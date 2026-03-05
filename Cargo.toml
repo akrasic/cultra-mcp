@@ -1,0 +1,45 @@
+[package]
+name = "cultra-mcp"
+version = "1.0.0"
+edition = "2021"
+authors = ["Cultra Contributors"]
+description = "Universal MCP server for Cultra - cross-tool AI coding intelligence"
+
+[dependencies]
+# JSON-RPC and serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client for API calls (truly synchronous, minimal dependencies)
+ureq = { version = "3.1", default-features = false, features = ["json", "rustls"] }
+urlencoding = "2.1"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Home directory expansion
+dirs = "6.0"
+
+# Tree-sitter for AST parsing
+tree-sitter = "0.26"
+tree-sitter-go = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-javascript = "0.25"
+streaming-iterator = "0.1"
+
+[dev-dependencies]
+which = "7.0"
+tempfile = "3.13"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
