@@ -3,6 +3,7 @@
 Universal MCP server for cross-tool AI coding intelligence. Written in Rust, communicates over stdio using the [Model Context Protocol](https://modelcontextprotocol.io/).
 
 Cultra MCP provides project management, code analysis, knowledge graph, and LSP integration tools to AI coding assistants.
+Support Claude Code, tested with OpenCode. 
 
 ## Requirements
 
@@ -14,6 +15,12 @@ Requires Rust 1.70+.
 
 ```bash
 cargo build --release
+```
+
+or use `cargo install`
+
+```
+  cargo install --git https://github.com/akrasic/cultra-mcp
 ```
 
 The binary is output to `./target/release/cultra-mcp`.
@@ -40,6 +47,10 @@ The server reads its configuration from `~/.config/cultra/mcp.json`:
 ## Usage
 
 ### Claude Code
+
+```
+claude mcp add cultra /path/to/binary  
+```
 
 Add to your Claude Code MCP settings (`~/.claude/settings.json`):
 
