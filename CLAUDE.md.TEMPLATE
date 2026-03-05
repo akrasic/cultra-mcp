@@ -1,0 +1,342 @@
+# {{PROJECT_NAME}} Development Guide
+
+**Project:** {{PROJECT_ID}} | **Updated:** {{DATE}}
+
+---
+
+## Customization
+
+**Before using:** Replace all `{{PLACEHOLDERS}}`, remove `[OPTIONAL]` sections you don't need.
+See `CLAUDE_TEMPLATE_GUIDE.md` for detailed setup instructions.
+
+---
+
+## Non-Negotiable Rules
+
+These are not optional. Do not skip them. Do not rationalize exceptions.
+
+1. **Load context** at the start of every session
+2. **Create a task** before ANY code change — every change gets a task ID for traceability
+3. **Log progress with file paths** — `"Fixed X in handlers.go:234"` not `"Fixed X"`
+4. **Save state** when work is done
+5. [OPTIONAL] **Use MCP code intelligence tools** for code exploration — AST/LSP are 10-100x faster than reading files, and give more context than grep/sed. This is not optional when the tools are available.
+
+Violating these creates gaps in the audit trail. A task you didn't track is a change you can't reference later.
+
+---
+
+## Session Start
+
+[OPTIONAL: With MCP tools]
+```javascript
+// Use batch to load session + search tasks in one call
+batch({operations: [
+  {tool: "load_session_state", args: {project_id: "{{PROJECT_ID}}", strategy: "relevant", include_plan_context: true}},
+  {tool: "search_tasks", args: {project_id: "{{PROJECT_ID}}", query: "relevant keywords"}}
+]})
+
+"Resuming from [date]: [what was happening]
+Current work: [task/plan status]
+Ready to continue."
+```
+
+[ALTERNATIVE: Without MCP tools]
+```
+// Check recent git commits, read SESSION_NOTES.md, ask user for context
+git log --oneline -10
+```
+
+---
+
+## Session End
+
+[OPTIONAL: With MCP tools]
+```javascript
+save_session_state({
+  project_id: "{{PROJECT_ID}}",
+  current_plan_id: "plan-x",
+  current_task_id: "TASK-123",
+  working_memory: {
+    phase: "Implementation",            // Required
+    current_focus: "What you're doing", // Required
+    next_action: "Specific next step"   // Required
+  },
+  context_snapshot: {
+    next_session_start: "Clear instruction for next instance",  // Required
+    files_modified: ["file.{{EXT}}:23 (what changed)"],
+    tasks_completed: ["TASK-123"],
+    decisions_made: ["Why you chose X over Y"]
+  }
+})
+```
+
+[ALTERNATIVE: Without MCP tools]
+```markdown
+<!-- Update docs/SESSION_NOTES.md -->
+## Session {{DATE}}
+**Current focus:** What you're doing
+**Next action:** Specific next step
+**Files modified:** file.{{EXT}}:23 (what changed)
+```
+
+Save at discrete work units (think git commits). Not after every tool call.
+
+---
+
+## Work Classification
+
+Before starting, ask: **"Is this 1 task or 3+ related tasks?"**
+
+### Single Task
+
+```javascript
+task = create_task({title: "Fix validation bug in handlers.{{EXT}}", status: "in_progress"})
+// Do the work
+log_progress({what: "Fixed validation in handlers.{{EXT}}:234"})
+complete_task({task_id, status: "done"})
+```
+
+### 3+ Related Tasks — Create a Plan First
+
+**The 3-Task Rule:** When you're about to create the third related task, stop. Create a plan first.
+
+[CUSTOMIZE] Adjust this threshold (2+, 4+) based on your project. 3+ is recommended.
+
+**Sequence matters:** Plan -> Document -> Tasks -> Link
+
+[OPTIONAL: With MCP tools]
+```javascript
+// 1. Create plan
+plan = save_plan({
+  plan_id: "plan-{{FEATURE_ID}}",
+  title: "{{FEATURE_SET}}",
+  status: "in_progress",
+  problem: "What problem this solves",
+  goal: "What you're achieving",
+  approach: "Technical strategy"
+})
+
+// 2. Document IMMEDIATELY
+doc = save_document({
+  document_id: "doc-{{FEATURE_ID}}-plan",
+  project_id: "{{PROJECT_ID}}",
+  title: "{{FEATURE_SET}} - Implementation Plan",
+  doc_type: "plan_details",
+  content: `
+# Goal
+[Specific deliverable]
+
+# Approach
+[Technical strategy, stack, patterns]
+
+# Task Breakdown
+1. Task one - ~30min
+2. Task two - ~20min
+3. Task three - ~25min
+
+# Success Criteria
+- [ ] Measurable criterion 1
+- [ ] Measurable criterion 2
+
+# Key Decisions
+- Decision X because Y
+`
+})
+
+// 3. Create tasks under the plan
+task1 = save_task({plan_id: plan.plan_id, title: "Task 1", status: "todo"})
+task2 = save_task({plan_id: plan.plan_id, title: "Task 2", status: "todo"})
+task3 = save_task({plan_id: plan.plan_id, title: "Task 3", status: "todo"})
+
+// 4. Link document to all tasks
+link_document({
+  document_id: doc.document_id,
+  task_ids: [task1.task_id, task2.task_id, task3.task_id]
+})
+
+// 5. Check progress anytime
+get_plan({plan_id: plan.plan_id})
+```
+
+[ALTERNATIVE: Without MCP tools]
+```javascript
+EnterPlanMode()
+// Write plan to docs/plans/PLAN_{{FEATURE_ID}}.md
+// Create tasks using TaskCreate
+TaskCreate({subject: "Task 1", description: "...", activeForm: "Working on task 1"})
+TaskCreate({subject: "Task 2", description: "...", activeForm: "Working on task 2"})
+TaskCreate({subject: "Task 3", description: "...", activeForm: "Working on task 3"})
+```
+
+### Complex Work (Unclear Scope)
+
+Create a parent task FIRST, then plan, then create subtasks:
+
+```javascript
+parent = create_task({title: "Add {{FEATURE}} to {{COMPONENT}}", status: "in_progress"})
+// Now plan — the parent task tracks the entire effort including planning
+EnterPlanMode()
+// After planning, create subtasks
+```
+
+---
+
+## [OPTIONAL] Code Intelligence
+
+Remove this section if you don't have AST/LSP tools available.
+
+**AST** (~100ms, single file) — structure, symbols, call graphs within a file:
+```javascript
+parse_file_ast({file_path: "/path/to/file.{{EXT}}"})
+search_code_context({project_id: "{{PROJECT_ID}}", symbol_name: "HandleAuth"})
+read_symbol_lines({location: "file.{{EXT}}:57-130"})
+```
+
+**LSP** (~300ms, cross-file) — find all usages, jump to definitions, get type info:
+```javascript
+lsp_workspace_symbols({query: "HandleAuth", language: "{{MAIN_LANGUAGE}}"})
+lsp({action: "definition", file_path: "file.{{EXT}}", line: 45, character: 10})
+lsp({action: "references", file_path: "file.{{EXT}}", line: 45, character: 10})
+lsp({action: "hover", file_path: "file.{{EXT}}", line: 45, character: 10})
+```
+
+**When to use which:** One file? AST. Multiple files? LSP. Understanding a feature? Both.
+
+**CSS analysis** (~5ms) — structure, specificity, unused selectors:
+```javascript
+analyze_file({analyzer: "css", file_path: "/path/to/styles.css"})  // Full structure: rules, variables, media queries, specificity
+find_css_rules({file_path: "styles.css", pattern: ".sidebar"})  // Find rules matching selector pattern
+find_unused_selectors({css_path: "styles.css", component_dir: "src/components/"})  // Find orphaned CSS
+```
+
+**Tailwind + CSS variable tools** — resolve utility classes, trace variable dependencies:
+```javascript
+resolve_tailwind_classes({classes: ["flex", "p-4", "bg-red-500", "hover:text-white"]})  // What CSS do these generate?
+resolve_tailwind_classes({classes: ["bg-kb-primary"], css_path: "src/index.css"})        // Resolve with custom @theme
+analyze_file({analyzer: "css_variables", file_path: "src/index.css"})  // Trace var() dependency chains, find cycles/undefined refs
+```
+
+**Why CSS tools over Grep/Read?** A 4500-line CSS file: `analyze_file(analyzer: "css")` = 1 call, ~2K tokens. Grep+Read = 8+ calls, ~120K tokens. `find_unused_selectors` checks hundreds of selectors across dozens of files in 1 call vs hundreds of Grep calls. `resolve_tailwind_classes` maps utility classes to CSS declarations in 1 call vs manual lookup. `analyze_file(analyzer: "css_variables")` traces all `var()` dependencies in 1 call vs reading and manually tracing references.
+
+**This is your default.** When investigating the codebase — understanding a feature, tracing a bug, checking what a function does, finding callers — reach for AST/LSP first, not Grep/Read. `parse_file_ast` gives you every symbol, call, and import in one call. `lsp(action: "references")` traces all usages across the entire codebase in one call. `lsp(action: "hover")` gives you the type signature without reading the file. Reading full files and grepping for strings is the slow, noisy fallback when code intelligence tools don't cover your case. Not the other way around.
+
+**Requires language server:** {{MAIN_LANGUAGE}} needs its language server installed (e.g., gopls for Go, tsserver for TypeScript, pyright for Python).
+
+---
+
+## [OPTIONAL] Batch Operations
+
+Remove this section if you don't have MCP tools available.
+
+`batch` executes multiple tool calls in a single request. Each operation runs sequentially; failures don't abort the batch.
+
+**When to use:** Whenever you need 2+ independent MCP calls. Saves round-trips.
+
+```javascript
+// Multi-read: fetch task + plan + document together
+batch({operations: [
+  {tool: "get_task", args: {task_id: "TASK-123"}},
+  {tool: "get_plan", args: {plan_id: "plan-{{FEATURE_ID}}"}},
+  {tool: "get_document", args: {document_id: "doc-{{FEATURE_ID}}-plan"}}
+]})
+```
+
+**Constraints:** Max 20 operations per batch. Cannot nest `batch` inside `batch`.
+
+**Response shape:** `{ total: N, results: [{ index, tool, success, result/error }] }` — check `success` on each result.
+
+---
+
+## [OPTIONAL] Document Types
+
+For use with MCP document management tools:
+
+`plan_details` | `implementation` | `retrospective` | `guide` | `architecture` | `decision` | `test_report` | `general` | `offtopic`
+
+---
+
+## Plan & Document Quality
+
+Plans are implementation blueprints, not wish lists. A plan that looks good but falls apart on contact with code is worse than no plan — it wastes time and creates false confidence.
+
+### Before writing any plan:
+
+1. **Research first, design second.** For anything touching unfamiliar territory (new crates, native APIs, external services, platform-specific features), create a research task. Read the actual API surface, check the dependency's README, verify compatibility with the existing stack. Then design.
+
+2. **Verify every technical claim.** If you write "use X" — confirm X exists, does what you claim, and is compatible with the project's versions (check Cargo.toml, package.json, go.mod). Name the specific crate, function, or API endpoint. Vague references like "via native APIs" or "using standard library" are not acceptable — name the specific thing.
+
+3. **Walk the full implementation path.** For each task, mentally write the code. What imports do you need? What function signatures? What happens when it fails? What happens on different platforms? If you can't answer these, the task isn't ready to be created.
+
+4. **Name the hard problems upfront.** Every plan MUST have a `# Risks & Open Questions` section. Not token risks — real ones you'd worry about if you were building it yourself.
+
+5. **Justify dependencies between tasks.** Every `blocked_by` needs a technical reason — not just structural grouping.
+
+6. **Justify estimates.** Break down effort per task. Which ones are 30 minutes and which are 4 hours? What makes the hard ones hard?
+
+### Red flags that mean the plan isn't ready:
+
+- Any claim you haven't verified against the actual codebase or docs
+- Vague technology references without naming specifics
+- No failure cases or edge cases discussed
+- Every task estimated at the same effort
+- No risks section, or risks that are generic filler
+- [CUSTOMIZE] Add project-specific red flags here
+
+---
+
+## Implementation: Test-Driven Development
+
+Write tests first. Not after, not "when there's time," not "if it makes sense." Tests define the contract before the code exists.
+
+1. **Write the test before the implementation.** Define what the function should do — inputs, expected outputs, error cases — as a test. Then write the code to make it pass.
+
+2. **Test the failure cases first.** The happy path is obvious. The value of TDD is forcing you to think about: what happens with nil input? Invalid state? Network failure? Concurrent access?
+
+3. **One behavior per test.** A test named `TestCreateNote` that checks creation, validation, duplicate handling, and permissions is four tests pretending to be one. Split them.
+
+4. **Tests are documentation.** A new instance should be able to read the test file and understand what the code does without reading the implementation.
+
+5. **No skipping tests for "simple" code.** Simple code becomes complex code. The test you skip today is the regression you debug tomorrow.
+
+---
+
+## Quick Decisions
+
+**Should I create a task?** Modifying code: yes. Answering a question: no.
+
+**Should I create a plan?** Creating 3+ related tasks: yes. Single task: no.
+
+**Task first or plan first?** Always create a task first. It tracks the entire effort including planning.
+
+**Forgot to create a plan?** Create it now. Link existing tasks retroactively.
+
+---
+
+## [CUSTOMIZE] Project Specifics
+
+**Tech Stack:**
+- Language: {{MAIN_LANGUAGE}}
+- Framework: {{FRAMEWORK}}
+- Database: {{DATABASE}}
+- Testing: {{TEST_FRAMEWORK}}
+
+**Coding Standards:**
+- Follow {{STYLE_GUIDE}}
+- Run {{LINTER}} before committing
+- Test coverage target: {{COVERAGE}}%
+
+**Common Patterns:**
+- How to add a new API endpoint: [describe]
+- How to create a new component: [describe]
+- How to add a database migration: [describe]
+
+**Domain Terms:**
+- {{TERM_1}}: Definition
+- {{TERM_2}}: Definition
+
+---
+
+**Template Version:** 2.4 (Mar 1, 2026)
+**Source:** Based on Cultra Engine V3 (claude-session-manager)
+
+*Customize for your project. Remove optional sections you don't need. Replace all {{PLACEHOLDERS}}. See CLAUDE_TEMPLATE_GUIDE.md for detailed instructions.*

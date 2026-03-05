@@ -1,29 +1,21 @@
 use super::protocol::Tool;
-use super::Server;
 use super::types::{
-    SessionStrategy, TaskType, TaskStatus, Priority,
-    DocType, PlanStatus, DecisionStatus, EnumValues,
+    DecisionStatus, DocType, EnumValues, PlanStatus, Priority, SessionStrategy, TaskStatus,
+    TaskType,
 };
+use super::Server;
 use crate::ast::{
-    Parser,
-    analyze_concurrency,
-    analyze_css, find_css_rules, find_unused_selectors, css_variable_graph,
-    analyze_react_component,
-    find_interface_implementations,
-    resolve_tailwind_classes,
+    analyze_concurrency, analyze_css, analyze_react_component, css_variable_graph, find_css_rules,
+    find_interface_implementations, find_unused_selectors, resolve_tailwind_classes, Parser,
 };
-use crate::lsp::tools::{
-    lsp_query,
-    lsp_workspace_symbols,
-    lsp_document_symbols,
-};
+use crate::lsp::tools::{lsp_document_symbols, lsp_query, lsp_workspace_symbols};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
 use std::fmt;
 
 // Embed templates at compile time
-const CLAUDE_MD_TEMPLATE: &str = include_str!("../../../CLAUDE.md.TEMPLATE");
-const CLAUDE_TEMPLATE_GUIDE: &str = include_str!("../../../CLAUDE_TEMPLATE_GUIDE.md");
+const CLAUDE_MD_TEMPLATE: &str = include_str!("../../CLAUDE.md.TEMPLATE");
+const CLAUDE_TEMPLATE_GUIDE: &str = include_str!("../../CLAUDE_TEMPLATE_GUIDE.md");
 
 /// Get all tool definitions
 pub fn get_tool_definitions() -> Vec<Tool> {
@@ -1163,7 +1155,10 @@ fn validate_id(field: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(anyhow!("{} cannot be empty", field));
     }
-    if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(anyhow!("{} contains invalid characters: {}", field, value));
     }
     Ok(())
@@ -1178,13 +1173,9 @@ fn parse_positive_int(
 ) -> Result<Option<u64>> {
     match args.get(field) {
         Some(Value::Number(n)) => {
-            let val = n.as_u64().ok_or_else(|| {
-                anyhow!(
-                    "{} must be a positive integer (got: {})",
-                    field,
-                    n
-                )
-            })?;
+            let val = n
+                .as_u64()
+                .ok_or_else(|| anyhow!("{} must be a positive integer (got: {})", field, n))?;
 
             // Validate minimum
             if let Some(min_val) = min {
@@ -1240,8 +1231,12 @@ where
             })?;
             Ok(Some(value))
         }
-        Some(Value::Null) => Ok(None),  // Treat null as absent
-        Some(val) => Err(anyhow!("{} must be a string, but got: {}", field, get_value_type_name(val))),
+        Some(Value::Null) => Ok(None), // Treat null as absent
+        Some(val) => Err(anyhow!(
+            "{} must be a string, but got: {}",
+            field,
+            get_value_type_name(val)
+        )),
         None => Ok(None),
     }
 }
@@ -1249,28 +1244,20 @@ where
 // ========== Generic API Handlers ==========
 
 /// Generic POST handler - creates or updates a resource
-fn api_post(
-    server: &Server,
-    endpoint: &str,
-    args: Map<String, Value>,
-) -> Result<Value> {
+fn api_post(server: &Server, endpoint: &str, args: Map<String, Value>) -> Result<Value> {
     server.api.post(endpoint, Value::Object(args))
 }
 
 /// Generic PUT handler - updates a resource
-fn api_put(
-    server: &Server,
-    endpoint: &str,
-    args: Map<String, Value>,
-) -> Result<Value> {
+fn api_put(server: &Server, endpoint: &str, args: Map<String, Value>) -> Result<Value> {
     server.api.put(endpoint, Value::Object(args))
 }
 
 /// Generic GET by ID handler
 fn api_get_by_id(
     server: &Server,
-    endpoint_template: &str,  // e.g., "/api/tasks/{}"
-    id_field: &str,            // e.g., "task_id"
+    endpoint_template: &str, // e.g., "/api/tasks/{}"
+    id_field: &str,          // e.g., "task_id"
     args: &Map<String, Value>,
 ) -> Result<Value> {
     let id = args
@@ -1310,7 +1297,8 @@ fn api_get_with_filters(
         } else if let Some(value) = args.get(field).and_then(|v| v.as_u64()) {
             query.push((field.to_string(), value.to_string()));
         } else if let Some(arr) = args.get(field).and_then(|v| v.as_array()) {
-            let joined: Vec<String> = arr.iter()
+            let joined: Vec<String> = arr
+                .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect();
             if !joined.is_empty() {
@@ -1325,8 +1313,8 @@ fn api_get_with_filters(
 /// Generic DELETE handler
 fn api_delete(
     server: &Server,
-    endpoint_template: &str,  // e.g., "/api/tasks/{}/dependencies/{}"
-    id_fields: &[&str],        // e.g., ["task_id", "depends_on"]
+    endpoint_template: &str, // e.g., "/api/tasks/{}/dependencies/{}"
+    id_fields: &[&str],      // e.g., ["task_id", "depends_on"]
     args: &Map<String, Value>,
 ) -> Result<Value> {
     let mut endpoint = endpoint_template.to_string();
@@ -1346,11 +1334,7 @@ fn api_delete(
 }
 
 /// Route tool calls to implementations
-pub fn call_tool(
-    server: &mut Server,
-    name: &str,
-    args: Map<String, Value>,
-) -> Result<Value> {
+pub fn call_tool(server: &mut Server, name: &str, args: Map<String, Value>) -> Result<Value> {
     match name {
         "load_session_state" => load_session_state(server, args),
         "save_session_state" => save_session_state(server, args),
@@ -1492,7 +1476,12 @@ fn get_template(args: Map<String, Value>) -> Result<Value> {
     let (title, content) = match name {
         "claude_md" => ("CLAUDE.md Template", CLAUDE_MD_TEMPLATE),
         "template_guide" => ("CLAUDE.md Template Guide", CLAUDE_TEMPLATE_GUIDE),
-        other => return Err(anyhow!("Invalid template '{}'. Must be 'claude_md' or 'template_guide'", other)),
+        other => {
+            return Err(anyhow!(
+                "Invalid template '{}'. Must be 'claude_md' or 'template_guide'",
+                other
+            ))
+        }
     };
 
     Ok(json!({
@@ -1558,19 +1547,26 @@ fn save_session_state(server: &Server, mut args: Map<String, Value>) -> Result<V
             }
 
             if let Some(current_focus) = wm_obj.get("current_focus") {
-                if !current_focus.is_string() || current_focus.as_str().unwrap_or("").trim().is_empty() {
+                if !current_focus.is_string()
+                    || current_focus.as_str().unwrap_or("").trim().is_empty()
+                {
                     return Err(anyhow!("working_memory.current_focus must be a non-empty string describing what you're doing now"));
                 }
             } else {
-                return Err(anyhow!("working_memory.current_focus is required (Engine V3)"));
+                return Err(anyhow!(
+                    "working_memory.current_focus is required (Engine V3)"
+                ));
             }
 
             if let Some(next_action) = wm_obj.get("next_action") {
-                if !next_action.is_string() || next_action.as_str().unwrap_or("").trim().is_empty() {
+                if !next_action.is_string() || next_action.as_str().unwrap_or("").trim().is_empty()
+                {
                     return Err(anyhow!("working_memory.next_action must be a non-empty string with a specific next step"));
                 }
             } else {
-                return Err(anyhow!("working_memory.next_action is required (Engine V3)"));
+                return Err(anyhow!(
+                    "working_memory.next_action is required (Engine V3)"
+                ));
             }
         }
     }
@@ -1580,11 +1576,15 @@ fn save_session_state(server: &Server, mut args: Map<String, Value>) -> Result<V
         if let Some(cs_obj) = cs.as_object() {
             // Check required field
             if let Some(next_session_start) = cs_obj.get("next_session_start") {
-                if !next_session_start.is_string() || next_session_start.as_str().unwrap_or("").trim().is_empty() {
+                if !next_session_start.is_string()
+                    || next_session_start.as_str().unwrap_or("").trim().is_empty()
+                {
                     return Err(anyhow!("context_snapshot.next_session_start must be a non-empty string with clear resuming instructions"));
                 }
             } else {
-                return Err(anyhow!("context_snapshot.next_session_start is required (Engine V3)"));
+                return Err(anyhow!(
+                    "context_snapshot.next_session_start is required (Engine V3)"
+                ));
             }
         }
     }
@@ -1621,7 +1621,8 @@ fn get_session_code_context(server: &Server, args: Map<String, Value>) -> Result
 
 /// Tool implementation: create_project
 fn create_project(server: &Server, args: Map<String, Value>) -> Result<Value> {
-    if !args.contains_key("project_id") || args.get("project_id").and_then(|v| v.as_str()).is_none() {
+    if !args.contains_key("project_id") || args.get("project_id").and_then(|v| v.as_str()).is_none()
+    {
         return Err(anyhow!("project_id is required"));
     }
     if !args.contains_key("name") || args.get("name").and_then(|v| v.as_str()).is_none() {
@@ -1721,7 +1722,9 @@ fn get_task_chain(server: &Server, args: Map<String, Value>) -> Result<Value> {
         Some(query_params)
     };
 
-    server.api.get(&format!("/api/v2/tasks/{}/chain", task_id), query)
+    server
+        .api
+        .get(&format!("/api/v2/tasks/{}/chain", task_id), query)
 }
 
 /// Tool implementation: update_task_status
@@ -1788,17 +1791,22 @@ fn task_dependency(server: &Server, args: Map<String, Value>) -> Result<Value> {
         "add" => {
             let mut api_body = Map::new();
             api_body.insert("blocked_by".to_string(), depends_on.clone());
-            api_post(server, &format!("/api/v2/tasks/{}/dependencies", task_id), api_body)
-        }
-        "remove" => {
-            api_delete(
+            api_post(
                 server,
-                "/api/v2/tasks/{}/dependencies/{}",
-                &["task_id", "depends_on"],
-                &args,
+                &format!("/api/v2/tasks/{}/dependencies", task_id),
+                api_body,
             )
         }
-        other => Err(anyhow!("Invalid action '{}'. Must be 'add' or 'remove'", other)),
+        "remove" => api_delete(
+            server,
+            "/api/v2/tasks/{}/dependencies/{}",
+            &["task_id", "depends_on"],
+            &args,
+        ),
+        other => Err(anyhow!(
+            "Invalid action '{}'. Must be 'add' or 'remove'",
+            other
+        )),
     }
 }
 
@@ -1832,7 +1840,8 @@ fn get_documents(server: &Server, mut args: Map<String, Value>) -> Result<Value>
 
     // Convert tags array to comma-separated string for the API
     if let Some(Value::Array(tags)) = args.remove("tags") {
-        let tag_str: Vec<String> = tags.iter()
+        let tag_str: Vec<String> = tags
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
         if !tag_str.is_empty() {
@@ -1873,12 +1882,14 @@ fn update_document(server: &Server, mut args: Map<String, Value>) -> Result<Valu
 
 /// Tool implementation: link_document (consolidated from link_document + link_document_batch)
 fn link_document(server: &Server, args: Map<String, Value>) -> Result<Value> {
-    let _document_id = args.get("document_id")
+    let _document_id = args
+        .get("document_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("document_id is required"))?;
     validate_id("document_id", _document_id)?;
 
-    let task_ids = args.get("task_ids")
+    let task_ids = args
+        .get("task_ids")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("task_ids is required and must be an array"))?;
     if task_ids.is_empty() {
@@ -1955,13 +1966,7 @@ fn get_plans(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
         args.insert("status".to_string(), Value::String(status.to_string()));
     }
 
-    api_get_with_filters(
-        server,
-        "/api/v2/plans",
-        &["project_id"],
-        &["status"],
-        &args,
-    )
+    api_get_with_filters(server, "/api/v2/plans", &["project_id"], &["status"], &args)
 }
 
 /// Tool implementation: get_plan (consolidated from get_plan_status + get_plan_details)
@@ -1972,11 +1977,19 @@ fn get_plan(server: &Server, args: Map<String, Value>) -> Result<Value> {
         .ok_or_else(|| anyhow!("Missing required parameter: plan_id"))?;
     validate_id("plan_id", plan_id)?;
 
-    let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("status");
+    let detail = args
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("status");
     let endpoint = match detail {
         "status" => format!("/api/v2/plans/{}/status", plan_id),
         "full" => format!("/api/v2/plans/{}/details", plan_id),
-        other => return Err(anyhow!("Invalid detail value '{}'. Must be 'status' or 'full'", other)),
+        other => {
+            return Err(anyhow!(
+                "Invalid detail value '{}'. Must be 'status' or 'full'",
+                other
+            ))
+        }
     };
 
     server.api.get(&endpoint, None)
@@ -2028,7 +2041,8 @@ fn parse_file_ast(server: &Server, args: Map<String, Value>) -> Result<Value> {
 
     // Parse file locally (fast, no network overhead)
     let parser = Parser::new();
-    let file_context = parser.parse_file(file_path)
+    let file_context = parser
+        .parse_file(file_path)
         .map_err(|e| anyhow!("Failed to parse file: {}", e))?;
 
     // POST to API for storage (respects RLS, enables search_code_context)
@@ -2041,7 +2055,11 @@ fn parse_file_ast(server: &Server, args: Map<String, Value>) -> Result<Value> {
         "ast_stats": file_context.ast_stats
     });
 
-    api_post(server, "/api/v2/ast/parse", body.as_object().unwrap().clone())?;
+    api_post(
+        server,
+        "/api/v2/ast/parse",
+        body.as_object().unwrap().clone(),
+    )?;
 
     // Return AST metadata
     Ok(json!({
@@ -2064,7 +2082,12 @@ fn analyze_file_tool(args: Map<String, Value>) -> Result<Value> {
     // Validate analyzer before doing any I/O
     match analyzer {
         "concurrency" | "react" | "css" | "css_variables" => {}
-        other => return Err(anyhow!("Invalid analyzer '{}'. Must be 'concurrency', 'react', 'css', or 'css_variables'", other)),
+        other => {
+            return Err(anyhow!(
+                "Invalid analyzer '{}'. Must be 'concurrency', 'react', 'css', or 'css_variables'",
+                other
+            ))
+        }
     }
 
     let file_path = args
@@ -2078,26 +2101,22 @@ fn analyze_file_tool(args: Map<String, Value>) -> Result<Value> {
         "concurrency" => {
             let analysis = analyze_concurrency(file_path)
                 .map_err(|e| anyhow!("Failed to analyze concurrency: {}", e))?;
-            serde_json::to_value(analysis)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "react" => {
             let analysis = analyze_react_component(file_path)
                 .map_err(|e| anyhow!("Failed to analyze React component: {}", e))?;
-            serde_json::to_value(analysis)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "css" => {
-            let analysis = analyze_css(file_path)
-                .map_err(|e| anyhow!("Failed to analyze CSS: {}", e))?;
-            serde_json::to_value(analysis)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            let analysis =
+                analyze_css(file_path).map_err(|e| anyhow!("Failed to analyze CSS: {}", e))?;
+            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "css_variables" => {
             let graph = css_variable_graph(file_path)
                 .map_err(|e| anyhow!("Failed to build CSS variable graph: {}", e))?;
-            serde_json::to_value(graph)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(graph).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         _ => unreachable!("analyzer already validated"),
     }
@@ -2113,15 +2132,12 @@ fn find_interface_implementations_tool(args: Map<String, Value>) -> Result<Value
     // Validate file exists and is readable
     validate_file_exists(file_path)?;
 
-    let interface_name = args
-        .get("interface_name")
-        .and_then(|v| v.as_str());
+    let interface_name = args.get("interface_name").and_then(|v| v.as_str());
 
     let analysis = find_interface_implementations(file_path, interface_name)
         .map_err(|e| anyhow!("Failed to find interface implementations: {}", e))?;
 
-    serde_json::to_value(analysis)
-        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
 
 // ========== CSS Analysis Tools ==========
@@ -2143,8 +2159,7 @@ fn find_css_rules_tool(args: Map<String, Value>) -> Result<Value> {
     let rules = find_css_rules(file_path, pattern)
         .map_err(|e| anyhow!("Failed to find CSS rules: {}", e))?;
 
-    serde_json::to_value(rules)
-        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(rules).map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
 
 /// Tool implementation: find_unused_selectors
@@ -2168,8 +2183,7 @@ fn find_unused_selectors_tool(args: Map<String, Value>) -> Result<Value> {
     let unused = find_unused_selectors(css_path, &path_refs)
         .map_err(|e| anyhow!("Failed to find unused selectors: {}", e))?;
 
-    serde_json::to_value(unused)
-        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(unused).map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
 
 /// Walk a directory and collect .tsx/.ts/.jsx/.js/.html file paths
@@ -2181,7 +2195,18 @@ fn collect_component_files(dir: &str) -> Result<Vec<String>> {
         if path.is_dir() {
             // Skip common non-source directories
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if matches!(name, "node_modules" | ".git" | "dist" | "build" | "target" | ".next" | "__pycache__" | ".venv" | "vendor") {
+                if matches!(
+                    name,
+                    "node_modules"
+                        | ".git"
+                        | "dist"
+                        | "build"
+                        | "target"
+                        | ".next"
+                        | "__pycache__"
+                        | ".venv"
+                        | "vendor"
+                ) {
                     return;
                 }
             }
@@ -2230,10 +2255,8 @@ fn resolve_tailwind_classes_tool(args: Map<String, Value>) -> Result<Value> {
     let result = resolve_tailwind_classes(&class_refs, css_path)
         .map_err(|e| anyhow!("Failed to resolve Tailwind classes: {}", e))?;
 
-    serde_json::to_value(result)
-        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(result).map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
-
 
 // ========== Engine V2 Intelligence Tools ==========
 
@@ -2297,7 +2320,9 @@ fn search_code_context(server: &Server, args: Map<String, Value>) -> Result<Valu
                             // Filter by symbol_type
                             if matches {
                                 if let Some(type_filter) = symbol_type {
-                                    if let Some(sym_type) = sym_obj.get("type").and_then(|v| v.as_str()) {
+                                    if let Some(sym_type) =
+                                        sym_obj.get("type").and_then(|v| v.as_str())
+                                    {
                                         if sym_type != type_filter {
                                             matches = false;
                                         }
@@ -2310,7 +2335,9 @@ fn search_code_context(server: &Server, args: Map<String, Value>) -> Result<Valu
                             // Filter by receiver (Go only)
                             if matches {
                                 if let Some(receiver_filter) = receiver {
-                                    if let Some(sym_receiver) = sym_obj.get("receiver").and_then(|v| v.as_str()) {
+                                    if let Some(sym_receiver) =
+                                        sym_obj.get("receiver").and_then(|v| v.as_str())
+                                    {
                                         if sym_receiver != receiver_filter {
                                             matches = false;
                                         }
@@ -2323,7 +2350,9 @@ fn search_code_context(server: &Server, args: Map<String, Value>) -> Result<Valu
                             // Filter by scope
                             if matches {
                                 if let Some(scope_filter) = scope {
-                                    if let Some(sym_scope) = sym_obj.get("scope").and_then(|v| v.as_str()) {
+                                    if let Some(sym_scope) =
+                                        sym_obj.get("scope").and_then(|v| v.as_str())
+                                    {
                                         if sym_scope != scope_filter {
                                             matches = false;
                                         }
@@ -2336,9 +2365,13 @@ fn search_code_context(server: &Server, args: Map<String, Value>) -> Result<Valu
                             // Filter by calls
                             if matches {
                                 if let Some(calls_filter) = calls {
-                                    if let Some(sym_calls) = sym_obj.get("calls").and_then(|v| v.as_array()) {
+                                    if let Some(sym_calls) =
+                                        sym_obj.get("calls").and_then(|v| v.as_array())
+                                    {
                                         let calls_match = sym_calls.iter().any(|c| {
-                                            c.as_str().map(|s| s.contains(calls_filter)).unwrap_or(false)
+                                            c.as_str()
+                                                .map(|s| s.contains(calls_filter))
+                                                .unwrap_or(false)
                                         });
                                         if !calls_match {
                                             matches = false;
@@ -2378,37 +2411,39 @@ fn read_symbol_lines(args: Map<String, Value>) -> Result<Value> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let (file_path, start_line, end_line) = if let Some(location) = args.get("location").and_then(|v| v.as_str()) {
-        // Parse location string "file.go:57-130" or "file.go:57"
-        split_location(location)?
-    } else {
-        // Use explicit parameters
-        let file_path = args
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("file_path or location is required"))?
-            .to_string();
+    let (file_path, start_line, end_line) =
+        if let Some(location) = args.get("location").and_then(|v| v.as_str()) {
+            // Parse location string "file.go:57-130" or "file.go:57"
+            split_location(location)?
+        } else {
+            // Use explicit parameters
+            let file_path = args
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("file_path or location is required"))?
+                .to_string();
 
-        let start_line = args
-            .get("start_line")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow!("start_line is required when using file_path"))? as usize;
+            let start_line = args
+                .get("start_line")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!("start_line is required when using file_path"))?
+                as usize;
 
-        let end_line = args
-            .get("end_line")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as usize)
-            .unwrap_or(start_line);
+            let end_line = args
+                .get("end_line")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as usize)
+                .unwrap_or(start_line);
 
-        (file_path, start_line, end_line)
-    };
+            (file_path, start_line, end_line)
+        };
 
     // Validate file exists and is readable
     validate_file_exists(&file_path)?;
 
     // Read file lines
-    let file = File::open(&file_path)
-        .map_err(|e| anyhow!("Failed to open file {}: {}", file_path, e))?;
+    let file =
+        File::open(&file_path).map_err(|e| anyhow!("Failed to open file {}: {}", file_path, e))?;
 
     let reader = BufReader::new(file);
     let mut content = Vec::new();
@@ -2469,12 +2504,23 @@ fn query_context(server: &Server, args: Map<String, Value>) -> Result<Value> {
         "use_retrievability": args.get("use_retrievability").and_then(|v| v.as_bool()).unwrap_or(false)
     });
 
-    api_post(server, "/api/v2/vector/query", body.as_object().unwrap().clone())
+    api_post(
+        server,
+        "/api/v2/vector/query",
+        body.as_object().unwrap().clone(),
+    )
 }
 
 /// Tool implementation: add_graph_edge
 fn add_graph_edge(server: &Server, args: Map<String, Value>) -> Result<Value> {
-    let required_fields = ["from_type", "from_id", "to_type", "to_id", "edge_type", "project_id"];
+    let required_fields = [
+        "from_type",
+        "from_id",
+        "to_type",
+        "to_id",
+        "edge_type",
+        "project_id",
+    ];
     for field in &required_fields {
         if !args.contains_key(*field) || args.get(*field).and_then(|v| v.as_str()).is_none() {
             return Err(anyhow!("Missing required parameter: {}", field));
@@ -2540,8 +2586,12 @@ fn get_graph_neighbors(server: &Server, args: Map<String, Value>) -> Result<Valu
 /// Split location string "file.go:57-130" into (file_path, start_line, end_line)
 fn split_location(location: &str) -> Result<(String, usize, usize)> {
     // Find the LAST colon - handles Windows paths like C:\path:42
-    let colon_pos = location.rfind(':')
-        .ok_or_else(|| anyhow!("Invalid location format '{}' - expected 'file:line' or 'file:start-end'", location))?;
+    let colon_pos = location.rfind(':').ok_or_else(|| {
+        anyhow!(
+            "Invalid location format '{}' - expected 'file:line' or 'file:start-end'",
+            location
+        )
+    })?;
     let file_path = location[..colon_pos].to_string();
     let line_part = &location[colon_pos + 1..];
 
@@ -2552,15 +2602,18 @@ fn split_location(location: &str) -> Result<(String, usize, usize)> {
             return Err(anyhow!("Invalid line range format"));
         }
 
-        let start_line = range[0].parse::<usize>()
+        let start_line = range[0]
+            .parse::<usize>()
             .map_err(|_| anyhow!("Invalid start line number"))?;
-        let end_line = range[1].parse::<usize>()
+        let end_line = range[1]
+            .parse::<usize>()
             .map_err(|_| anyhow!("Invalid end line number"))?;
 
         Ok((file_path, start_line, end_line))
     } else {
         // Single line: "57"
-        let line = line_part.parse::<usize>()
+        let line = line_part
+            .parse::<usize>()
             .map_err(|_| anyhow!("Invalid line number"))?;
         Ok((file_path, line, line))
     }
@@ -2675,13 +2728,19 @@ mod tests {
         args.insert("depth".to_string(), json!(0));
         let result = parse_positive_int(&args, "depth", Some(1), Some(5));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must be at least 1"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be at least 1"));
 
         // Test above range
         args.insert("depth".to_string(), json!(10));
         let result = parse_positive_int(&args, "depth", Some(1), Some(5));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must be at most 5"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be at most 5"));
     }
 
     #[test]
@@ -2710,7 +2769,7 @@ mod tests {
     fn test_validate_file_exists_directory() {
         // Create a temporary directory
         let temp_dir = TempDir::new().unwrap();
-        
+
         // Should fail because it's a directory, not a file
         let result = validate_file_exists(temp_dir.path().to_str().unwrap());
         assert!(result.is_err());
@@ -2739,14 +2798,20 @@ mod tests {
     fn test_split_location_invalid_format() {
         let result = split_location("file.go");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid location format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid location format"));
     }
 
     #[test]
     fn test_split_location_invalid_line_number() {
         let result = split_location("file.go:abc");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid line number"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid line number"));
     }
 
     // Helper to create a test server (API calls will fail but validation runs first)
@@ -2794,9 +2859,12 @@ mod tests {
     fn test_batch_recursive_call_blocked() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert("operations".to_string(), json!([
-            {"tool": "batch", "args": {"operations": [{"tool": "get_task", "args": {}}]}}
-        ]));
+        args.insert(
+            "operations".to_string(),
+            json!([
+                {"tool": "batch", "args": {"operations": [{"tool": "get_task", "args": {}}]}}
+            ]),
+        );
         let result = batch(&mut server, args).unwrap();
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
@@ -2808,26 +2876,35 @@ mod tests {
     fn test_batch_unknown_tool_returns_error_result() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert("operations".to_string(), json!([
-            {"tool": "nonexistent_tool_xyz", "args": {}}
-        ]));
+        args.insert(
+            "operations".to_string(),
+            json!([
+                {"tool": "nonexistent_tool_xyz", "args": {}}
+            ]),
+        );
         let result = batch(&mut server, args).unwrap();
         assert_eq!(result["total"], 1);
         let results = result["results"].as_array().unwrap();
         assert_eq!(results[0]["index"], 0);
         assert_eq!(results[0]["tool"], "nonexistent_tool_xyz");
         assert_eq!(results[0]["success"], false);
-        assert!(results[0]["error"].as_str().unwrap().contains("Unknown tool"));
+        assert!(results[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown tool"));
     }
 
     #[test]
     fn test_batch_result_structure() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert("operations".to_string(), json!([
-            {"tool": "unknown_a", "args": {}},
-            {"tool": "unknown_b", "args": {}}
-        ]));
+        args.insert(
+            "operations".to_string(),
+            json!([
+                {"tool": "unknown_a", "args": {}},
+                {"tool": "unknown_b", "args": {}}
+            ]),
+        );
         let result = batch(&mut server, args).unwrap();
         assert_eq!(result["total"], 2);
         let results = result["results"].as_array().unwrap();
@@ -2841,9 +2918,12 @@ mod tests {
     fn test_batch_missing_tool_field() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert("operations".to_string(), json!([
-            {"args": {}}
-        ]));
+        args.insert(
+            "operations".to_string(),
+            json!([
+                {"args": {}}
+            ]),
+        );
         let result = batch(&mut server, args).unwrap();
         let results = result["results"].as_array().unwrap();
         assert_eq!(results[0]["success"], false);
