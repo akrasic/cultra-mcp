@@ -5,21 +5,27 @@ use tree_sitter::{Query, QueryCursor};
 
 use streaming_iterator::StreamingIterator;
 
-/// Extract symbols from TypeScript/JavaScript source code
+/// Extract symbols from TypeScript/JavaScript/TSX source code.
+///
+/// The `ts_lang` parameter must match the grammar the tree was parsed with —
+/// `LANGUAGE_TYPESCRIPT` for .ts, `LANGUAGE_TSX` for .tsx, `LANGUAGE_JAVASCRIPT`
+/// for .js/.jsx. Tree-sitter queries compiled against the wrong grammar silently
+/// return zero matches, which is why TSX files previously returned 0 symbols.
 pub fn extract_typescript_symbols(
     root_node: &tree_sitter::Node,
     content: &[u8],
+    ts_lang: &tree_sitter::Language,
 ) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
     // Extract function declarations
-    symbols.extend(extract_typescript_functions(root_node, content)?);
+    symbols.extend(extract_typescript_functions(root_node, content, ts_lang)?);
 
     // Extract class declarations
-    symbols.extend(extract_typescript_classes(root_node, content)?);
+    symbols.extend(extract_typescript_classes(root_node, content, ts_lang)?);
 
     // Extract interface declarations
-    symbols.extend(extract_typescript_interfaces(root_node, content)?);
+    symbols.extend(extract_typescript_interfaces(root_node, content, ts_lang)?);
 
     Ok(symbols)
 }
@@ -28,6 +34,7 @@ pub fn extract_typescript_symbols(
 fn extract_typescript_functions(
     node: &tree_sitter::Node,
     content: &[u8],
+    ts_lang: &tree_sitter::Language,
 ) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
@@ -45,7 +52,7 @@ fn extract_typescript_functions(
     ]
     "#;
 
-    let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+    let language = ts_lang.clone();
     let query = Query::new(&language, query_source)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *node, content);
@@ -123,6 +130,7 @@ fn extract_typescript_functions(
 fn extract_typescript_classes(
     node: &tree_sitter::Node,
     content: &[u8],
+    ts_lang: &tree_sitter::Language,
 ) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
@@ -131,7 +139,7 @@ fn extract_typescript_classes(
         name: (type_identifier) @class.name) @class.decl
     "#;
 
-    let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+    let language = ts_lang.clone();
     let query = Query::new(&language, query_source)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *node, content);
@@ -152,14 +160,14 @@ fn extract_typescript_classes(
             }
         }
 
-        if let Some(node) = class_node {
+        if let Some(cls_node) = class_node {
             let signature = format!("class {}", class_name);
 
             symbols.push(Symbol {
                 symbol_type: SymbolType::Class,
-                name: class_name,
-                line: node.start_position().row as u32 + 1,
-                end_line: node.end_position().row as u32 + 1,
+                name: class_name.clone(),
+                line: cls_node.start_position().row as u32 + 1,
+                end_line: cls_node.end_position().row as u32 + 1,
                 scope: Scope::Public,
                 signature,
                 parent: None,
@@ -168,6 +176,125 @@ fn extract_typescript_classes(
                 documentation: None,
                 parameters: Vec::new(),
                 return_type: None,
+            });
+
+            // CULTRA-967: extract class methods as individual symbols so
+            // find_references / find_dead_code can anchor on them.
+            symbols.extend(
+                extract_typescript_class_methods(&cls_node, content, &class_name, ts_lang)?
+            );
+        }
+    }
+
+    Ok(symbols)
+}
+
+/// CULTRA-967: Extract methods from a class body as individual Symbol entries.
+fn extract_typescript_class_methods(
+    class_node: &tree_sitter::Node,
+    content: &[u8],
+    class_name: &str,
+    language: &tree_sitter::Language,
+) -> Result<Vec<Symbol>> {
+    let mut symbols = Vec::new();
+
+    let query_source = r#"
+    (method_definition
+        name: (property_identifier) @method.name
+        parameters: (formal_parameters) @method.params
+        return_type: (type_annotation)? @method.return) @method.decl
+    "#;
+
+    let query = Query::new(language, query_source)?;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, *class_node, content);
+    while let Some(match_) = matches.next() {
+        let mut method_name = String::new();
+        let mut params = String::new();
+        let mut return_type = String::new();
+        let mut method_node: Option<tree_sitter::Node> = None;
+
+        for capture in match_.captures {
+            let capture_name = &query.capture_names()[capture.index as usize];
+            match *capture_name {
+                "method.name" => {
+                    method_name = capture.node.utf8_text(content)?.to_string();
+                }
+                "method.params" => {
+                    params = capture.node.utf8_text(content)?.to_string();
+                }
+                "method.return" => {
+                    return_type = capture.node.utf8_text(content)?.to_string();
+                }
+                "method.decl" => {
+                    method_node = Some(capture.node);
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(m_node) = method_node {
+            // Skip constructor — it's not a callable you'd reference externally
+            if method_name == "constructor" {
+                continue;
+            }
+
+            let parameters = extract_typescript_parameters(&params);
+
+            let signature = if params.is_empty() || params == "()" {
+                format!("{}()", method_name)
+            } else {
+                format!("{}(...)", method_name)
+            };
+
+            let calls = extract_typescript_calls(&m_node, content, language)?;
+
+            let return_type_str = if !return_type.is_empty() {
+                return_type.trim_start_matches(':').trim().to_string()
+            } else {
+                String::new()
+            };
+
+            // Determine scope from accessibility modifier. In tree-sitter's
+            // TypeScript grammar, method_definition has an optional
+            // accessibility_modifier child ("public"|"private"|"protected").
+            let scope = {
+                let mut found_scope = Scope::Public; // TS default is public
+                let mut child = m_node.child(0);
+                while let Some(c) = child {
+                    if c.kind() == "accessibility_modifier" {
+                        let modifier = c.utf8_text(content).unwrap_or("");
+                        if modifier == "private" || modifier == "protected" {
+                            found_scope = Scope::Private;
+                        }
+                        break;
+                    }
+                    // Stop after the first few children to avoid scanning body
+                    if c.kind() == "statement_block" || c.kind() == "formal_parameters" {
+                        break;
+                    }
+                    child = c.next_sibling();
+                }
+                found_scope
+            };
+
+            symbols.push(Symbol {
+                symbol_type: SymbolType::Method,
+                name: method_name,
+                line: m_node.start_position().row as u32 + 1,
+                end_line: m_node.end_position().row as u32 + 1,
+                scope,
+                signature,
+                parent: Some(class_name.to_string()),
+                receiver: None,
+                calls,
+                documentation: None,
+                parameters,
+                return_type: if return_type_str.is_empty() {
+                    None
+                } else {
+                    Some(return_type_str)
+                },
             });
         }
     }
@@ -179,6 +306,7 @@ fn extract_typescript_classes(
 fn extract_typescript_interfaces(
     node: &tree_sitter::Node,
     content: &[u8],
+    ts_lang: &tree_sitter::Language,
 ) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
@@ -187,7 +315,7 @@ fn extract_typescript_interfaces(
         name: (type_identifier) @interface.name) @interface.decl
     "#;
 
-    let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+    let language = ts_lang.clone();
     let query = Query::new(&language, query_source)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *node, content);
@@ -315,6 +443,7 @@ fn extract_typescript_calls(
 pub fn extract_typescript_imports(
     root_node: &tree_sitter::Node,
     content: &[u8],
+    ts_lang: &tree_sitter::Language,
 ) -> Result<Vec<String>> {
     let mut imports = Vec::new();
 
@@ -323,7 +452,7 @@ pub fn extract_typescript_imports(
         source: (string) @import.source)
     "#;
 
-    let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+    let language = ts_lang.clone();
     let query = Query::new(&language, query_source)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *root_node, content);
@@ -387,7 +516,7 @@ export function main() {
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
 
-        let symbols = extract_typescript_symbols(&root_node, source.as_bytes())
+        let symbols = extract_typescript_symbols(&root_node, source.as_bytes(), &lang)
             .expect("Failed to extract symbols");
 
         // Should extract interface, class, and functions
@@ -434,7 +563,7 @@ function main() {}
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
 
-        let imports = extract_typescript_imports(&root_node, source.as_bytes())
+        let imports = extract_typescript_imports(&root_node, source.as_bytes(), &lang)
             .expect("Failed to extract imports");
 
         assert_eq!(imports.len(), 2);

@@ -48,6 +48,25 @@ Use this to determine which sections to keep:
 
 ---
 
+### Harness Contract (RECOMMENDED if using MCP)
+
+**Do you want the harness running Claude (e.g. Claude Code) to know that this project has its own task tracker and a curated tool preload list?**
+
+✅ **YES - Keep the `## Harness Contract` section** and:
+- Replace `{{MCP_NAMESPACE}}` with your MCP server's namespace prefix (e.g. `cultra` for `mcp__cultra__*` tools)
+- Curate the `preload_tools` list — the template ships with the full Cultra working set, but you may add or remove entries based on which tools you actually reach for on this project
+- Keep the `suppress_builtin_reminders` list as-is unless your harness has additional built-in primitives whose nudges you want to silence
+
+The contract lives in a fenced ` ```harness-contract ` YAML block. The block is machine-parseable for harnesses that recognize the tag and renders as a normal code block for harnesses that don't, so it's backwards-compatible.
+
+**What it does:**
+1. **Reminder suppression** — tells the harness to stop nudging the agent toward built-in `TaskCreate` / `TaskUpdate` when an MCP task tracker is the canonical path. Without this, agents on Cultra-style projects get periodic reminders that pull them away from `mcp__cultra__save_task` toward the harness's built-in primitive, fragmenting the audit trail.
+2. **Tool preload** — tells the harness which tool schemas to warm at session start, so the agent can call them without first paying a `ToolSearch` round-trip. Without this, every first use of a Cultra tool in a session costs an extra inference round-trip just to fetch the schema.
+
+❌ **NO - Delete the entire `## Harness Contract` section** (you don't have an MCP task tracker, or you want the harness's built-in reminders/lazy-load behavior).
+
+---
+
 ### MCP Session Management (OPTIONAL)
 
 **Do you have an MCP server with session/plan/task management tools?**
@@ -59,11 +78,13 @@ Use this to determine which sections to keep:
 - Document management tools
 - Batch operations (reduces round-trips for multi-tool calls)
 - Engine V3 features (if applicable)
+- The `## Harness Contract` section (see above)
 
 ❌ **NO - Remove and replace with:**
 - Built-in Claude Code tools (`TaskCreate`, `TaskUpdate`, `EnterPlanMode`)
 - Markdown-based session notes
 - Git-based continuity (commits as boundaries)
+- Also delete the `## Harness Contract` section — its purpose is to declare an external tracker
 
 **Example replacement:**
 ```markdown
@@ -112,6 +133,7 @@ cat docs/SESSION_NOTES.md
 | `{{PROJECT_TAGLINE}}` | Fast REST API | Short project description |
 | `{{DATE}}` | Feb 5, 2026 | Current date |
 | `{{MAIN_LANGUAGE}}` | go | Primary programming language |
+| `{{MCP_NAMESPACE}}` | cultra | MCP server namespace prefix used in `## Harness Contract`. Used to build tool names like `mcp__cultra__save_task`. Delete the Harness Contract section entirely if you don't have an MCP task tracker. |
 
 ### Optional Replacements (in examples)
 
@@ -137,7 +159,8 @@ cat docs/SESSION_NOTES.md
 
 ### Phase 2: Feature Selection (10 minutes)
 - [ ] Decide: Using MCP session tools? (YES/NO)
-  - If NO: Remove MCP sections, add alternatives
+  - If NO: Remove MCP sections, add alternatives, AND delete the `## Harness Contract` section
+  - If YES: Replace `{{MCP_NAMESPACE}}` in the Harness Contract section, curate the `preload_tools` list
 - [ ] Decide: Using code intelligence tools? (YES/NO)
   - If NO: Remove AST/LSP sections
 - [ ] Remove all `[REMOVE IF NOT USING]` sections you don't need
@@ -472,6 +495,7 @@ Add to the Changelog section:
 |---------|------|-------|
 | Philosophy | Core | ✅ Always |
 | Quick Start | Core | ✅ Always (customize) |
+| Harness Contract | Conditional | ✅ If using MCP task tracker, ❌ delete entirely otherwise |
 | Work Classification | Core | ✅ Always |
 | Protocol Modes | Core | ✅ Always |
 | Workflow Timing | Core | ✅ Always |

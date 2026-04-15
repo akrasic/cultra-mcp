@@ -13,6 +13,8 @@ pub fn detect_language(file_path: &str) -> Option<&'static str> {
         "jsx" => Some("javascript"),
         "py" => Some("python"),
         "rs" => Some("rust"),
+        "tf" | "tfvars" => Some("terraform"),
+        "svelte" => Some("svelte"),
         _ => None,
     }
 }
@@ -59,6 +61,8 @@ mod tests {
         assert_eq!(detect_language("script.js"), Some("javascript"));
         assert_eq!(detect_language("module.py"), Some("python"));
         assert_eq!(detect_language("lib.rs"), Some("rust"));
+        assert_eq!(detect_language("main.tf"), Some("terraform"));
+        assert_eq!(detect_language("vars.tfvars"), Some("terraform"));
         assert_eq!(detect_language("unknown.txt"), None);
     }
 

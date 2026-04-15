@@ -3,6 +3,7 @@ mod lsp;
 mod mcp;
 mod api_client;
 mod config;
+mod workspace;
 
 use anyhow::Result;
 use std::env;
@@ -194,8 +195,15 @@ fn main() -> Result<()> {
     let lsp_manager = lsp::LSPManager::new(&workspace_root);
     tracing::info!("LSP manager initialized for workspace: {:?}", workspace_root);
 
+    // Detect default project_id from CLAUDE.md
+    let default_project = config::detect_project_id(&workspace_root);
+    if let Some(ref pid) = default_project {
+        tracing::info!("Default project detected from CLAUDE.md: {}", pid);
+    }
+
     // Create MCP server
-    let mut server = mcp::Server::new(api_client, lsp_manager);
+    let mut server = mcp::Server::new(api_client, lsp_manager)
+        .with_default_project(default_project);
     let selected_transport = parse_transport_mode();
     tracing::info!("Transport mode: {:?}", selected_transport);
 

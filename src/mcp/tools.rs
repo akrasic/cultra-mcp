@@ -1,28 +1,50 @@
+use super::execution_waves::get_execution_waves;
+use super::project_map::{merge_project_map_into, scan_project_map_tool};
 use super::protocol::Tool;
-use super::types::{
-    DecisionStatus, DocType, EnumValues, PlanStatus, Priority, SessionStrategy, TaskStatus,
-    TaskType,
-};
 use super::Server;
-use crate::ast::{
-    analyze_concurrency, analyze_css, analyze_react_component, css_variable_graph, find_css_rules,
-    find_interface_implementations, find_unused_selectors, resolve_tailwind_classes, Parser,
+use super::types::{
+    SessionStrategy, TaskType, TaskStatus, Priority,
+    DocType, PlanStatus, DecisionStatus, EnumValues,
 };
-use crate::lsp::tools::{lsp_document_symbols, lsp_query, lsp_workspace_symbols};
+use crate::ast::{
+    Parser,
+    analyze_complexity,
+    analyze_concurrency,
+    analyze_css, find_css_rules, find_unused_selectors, css_variable_graph,
+    analyze_react_component,
+    find_interface_implementations,
+    analyze_security,
+    resolve_tailwind_classes,
+};
+use crate::lsp::tools::{
+    lsp_query,
+    lsp_workspace_symbols,
+    lsp_document_symbols,
+};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Map, Value};
 use std::fmt;
 
 // Embed templates at compile time
-const CLAUDE_MD_TEMPLATE: &str = include_str!("../../CLAUDE.md.TEMPLATE");
-const CLAUDE_TEMPLATE_GUIDE: &str = include_str!("../../CLAUDE_TEMPLATE_GUIDE.md");
+const CLAUDE_MD_TEMPLATE: &str = include_str!("../../../CLAUDE.md.TEMPLATE");
+const CLAUDE_TEMPLATE_GUIDE: &str = include_str!("../../../CLAUDE_TEMPLATE_GUIDE.md");
+
+// Embed skills at compile time
+const SKILL_SECURITY_AUDIT: &str = include_str!("../../skills/security-audit.md");
+const SKILL_CODE_REVIEW: &str = include_str!("../../skills/code-review.md");
+
+/// Built-in skills that can be installed via install_skills tool
+const BUILT_IN_SKILLS: &[(&str, &str)] = &[
+    ("security-audit", SKILL_SECURITY_AUDIT),
+    ("code-review", SKILL_CODE_REVIEW),
+];
 
 /// Get all tool definitions
 pub fn get_tool_definitions() -> Vec<Tool> {
     vec![
         Tool {
             name: "load_session_state".to_string(),
-            description: "Load the most recent session state for a project to resume work. Supports multiple retrieval strategies based on time decay and access patterns. Optionally includes complete plan context with smart suggestions.".to_string(),
+            description: "Load the most recent session state for a project to resume work. Supports multiple retrieval strategies based on time decay and access patterns. Optionally includes complete plan context with smart suggestions. Response also includes a `project_map` field (CULTRA-1011) with the workspace floorplan from get_project_map for boot-up orientation; absent if the scan fails.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -72,6 +94,11 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "context_snapshot": {
                         "type": "object",
                         "description": "Context snapshot"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["work", "exploration", "qa", "throwaway"],
+                        "description": "Session classification (CULTRA-902). 'work' (default) for substantive work, 'exploration' for quick pokes, 'qa' for spelunking, 'throwaway' for one-off runs that should be filtered out of recent_activity."
                     }
                 },
                 "required": ["project_id"]
@@ -108,6 +135,11 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "limit": {
                         "type": "number",
                         "description": "Maximum number of sessions to return (default: 50)"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["work", "exploration", "qa", "throwaway"],
+                        "description": "Filter by session kind (CULTRA-902). Omit to include all kinds."
                     }
                 },
                 "required": ["project_id"]
@@ -147,7 +179,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "get_tasks".to_string(),
-            description: "Query tasks with optional filters".to_string(),
+            description: "Get tasks in a project with optional structured filters (status, priority, assigned_to) and pagination (limit, offset, sort, dir). status accepts either a single value or an array of values for multi-status filtering (e.g. status=['done','cancelled']). Response shape (CULTRA-929 A1): {tasks: [...], total: N, limit: N, offset: N}. Use this when you know the exact fields you want; use search_tasks for fuzzy text queries.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -156,8 +188,11 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "description": "Project identifier"
                     },
                     "status": {
-                        "type": "string",
-                        "description": "Filter by status (todo, in_progress, blocked, done, cancelled)"
+                        "oneOf": [
+                            {"type": "string"},
+                            {"type": "array", "items": {"type": "string"}}
+                        ],
+                        "description": "Filter by status. Accepts a single string ('todo', 'in_progress', 'blocked', 'done', 'cancelled') or an array of strings for multi-status filtering."
                     },
                     "priority": {
                         "type": "string",
@@ -166,6 +201,23 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "assigned_to": {
                         "type": "string",
                         "description": "Filter by assignee"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum tasks to return (CULTRA-929 A1). Default and cap are backend-defined."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Number of tasks to skip (CULTRA-929 A1). Combine with limit for pagination."
+                    },
+                    "sort": {
+                        "type": "string",
+                        "description": "Sort field (CULTRA-929 A1). Common values: 'updated_at', 'created_at', 'completed_at', 'priority'. Backend defines the full set."
+                    },
+                    "dir": {
+                        "type": "string",
+                        "enum": ["asc", "desc"],
+                        "description": "Sort direction (CULTRA-929 A1). Default backend-defined."
                     }
                 },
                 "required": ["project_id"]
@@ -230,6 +282,28 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "assigned_to": {
                         "type": "string",
                         "description": "Assignee"
+                    },
+                    "external_blockers": {
+                        "type": "array",
+                        "description": "External (non-task) blockers (CULTRA-903). Array of {reason, contact?, eta?}.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reason": {"type": "string"},
+                                "contact": {"type": "string"},
+                                "eta": {"type": "string", "description": "RFC3339 timestamp"}
+                            },
+                            "required": ["reason"]
+                        }
+                    },
+                    "progress_log": {
+                        "type": "object",
+                        "description": "Inline progress log entry written alongside the task in one call (CULTRA-900). Saves a round-trip vs. calling add_progress_log separately.",
+                        "properties": {
+                            "who": {"type": "string"},
+                            "what": {"type": "string"}
+                        },
+                        "required": ["who", "what"]
                     }
                 },
                 "required": ["project_id", "title"]
@@ -251,7 +325,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "get_task_chain".to_string(),
-            description: "Get complete dependency chain for a task showing all upstream (blocking) and downstream (blocked) tasks transitively. Useful for understanding task dependencies and planning work order.".to_string(),
+            description: "Get the full dependency chain for a task. Use direction='upstream' to find what blocks this task, direction='downstream' to find which tasks depend on this one ('who's waiting on X?'), or direction='both' (default) for full context. Use relationship_type='supersedes' (CULTRA-903) to walk the supersedes/superseded_by relationship instead of the default 'blocks' relationship. Example: get_task_chain({task_id:'X', direction:'downstream'}) answers 'who's waiting on X?'.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -267,9 +341,40 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "max_depth": {
                         "type": "number",
                         "description": "Maximum traversal depth (default: 10, max: 10)"
+                    },
+                    "relationship_type": {
+                        "type": "string",
+                        "enum": ["blocks", "supersedes"],
+                        "description": "Which relationship type to walk. Default 'blocks' walks blocked_by/blocks arrays. 'supersedes' walks superseded_by/supersedes arrays (CULTRA-903)."
                     }
                 },
                 "required": ["task_id"]
+            }),
+        },
+        Tool {
+            name: "get_execution_waves".to_string(),
+            description: "Return tasks grouped into dependency waves via topological sort (Kahn's algorithm). Wave 0 contains tasks with no in-scope blockers and can run first in parallel; wave 1 depends on wave 0, etc. Exactly one of plan_id or project_id is required. Each task carries has_external_blockers (non-task blockers from CULTRA-903) and has_external_task_deps (blockers in another plan/project or filtered out by status) summary bools — the wave represents readiness within the requested scope. If the graph contains cycles, cycle_detected=true and cycle_members lists the implicated task IDs; repair via task_dependency({action:'remove', ...}). Superseded tasks (superseded_by non-empty) are always excluded. Default status filter includes todo/in_progress/blocked/review; override via include_statuses. Pass include_excluded=true to additionally get a map of done/cancelled/superseded task IDs that were filtered out.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "plan_id": {
+                        "type": "string",
+                        "description": "Plan to compute waves for. Common case: per-plan execution planning."
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project to compute waves for. Use when you want the full project DAG rather than a single plan."
+                    },
+                    "include_statuses": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Override default status filter. Default: ['todo','in_progress','blocked','review']. Pass include_statuses=['todo','in_progress','blocked','review','done','cancelled'] for full retrospective DAG."
+                    },
+                    "include_excluded": {
+                        "type": "boolean",
+                        "description": "When true, the response includes excluded.{done,cancelled,superseded} arrays of task IDs that were filtered out. Default: false (lean response)."
+                    }
+                }
             }),
         },
         Tool {
@@ -289,6 +394,19 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "assigned_to": {
                         "type": "string",
                         "description": "Optionally update assignee at the same time"
+                    },
+                    "progress_log": {
+                        "type": "object",
+                        "description": "Inline progress log entry written alongside the status change in one call (CULTRA-900).",
+                        "properties": {
+                            "who": {"type": "string"},
+                            "what": {"type": "string"}
+                        },
+                        "required": ["who", "what"]
+                    },
+                    "if_version": {
+                        "type": "integer",
+                        "description": "Optimistic concurrency token (CULTRA-904)."
                     }
                 },
                 "required": ["task_id", "status"]
@@ -340,6 +458,32 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "details": {
                         "type": "object",
                         "description": "Additional details (optional)"
+                    },
+                    "external_blockers": {
+                        "type": "array",
+                        "description": "Replace external blockers with this list (CULTRA-903). Empty array clears all. Omit to leave unchanged.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reason": {"type": "string"},
+                                "contact": {"type": "string"},
+                                "eta": {"type": "string", "description": "RFC3339 timestamp"}
+                            },
+                            "required": ["reason"]
+                        }
+                    },
+                    "progress_log": {
+                        "type": "object",
+                        "description": "Inline progress log entry written alongside the update in one call (CULTRA-900).",
+                        "properties": {
+                            "who": {"type": "string"},
+                            "what": {"type": "string"}
+                        },
+                        "required": ["who", "what"]
+                    },
+                    "if_version": {
+                        "type": "integer",
+                        "description": "Optimistic concurrency token (CULTRA-904). Include the version you read; if the row has changed since, the update fails with a version conflict and the response includes the current version for retry."
                     }
                 },
                 "required": ["task_id"]
@@ -347,7 +491,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "task_dependency".to_string(),
-            description: "Add or remove a dependency relationship between tasks".to_string(),
+            description: "Add or remove a dependency relationship between tasks. Default type='blocks' updates blocks/blocked_by arrays. type='supersedes' (CULTRA-903) updates supersedes/superseded_by arrays for the 'this task replaces that one' relationship.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -363,6 +507,11 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "depends_on": {
                         "type": "string",
                         "description": "Task that must be completed first / to remove from dependencies (required)"
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["blocks", "supersedes"],
+                        "description": "Relationship type. Default 'blocks'. 'supersedes' marks task_id as superseded by depends_on (CULTRA-903)."
                     }
                 },
                 "required": ["action", "task_id", "depends_on"]
@@ -410,7 +559,11 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "content": {
                         "type": "string",
-                        "description": "Markdown content (required)"
+                        "description": "Markdown content (required unless file_path is provided)"
+                    },
+                    "content_file": {
+                        "type": "string",
+                        "description": "Absolute path to a local markdown file to read as content. Overrides content if both are provided."
                     },
                     "doc_type": {
                         "type": "string",
@@ -492,6 +645,10 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "type": "string",
                         "description": "New markdown content (optional)"
                     },
+                    "content_file": {
+                        "type": "string",
+                        "description": "Absolute path to a local markdown file to read as content. Overrides content if both are provided."
+                    },
                     "doc_type": {
                         "type": "string",
                         "description": "New document type (optional)"
@@ -500,6 +657,10 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "New tags (optional)"
+                    },
+                    "if_version": {
+                        "type": "integer",
+                        "description": "Optimistic concurrency token (CULTRA-904). Include the version you read; mismatched updates fail with a version conflict."
                     }
                 },
                 "required": ["document_id"]
@@ -670,31 +831,189 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // AST Tools
         Tool {
             name: "parse_file_ast".to_string(),
-            description: "Parse a code file and extract AST metadata (symbols, functions, calls, imports). Returns semantic information about the code structure.".to_string(),
+            description: "Parse a code file and extract AST metadata (symbols, functions, calls, imports). Returns semantic information about the code structure. Set with_callers=true to enrich each exported function/method with up to 10 cross-file callers via LSP references (CULTRA-906).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to the code file to parse (.go, .ts, .tsx, .js, .jsx, .py, .rs, .php)"
+                        "description": "Absolute path to the code file to parse (.go, .ts, .tsx, .js, .jsx, .py, .rs, .php, .tf)"
                     },
                     "project_id": {
                         "type": "string",
                         "description": "Project identifier (optional, defaults to 'proj-cultra')"
+                    },
+                    "with_callers": {
+                        "type": "boolean",
+                        "description": "If true, attach a 'callers' list to each exported function/method symbol via LSP textDocument/references (CULTRA-906). Best-effort: degrades gracefully if LSP is unavailable. Per-symbol caller lookups can be slow on large workspaces."
+                    },
+                    "preview_lines": {
+                        "type": "number",
+                        "description": "CULTRA-994: include the first N lines of each symbol's source body as a 'preview' array. Useful for orientation without a separate Read call. Default: omitted (no preview)."
                     }
                 },
                 "required": ["file_path"]
             }),
         },
         Tool {
-            name: "analyze_file".to_string(),
-            description: "Analyze a source file. analyzer=\"concurrency\": Go concurrency patterns (goroutines, channels, mutex, race conditions). analyzer=\"react\": React component structure (props, hooks, state, children). analyzer=\"css\": CSS structural metadata (selectors, specificity, variables, media queries). analyzer=\"css_variables\": CSS custom property dependency graph (var() chains, cycles, unresolved refs).".to_string(),
+            name: "diff_file_ast".to_string(),
+            description: "Structural AST diff between two git revisions of the same file (CULTRA-909). Compares symbols by name and reports added, removed, and signature-changed functions/types. Use this for code review questions like 'what symbols did this branch add?' that raw text diff struggles to answer cleanly. base_ref is required; head_ref defaults to HEAD.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the file (must be inside the workspace git repo)"
+                    },
+                    "base_ref": {
+                        "type": "string",
+                        "description": "Git ref for the 'old' version (e.g., 'main', 'HEAD~5', commit SHA)"
+                    },
+                    "head_ref": {
+                        "type": "string",
+                        "description": "Git ref for the 'new' version (default: 'HEAD')"
+                    }
+                },
+                "required": ["file_path", "base_ref"]
+            }),
+        },
+        Tool {
+            name: "analyze_changes".to_string(),
+            description: "Run an analyzer (CULTRA-908) over only the files that changed between a git ref and the working tree. Thin wrapper around analyze_files. CULTRA-956: include_working_tree defaults to true, so 'analyze what my branch introduced' covers uncommitted work by default. Pass include_working_tree=false to scope strictly to committed changes between {since} and HEAD. The empty-result message distinguishes 'no changes found' from 'language filter rejected files' so a misconfiguration is debuggable.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "since": {
+                        "type": "string",
+                        "description": "Git ref to diff against (e.g., 'main', 'HEAD~5', commit SHA). With include_working_tree=true (default) this is `git diff <since>` (working-tree vs ref). With include_working_tree=false this is `git diff <since> HEAD` (committed-only)."
+                    },
+                    "analyzer": {
+                        "type": "string",
+                        "enum": ["concurrency", "react", "css", "css_variables", "security", "complexity"],
+                        "description": "Analyzer to run on each changed file"
+                    },
+                    "include_working_tree": {
+                        "type": "boolean",
+                        "description": "If true (CULTRA-956 default), uncommitted working-tree changes are included in the diff. Pass false to restrict to committed diffs only."
+                    }
+                },
+                "required": ["since", "analyzer"]
+            }),
+        },
+        Tool {
+            name: "find_dead_code".to_string(),
+            description: "Find exported functions/methods in a file that are never referenced from anywhere in the workspace (CULTRA-907). Uses LSP textDocument/references for each exported callable. Caveats: dynamic dispatch, reflection, build tags, and test-only exports are NOT detected and may produce false positives. Requires a running language server. The response includes an lsp_index_status field ('warm'|'cold'|'unknown') so callers can detect a cold LSP index without digging through caveats (CULTRA-947). Set require_warm_index=true to fail fast rather than receive best-effort results when the index isn't ready.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the source file to scan"
+                    },
+                    "require_warm_index": {
+                        "type": "boolean",
+                        "description": "If true, return an error when the LSP index appears cold (every checked symbol returns zero references) instead of producing best-effort 'low' confidence findings. Defaults to false for backward compatibility."
+                    },
+                    "warmup": {
+                        "type": "boolean",
+                        "description": "CULTRA-950: if true, run a per-language warmup command (e.g. `cargo check` for Rust, `go build ./...` for Go) before querying LSP, so the index is populated. Cached per session and invalidated when source files are touched. First call in a fresh session pays the cold-start cost (typically 5-30s); subsequent calls are instant. Languages with no warmup command return status='skipped' instead of erroring. Default false."
+                    }
+                },
+                "required": ["file_path"]
+            }),
+        },
+        Tool {
+            name: "find_references".to_string(),
+            description: "Semantic call-site lookup for a symbol (CULTRA-948). Uses LSP textDocument/references to find every usage of `symbol` declared in `file_path`, then classifies each hit with a role field: `definition` | `call` | `type_use` | `doc` | `unknown`. Use this instead of Grep during refactors when you need to know whether a hit is a function call, a type reference, or prose in a doc comment. Inherits the CULTRA-947 cold-index guard: the response includes an `lsp_index_status` field, and cold results (no cross-site references) surface a top-level `warning`. Pass `require_warm_index=true` to fail fast on a cold index instead of getting a best-effort empty result.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Symbol name to find references for (e.g. 'MyFunction', 'compose_from_diff_screens'). Must be declared in file_path."
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the file that declares the symbol. Used as the LSP anchor position."
+                    },
+                    "include_declaration": {
+                        "type": "boolean",
+                        "description": "If true, the declaration site is included in results as role='definition'. Default false — most refactors only want call sites."
+                    },
+                    "require_warm_index": {
+                        "type": "boolean",
+                        "description": "If true, return an error when the LSP index appears cold (references list is empty or declaration-only). Default false."
+                    },
+                    "warmup": {
+                        "type": "boolean",
+                        "description": "CULTRA-950: if true, run a per-language warmup command before querying LSP. See find_dead_code's warmup docs for details. Cached per session and mtime-invalidated. Default false."
+                    }
+                },
+                "required": ["symbol", "file_path"]
+            }),
+        },
+        Tool {
+            name: "analyze_symbol".to_string(),
+            description: "Single-function metrics + optional delta-against-baseline mode (CULTRA-949). Filters analyze_file(complexity)'s output to one symbol so a refactor loop can run this after every edit and see cyclomatic/cognitive/lines move by {-3, +0, +1} instead of re-reading a ~100-function JSON blob. Pass delta_against={cyclomatic, cognitive, lines[, rating]} to turn the response into live deltas with `prev`/`now`/`delta` per metric. v1 supports analyzer='complexity' only.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the source file containing the symbol."
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Function or method name to analyze. If the file has multiple functions with the same name (overloads / different impls), the first match is returned with a top-level warning."
+                    },
+                    "analyzer": {
+                        "type": "string",
+                        "enum": ["complexity"],
+                        "description": "Analyzer to run. v1 only supports 'complexity'. Default: 'complexity'."
+                    },
+                    "delta_against": {
+                        "type": "object",
+                        "description": "Optional inline baseline. When present, each metric is returned as {prev, now, delta} instead of a scalar. Keys: cyclomatic (int), cognitive (int), lines (int), rating (string, optional). Missing keys fall back to the scalar form for that metric.",
+                        "properties": {
+                            "cyclomatic": {"type": "integer"},
+                            "cognitive": {"type": "integer"},
+                            "lines": {"type": "integer"},
+                            "rating": {"type": "string"}
+                        }
+                    }
+                },
+                "required": ["file_path", "symbol"]
+            }),
+        },
+        Tool {
+            name: "analyze_files".to_string(),
+            description: "Bulk variant of analyze_file (CULTRA-905). Runs the same analyzer against many files in parallel and returns one entry per input file. Per-file failures are isolated — one bad path doesn't abort the batch. Use this instead of wrapping individual analyze_file calls in `batch` for whole-package or whole-repo audits.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "analyzer": {
                         "type": "string",
-                        "enum": ["concurrency", "react", "css", "css_variables"],
+                        "enum": ["concurrency", "react", "css", "css_variables", "security", "complexity"],
+                        "description": "Analyzer type (required)"
+                    },
+                    "file_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Absolute paths to analyze. Capped at 500 entries per call. Order is preserved in the result."
+                    }
+                },
+                "required": ["analyzer", "file_paths"]
+            }),
+        },
+        Tool {
+            name: "analyze_file".to_string(),
+            description: "Analyze a source file. analyzer=\"concurrency\": Go concurrency patterns (goroutines, channels, mutex, race conditions). analyzer=\"react\": React component structure (props, hooks, state, children). analyzer=\"css\": CSS structural metadata (selectors, specificity, variables, media queries). analyzer=\"css_variables\": CSS custom property dependency graph (var() chains, cycles, unresolved refs). analyzer=\"security\": Security vulnerability scan (SQL injection, XSS, command injection, hardcoded secrets, insecure crypto, SSRF, Terraform misconfigs — multi-language). analyzer=\"complexity\": Cyclomatic and cognitive complexity per function/resource block with ratings (multi-language incl. Terraform).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "analyzer": {
+                        "type": "string",
+                        "enum": ["concurrency", "react", "css", "css_variables", "security", "complexity"],
                         "description": "Analyzer type (required)"
                     },
                     "file_path": {
@@ -721,6 +1040,62 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     }
                 },
                 "required": ["file_path"]
+            }),
+        },
+        // CULTRA-995: contextual search — grep + AST annotation
+        Tool {
+            name: "contextual_search".to_string(),
+            description: "Search for a text pattern and annotate each match with the AST symbol that contains it (CULTRA-995). Combines grep-style text search with parse_file_ast-level context. Each match includes the file, line, matched text, and the containing function/class/method name and line range. Use this instead of Grep when you need to know 'which function contains this pattern' without a separate parse_file_ast call per file.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Text pattern to search for (passed to ripgrep)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Directory or file to search in. Defaults to workspace root. Must be within workspace."
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "File glob filter (e.g., '*.py', '*.rs'). Passed to ripgrep --glob."
+                    },
+                    "max_results": {
+                        "type": "number",
+                        "description": "Maximum matches to return. Default: 100."
+                    }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        // CULTRA-996: project manifest reader
+        Tool {
+            name: "project_info".to_string(),
+            description: "Read a project's manifest file and return structured metadata (CULTRA-996). Supports Cargo.toml, pyproject.toml, package.json, go.mod, composer.json. Returns language, dependencies, dev dependencies, version constraints, package manager, and LSP server availability. Use this instead of manually reading manifest files.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the project directory (must contain a manifest file). Defaults to workspace root."
+                    }
+                },
+                "required": []
+            }),
+        },
+        // CULTRA-1009: workspace floorplan for boot-up orientation
+        Tool {
+            name: "get_project_map".to_string(),
+            description: "Return a deterministic floorplan of the workspace: top-level directories classified by language/framework from their manifest files. Nested repos (with their own .git) are flagged is_own_repo=true and pruned to just a boundary marker — call get_project_map with their path for details. Submodules/worktrees are flagged submodule=true but kept with full manifest info (they're part of parent history). Use this at session boot to orient: what's here, what's mine to edit, what's somebody else's.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Optional workspace root. Defaults to the server's workspace_root. Must be within the workspace root."
+                    }
+                }
             }),
         },
         // CSS Analysis Tools
@@ -1005,13 +1380,13 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // LSP Tools
         Tool {
             name: "lsp".to_string(),
-            description: "LSP position query. action=\"references\": find all references. action=\"definition\": jump to definition. action=\"hover\": get type info and docs.".to_string(),
+            description: "LSP position query. action=\"references\": find all references. action=\"definition\": jump to definition. action=\"hover\": get type info and docs. action=\"implementation\": find trait/interface implementations (CULTRA-966). CULTRA-955: workspace_root is now resolved by walking up from file_path to the language manifest (Cargo.toml, go.mod, tsconfig.json) instead of defaulting to the MCP cwd. Response includes lsp_index_status='warm'|'cold'|'unknown' and a top-level warning when cold so callers can distinguish a real empty result from a not-yet-indexed workspace. Pass require_warm_index=true to fail fast on cold.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["references", "definition", "hover"],
+                        "enum": ["references", "definition", "hover", "implementation"],
                         "description": "LSP action to perform (required)"
                     },
                     "file_path": {
@@ -1028,7 +1403,15 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "workspace_root": {
                         "type": "string",
-                        "description": "Optional workspace root (defaults to current dir)"
+                        "description": "Optional workspace root override. CULTRA-955: when omitted, the workspace root is resolved by walking up from file_path to the language's manifest file (Cargo.toml / go.mod / tsconfig.json). Only override this if the walk-up resolves to the wrong project."
+                    },
+                    "require_warm_index": {
+                        "type": "boolean",
+                        "description": "If true (CULTRA-955), return an error when the LSP returns no useful results — usually means the index isn't ready yet. Default false: returns best-effort results with lsp_index_status='cold' and a warning."
+                    },
+                    "warmup": {
+                        "type": "boolean",
+                        "description": "CULTRA-963: if true, run a per-language warmup command (e.g. `cargo check` for Rust, `go build ./...` for Go) before querying LSP, so the index is fully populated for positional queries (hover, definition) that need semantic analysis beyond declaration-level info. Cached per session and invalidated when source files are touched. Default false."
                     }
                 },
                 "required": ["action", "file_path", "line", "character"]
@@ -1036,7 +1419,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "lsp_workspace_symbols".to_string(),
-            description: "Search for symbols across the entire workspace using LSP".to_string(),
+            description: "Search for symbols across the entire workspace using LSP. CULTRA-955: pass either workspace_root explicitly OR a file_path hint (any file inside the desired workspace) so the resolver can walk up to the language manifest. Without either, falls back to the MCP cwd which is usually wrong in nested-crate layouts. Response includes lsp_index_status and a cold-index warning when zero symbols come back.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1050,7 +1433,19 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "workspace_root": {
                         "type": "string",
-                        "description": "Optional workspace root (defaults to current dir)"
+                        "description": "Optional explicit workspace root. Wins over file_path hint."
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Optional hint: absolute path to any file inside the desired workspace. CULTRA-955: when given, the workspace root is resolved by walking up from this path to the language's manifest. Recommended over relying on the manager default."
+                    },
+                    "require_warm_index": {
+                        "type": "boolean",
+                        "description": "If true (CULTRA-955), return an error when zero symbols come back. Default false: returns the empty result with lsp_index_status='cold' and a warning."
+                    },
+                    "warmup": {
+                        "type": "boolean",
+                        "description": "CULTRA-963: if true, run a per-language warmup command before querying LSP. Uses file_path hint for warmup target. Cached per session. Default false."
                     }
                 },
                 "required": ["query", "language"]
@@ -1058,7 +1453,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "lsp_document_symbols".to_string(),
-            description: "List all symbols in a document using LSP".to_string(),
+            description: "List all symbols in a document using LSP. CULTRA-955: workspace_root is now resolved by walking up from file_path to the language manifest. Response includes lsp_index_status and a top-level warning when zero symbols come back, so a confidently-empty result (file genuinely has no symbols) is distinguishable from a cold index (workspace not yet indexed).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1068,7 +1463,23 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "workspace_root": {
                         "type": "string",
-                        "description": "Optional workspace root (defaults to current dir)"
+                        "description": "Optional workspace root override. CULTRA-955: defaults to the manifest dir found by walking up from file_path."
+                    },
+                    "require_warm_index": {
+                        "type": "boolean",
+                        "description": "If true (CULTRA-955), return an error when zero symbols come back. Default false."
+                    },
+                    "warmup": {
+                        "type": "boolean",
+                        "description": "CULTRA-963: if true, run a per-language warmup command before querying LSP. Cached per session. Default false."
+                    },
+                    "max_results": {
+                        "type": "number",
+                        "description": "CULTRA-971: maximum number of symbols to return. Useful for large files (e.g. api.ts with 90+ methods). When set, response includes total, offset, and max_results fields for pagination."
+                    },
+                    "offset": {
+                        "type": "number",
+                        "description": "CULTRA-971: skip the first N symbols before applying max_results. Default 0. Use with max_results to paginate through large symbol lists."
                     }
                 },
                 "required": ["file_path"]
@@ -1098,6 +1509,92 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                 "required": ["operations"]
             }),
         },
+        // Activity feed
+        Tool {
+            name: "recent_activity".to_string(),
+            description: "Get recent activity across a project — tasks updated, documents changed, decisions made, sessions. Answers 'what happened since I was last here?' in one call.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project identifier (optional if CLAUDE.md has Project line)"
+                    },
+                    "hours": {
+                        "type": "number",
+                        "description": "Look back N hours (default: 24, max: 168)"
+                    }
+                }
+            }),
+        },
+        // Knowledge Base Tools
+        Tool {
+            name: "kb_ask".to_string(),
+            description: "Query the knowledge base using RAG (Retrieval-Augmented Generation). Returns an AI-generated answer with source citations from indexed KB documents.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language question to ask the knowledge base (required)"
+                    },
+                    "space_key": {
+                        "type": "string",
+                        "description": "Optional KB space key to limit search scope"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum number of source chunks to retrieve (default: 5)"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+        // Unified Search
+        Tool {
+            name: "unified_search".to_string(),
+            description: "Search across all entities in a project (tasks, documents, plans, decisions, sessions). Returns ranked results from all entity types.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project identifier (required)"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (required)"
+                    },
+                    "entity_types": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Filter by entity types: task, document, plan, decision, session (optional, default: all)"
+                    },
+                    "limit": {
+                        "type": "number",
+                        "description": "Maximum results (default: 20, max: 50)"
+                    }
+                },
+                "required": ["project_id", "query"]
+            }),
+        },
+        Tool {
+            name: "install_skills".to_string(),
+            description: "Install Cultra's built-in Claude Code skills into .claude/skills/ in the current workspace. Skills provide specialized modes like security auditing and code review. Idempotent — skips existing files unless force=true.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "force": {
+                        "type": "boolean",
+                        "description": "Overwrite existing skill files (default: false)"
+                    },
+                    "list": {
+                        "type": "boolean",
+                        "description": "Just list available skills without installing (default: false)"
+                    }
+                }
+            }),
+        },
         Tool {
             name: "get_template".to_string(),
             description: "Get a built-in Cultra template. name=\"claude_md\": CLAUDE.md template for new projects. name=\"template_guide\": setup guide explaining how to customize the template.".to_string(),
@@ -1118,6 +1615,22 @@ pub fn get_tool_definitions() -> Vec<Tool> {
 
 // ========== Generic Tool Helpers ==========
 
+/// Resolve project_id: use provided value, fall back to server default, or error
+fn resolve_project_id(server: &Server, args: &mut Map<String, Value>) -> Result<()> {
+    if let Some(Value::String(pid)) = args.get("project_id") {
+        if !pid.is_empty() {
+            return Ok(()); // Already provided
+        }
+    }
+    // Fall back to default
+    if let Some(ref default_pid) = server.default_project_id {
+        args.insert("project_id".to_string(), Value::String(default_pid.clone()));
+        Ok(())
+    } else {
+        Err(anyhow!("Missing required parameter: project_id (no default detected from CLAUDE.md)"))
+    }
+}
+
 // ========== Helper Functions ==========
 
 /// Get human-readable type name from a JSON Value
@@ -1132,16 +1645,29 @@ fn get_value_type_name(value: &Value) -> &'static str {
     }
 }
 
-/// Validate that a file path exists and is readable
-fn validate_file_exists(file_path: &str) -> Result<()> {
+/// Validate that a file path exists, is readable, and is within the workspace
+fn validate_file_exists(file_path: &str, workspace_root: &std::path::Path) -> Result<()> {
     let path = std::path::Path::new(file_path);
-    if !path.exists() {
-        return Err(anyhow!(
+
+    // Canonicalize to resolve symlinks and ../ traversal
+    let canonical = path.canonicalize().map_err(|_| {
+        anyhow!(
             "File not found: '{}'. Please check the path and try again.",
             file_path
+        )
+    })?;
+
+    let canonical_workspace = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.to_path_buf());
+
+    if !canonical.starts_with(&canonical_workspace) {
+        return Err(anyhow!(
+            "Access denied: '{}' is outside the workspace root '{}'. File operations are restricted to the project directory.",
+            file_path,
+            workspace_root.display()
         ));
     }
-    if !path.is_file() {
+
+    if !canonical.is_file() {
         return Err(anyhow!(
             "Path exists but is not a file: '{}'. Expected a regular file.",
             file_path
@@ -1151,14 +1677,11 @@ fn validate_file_exists(file_path: &str) -> Result<()> {
 }
 
 /// Validate that an ID parameter contains only safe characters
-fn validate_id(field: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_id(field: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(anyhow!("{} cannot be empty", field));
     }
-    if !value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err(anyhow!("{} contains invalid characters: {}", field, value));
     }
     Ok(())
@@ -1173,9 +1696,13 @@ fn parse_positive_int(
 ) -> Result<Option<u64>> {
     match args.get(field) {
         Some(Value::Number(n)) => {
-            let val = n
-                .as_u64()
-                .ok_or_else(|| anyhow!("{} must be a positive integer (got: {})", field, n))?;
+            let val = n.as_u64().ok_or_else(|| {
+                anyhow!(
+                    "{} must be a positive integer (got: {})",
+                    field,
+                    n
+                )
+            })?;
 
             // Validate minimum
             if let Some(min_val) = min {
@@ -1231,12 +1758,8 @@ where
             })?;
             Ok(Some(value))
         }
-        Some(Value::Null) => Ok(None), // Treat null as absent
-        Some(val) => Err(anyhow!(
-            "{} must be a string, but got: {}",
-            field,
-            get_value_type_name(val)
-        )),
+        Some(Value::Null) => Ok(None),  // Treat null as absent
+        Some(val) => Err(anyhow!("{} must be a string, but got: {}", field, get_value_type_name(val))),
         None => Ok(None),
     }
 }
@@ -1244,20 +1767,28 @@ where
 // ========== Generic API Handlers ==========
 
 /// Generic POST handler - creates or updates a resource
-fn api_post(server: &Server, endpoint: &str, args: Map<String, Value>) -> Result<Value> {
+fn api_post(
+    server: &Server,
+    endpoint: &str,
+    args: Map<String, Value>,
+) -> Result<Value> {
     server.api.post(endpoint, Value::Object(args))
 }
 
 /// Generic PUT handler - updates a resource
-fn api_put(server: &Server, endpoint: &str, args: Map<String, Value>) -> Result<Value> {
+fn api_put(
+    server: &Server,
+    endpoint: &str,
+    args: Map<String, Value>,
+) -> Result<Value> {
     server.api.put(endpoint, Value::Object(args))
 }
 
 /// Generic GET by ID handler
 fn api_get_by_id(
     server: &Server,
-    endpoint_template: &str, // e.g., "/api/tasks/{}"
-    id_field: &str,          // e.g., "task_id"
+    endpoint_template: &str,  // e.g., "/api/tasks/{}"
+    id_field: &str,            // e.g., "task_id"
     args: &Map<String, Value>,
 ) -> Result<Value> {
     let id = args
@@ -1297,8 +1828,7 @@ fn api_get_with_filters(
         } else if let Some(value) = args.get(field).and_then(|v| v.as_u64()) {
             query.push((field.to_string(), value.to_string()));
         } else if let Some(arr) = args.get(field).and_then(|v| v.as_array()) {
-            let joined: Vec<String> = arr
-                .iter()
+            let joined: Vec<String> = arr.iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect();
             if !joined.is_empty() {
@@ -1313,8 +1843,8 @@ fn api_get_with_filters(
 /// Generic DELETE handler
 fn api_delete(
     server: &Server,
-    endpoint_template: &str, // e.g., "/api/tasks/{}/dependencies/{}"
-    id_fields: &[&str],      // e.g., ["task_id", "depends_on"]
+    endpoint_template: &str,  // e.g., "/api/tasks/{}/dependencies/{}"
+    id_fields: &[&str],        // e.g., ["task_id", "depends_on"]
     args: &Map<String, Value>,
 ) -> Result<Value> {
     let mut endpoint = endpoint_template.to_string();
@@ -1334,7 +1864,31 @@ fn api_delete(
 }
 
 /// Route tool calls to implementations
-pub fn call_tool(server: &mut Server, name: &str, args: Map<String, Value>) -> Result<Value> {
+pub fn call_tool(
+    server: &mut Server,
+    name: &str,
+    mut args: Map<String, Value>,
+) -> Result<Value> {
+    // Auto-fill project_id from CLAUDE.md default if not provided
+    if args.get("project_id").map_or(true, |v| v.as_str().map_or(true, |s| s.is_empty())) {
+        if let Some(ref default_pid) = server.default_project_id {
+            // Only inject if the tool's schema actually uses project_id
+            let tools_with_project_id = [
+                "load_session_state", "save_session_state", "get_sessions",
+                "get_session_code_context", "create_project",
+                "get_tasks", "search_tasks", "save_task",
+                "get_documents", "save_document", "update_document", "get_plan",
+                "save_plan", "get_plans", "save_decision", "get_decisions",
+                "add_graph_edge", "query_graph", "get_graph_neighbors",
+                "query_context", "search_code_context", "unified_search",
+                "recent_activity",
+            ];
+            if tools_with_project_id.contains(&name) {
+                args.insert("project_id".to_string(), Value::String(default_pid.clone()));
+            }
+        }
+    }
+
     match name {
         "load_session_state" => load_session_state(server, args),
         "save_session_state" => save_session_state(server, args),
@@ -1346,6 +1900,7 @@ pub fn call_tool(server: &mut Server, name: &str, args: Map<String, Value>) -> R
         "search_tasks" => search_tasks(server, args),
         "get_task" => get_task(server, args),
         "get_task_chain" => get_task_chain(server, args),
+        "get_execution_waves" => get_execution_waves(server, args),
         "save_task" => save_task(server, args),
         "update_task_status" => update_task_status(server, args),
         "update_task" => update_task(server, args),
@@ -1363,20 +1918,29 @@ pub fn call_tool(server: &mut Server, name: &str, args: Map<String, Value>) -> R
         "get_decisions" => get_decisions(server, args),
         // AST Tools
         "parse_file_ast" => parse_file_ast(server, args),
-        "analyze_file" => analyze_file_tool(args),
-        "find_interface_implementations" => find_interface_implementations_tool(args),
+        "analyze_file" => analyze_file_tool(args, &server.workspace_root),
+        "analyze_symbol" => analyze_symbol_tool(args, &server.workspace_root),
+        "analyze_files" => analyze_files_tool(args, &server.workspace_root),
+        "analyze_changes" => analyze_changes_tool(args, &server.workspace_root),
+        "diff_file_ast" => diff_file_ast_tool(args, &server.workspace_root),
+        "find_dead_code" => find_dead_code_tool(args, server),
+        "find_references" => find_references_tool(args, server),
+        "find_interface_implementations" => find_interface_implementations_tool(args, &server.workspace_root),
+        "contextual_search" => contextual_search_tool(args, &server.workspace_root),
+        "project_info" => project_info_tool(args, server),
+        "get_project_map" => scan_project_map_tool(args, server),
         // CSS Analysis Tools
-        "find_css_rules" => find_css_rules_tool(args),
-        "find_unused_selectors" => find_unused_selectors_tool(args),
+        "find_css_rules" => find_css_rules_tool(args, &server.workspace_root),
+        "find_unused_selectors" => find_unused_selectors_tool(args, &server.workspace_root),
         // CSS Analysis Tools V2
-        "resolve_tailwind_classes" => resolve_tailwind_classes_tool(args),
+        "resolve_tailwind_classes" => resolve_tailwind_classes_tool(args, &server.workspace_root),
         // LSP Tools
         "lsp" => lsp_query(args, &server.lsp),
         "lsp_workspace_symbols" => lsp_workspace_symbols(args, &server.lsp),
         "lsp_document_symbols" => lsp_document_symbols(args, &server.lsp),
         // Engine V2 Intelligence Tools
         "search_code_context" => search_code_context(server, args),
-        "read_symbol_lines" => read_symbol_lines(args),
+        "read_symbol_lines" => read_symbol_lines(args, &server.workspace_root),
         "init_vector_db" => init_vector_db(server, args),
         "query_context" => query_context(server, args),
         "add_graph_edge" => add_graph_edge(server, args),
@@ -1384,7 +1948,14 @@ pub fn call_tool(server: &mut Server, name: &str, args: Map<String, Value>) -> R
         "get_graph_neighbors" => get_graph_neighbors(server, args),
         // Batch execution
         "batch" => batch(server, args),
-        // Built-in templates
+        // Activity feed
+        "recent_activity" => recent_activity(server, args),
+        // Knowledge Base
+        "kb_ask" => kb_ask(server, args),
+        // Unified Search
+        "unified_search" => unified_search(server, args),
+        // Built-in templates & skills
+        "install_skills" => install_skills(args),
         "get_template" => get_template(args),
         _ => Err(anyhow!("Unknown tool: {}", name)),
     }
@@ -1466,6 +2037,226 @@ fn batch(server: &mut Server, args: Map<String, Value>) -> Result<Value> {
     }))
 }
 
+/// Tool implementation: recent_activity — composite view of recent project changes
+fn recent_activity(server: &Server, args: Map<String, Value>) -> Result<Value> {
+    let project_id = args
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: project_id"))?;
+
+    let hours = args
+        .get("hours")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(24)
+        .min(168) as i64;
+
+    // Calculate cutoff timestamp
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let cutoff_secs = now - (hours * 3600);
+
+    // Fetch tasks, documents, decisions, and sessions in parallel isn't possible
+    // with synchronous ureq, so we fetch sequentially but it's still fast
+    let tasks = server.api.get(
+        "/api/v2/tasks",
+        Some(vec![("project_id".to_string(), project_id.to_string())]),
+    ).unwrap_or(json!([]));
+
+    // CULTRA-938: /api/v2/tasks now returns {tasks, total, limit, offset}
+    // (CULTRA-929 A1) instead of a bare []. Unwrap the array before passing
+    // to filter_recent. Falls back to the original value if "tasks" isn't
+    // present, so this code stays correct against both shapes during the
+    // deploy window.
+    let tasks = match tasks.get("tasks").cloned() {
+        Some(arr) => arr,
+        None => tasks,
+    };
+
+    let documents = server.api.get(
+        "/api/v2/documents",
+        Some(vec![("project_id".to_string(), project_id.to_string())]),
+    ).unwrap_or(json!([]));
+
+    let decisions = server.api.get(
+        "/api/v2/decisions",
+        Some(vec![("project_id".to_string(), project_id.to_string())]),
+    ).unwrap_or(json!([]));
+
+    let sessions = server.api.get(
+        "/api/v2/sessions",
+        Some(vec![("project_id".to_string(), project_id.to_string())]),
+    ).unwrap_or(json!([]));
+
+    // Filter by updated_at > cutoff
+    let filter_recent = |items: &Value| -> Vec<Value> {
+        items.as_array().map(|arr| {
+            arr.iter().filter(|item| {
+                // Try updated_at, then last_active, then created_at
+                let ts = item.get("updated_at")
+                    .or_else(|| item.get("last_active"))
+                    .or_else(|| item.get("created_at"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                parse_timestamp_secs(ts) > cutoff_secs
+            }).cloned().collect()
+        }).unwrap_or_default()
+    };
+
+    let recent_tasks = filter_recent(&tasks);
+    let recent_docs = filter_recent(&documents);
+    let recent_decisions = filter_recent(&decisions);
+    let recent_sessions = filter_recent(&sessions);
+
+    Ok(json!({
+        "project_id": project_id,
+        "lookback_hours": hours,
+        "tasks": {
+            "count": recent_tasks.len(),
+            "items": recent_tasks.iter().map(|t| json!({
+                "task_id": t.get("task_id"),
+                "title": t.get("title"),
+                "status": t.get("status"),
+                "priority": t.get("priority"),
+                "updated_at": t.get("updated_at"),
+            })).collect::<Vec<_>>()
+        },
+        "documents": {
+            "count": recent_docs.len(),
+            "items": recent_docs.iter().map(|d| json!({
+                "document_id": d.get("document_id"),
+                "title": d.get("title"),
+                "doc_type": d.get("doc_type"),
+                "updated_at": d.get("updated_at"),
+            })).collect::<Vec<_>>()
+        },
+        "decisions": {
+            "count": recent_decisions.len(),
+            "items": recent_decisions.iter().map(|d| json!({
+                "decision_id": d.get("decision_id"),
+                "title": d.get("title"),
+                "status": d.get("status"),
+                "updated_at": d.get("updated_at"),
+            })).collect::<Vec<_>>()
+        },
+        "sessions": {
+            "count": recent_sessions.len(),
+            "items": recent_sessions.iter().map(|s| json!({
+                "session_id": s.get("session_id"),
+                "last_active": s.get("last_active"),
+                "working_memory": s.get("working_memory"),
+            })).collect::<Vec<_>>()
+        }
+    }))
+}
+
+/// Parse RFC 3339 timestamp to unix seconds. Returns 0 on parse failure.
+fn parse_timestamp_secs(ts: &str) -> i64 {
+    time::OffsetDateTime::parse(ts, &time::format_description::well_known::Rfc3339)
+        .map(|dt| dt.unix_timestamp())
+        .unwrap_or(0)
+}
+
+/// Tool implementation: kb_ask — query knowledge base with RAG
+fn kb_ask(server: &Server, args: Map<String, Value>) -> Result<Value> {
+    let _query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: query"))?;
+
+    server.api.post("/api/v2/kb/ask", serde_json::Value::Object(args))
+}
+
+/// Tool implementation: unified_search — search across all entity types
+fn unified_search(server: &Server, args: Map<String, Value>) -> Result<Value> {
+    let _project_id = args
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: project_id"))?;
+
+    let _query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: query"))?;
+
+    api_get_with_filters(
+        server,
+        "/api/v2/search",
+        &["project_id", "query"],
+        &["entity_types", "limit"],
+        &args,
+    )
+}
+
+/// Tool implementation: install_skills — bootstrap built-in skills into .claude/skills/
+fn install_skills(args: Map<String, Value>) -> Result<Value> {
+    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let list_only = args.get("list").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if list_only {
+        let skills: Vec<Value> = BUILT_IN_SKILLS
+            .iter()
+            .map(|(name, content)| {
+                // Extract description from frontmatter
+                let desc = content
+                    .lines()
+                    .find(|l| l.starts_with("description:"))
+                    .map(|l| l.strip_prefix("description:").unwrap_or("").trim())
+                    .unwrap_or("No description");
+                json!({
+                    "name": name,
+                    "description": desc,
+                    "size_bytes": content.len()
+                })
+            })
+            .collect();
+        return Ok(json!({
+            "available_skills": skills,
+            "total": skills.len()
+        }));
+    }
+
+    // Determine skills directory
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow!("Failed to get current directory: {}", e))?;
+    let skills_dir = cwd.join(".claude").join("skills");
+
+    // Create directory if needed
+    std::fs::create_dir_all(&skills_dir)
+        .map_err(|e| anyhow!("Failed to create .claude/skills/: {}", e))?;
+
+    let mut installed = Vec::new();
+    let mut skipped = Vec::new();
+
+    for (name, content) in BUILT_IN_SKILLS {
+        // Claude Code expects skills in subdirectories: .claude/skills/<name>/SKILL.md
+        let skill_dir = skills_dir.join(name);
+        let path = skill_dir.join("SKILL.md");
+        if path.exists() && !force {
+            skipped.push(json!({
+                "name": name,
+                "reason": "already exists (use force=true to overwrite)"
+            }));
+            continue;
+        }
+        std::fs::create_dir_all(&skill_dir)
+            .map_err(|e| anyhow!("Failed to create skill directory {}: {}", name, e))?;
+        std::fs::write(&path, content)
+            .map_err(|e| anyhow!("Failed to write {}/SKILL.md: {}", name, e))?;
+        installed.push(json!({
+            "name": name,
+            "path": path.to_string_lossy()
+        }));
+    }
+
+    Ok(json!({
+        "installed": installed,
+        "skipped": skipped,
+        "skills_dir": skills_dir.to_string_lossy()
+    }))
+}
+
 /// Tool implementation: get_template — return built-in templates embedded at compile time
 fn get_template(args: Map<String, Value>) -> Result<Value> {
     let name = args
@@ -1476,12 +2267,7 @@ fn get_template(args: Map<String, Value>) -> Result<Value> {
     let (title, content) = match name {
         "claude_md" => ("CLAUDE.md Template", CLAUDE_MD_TEMPLATE),
         "template_guide" => ("CLAUDE.md Template Guide", CLAUDE_TEMPLATE_GUIDE),
-        other => {
-            return Err(anyhow!(
-                "Invalid template '{}'. Must be 'claude_md' or 'template_guide'",
-                other
-            ))
-        }
+        other => return Err(anyhow!("Invalid template '{}'. Must be 'claude_md' or 'template_guide'", other)),
     };
 
     Ok(json!({
@@ -1492,101 +2278,79 @@ fn get_template(args: Map<String, Value>) -> Result<Value> {
 }
 
 /// Tool implementation: load_session_state
+///
+/// CULTRA-1011: after fetching session state, attempts to merge a
+/// `project_map` field into the response for boot-up workspace orientation.
+/// Scanner failures (including panics) are swallowed — `load_session_state`
+/// must NEVER fail boot just because the floorplan couldn't be generated.
 fn load_session_state(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
     // Validate and normalize strategy enum
     if let Some(strategy) = parse_enum_param::<SessionStrategy>(&args, "strategy")? {
         args.insert("strategy".to_string(), Value::String(strategy.to_string()));
     }
 
-    api_get_with_filters(
+    let mut result = api_get_with_filters(
         server,
         "/api/v2/sessions/latest",
         &["project_id"],
         &["strategy", "include_plan_context", "refresh_cache"],
         &args,
-    )
+    )?;
+
+    merge_project_map_into(&mut result, &server.workspace_root);
+    Ok(result)
 }
 
 /// Tool implementation: save_session_state
+/// CULTRA-941: coerce a field from a JSON-encoded string to an object.
+/// Agents sometimes pass nested objects as stringified JSON; this smooths
+/// that out before validation / forwarding to the API. Non-string values
+/// pass through unchanged.
+fn coerce_string_to_object(args: &mut Map<String, Value>, field: &str) -> Result<()> {
+    if let Some(Value::String(json_str)) = args.get(field) {
+        let parsed: Value = serde_json::from_str(json_str)
+            .map_err(|e| anyhow!("Invalid JSON in {}: {}", field, e))?;
+        args.insert(field.to_string(), parsed);
+    }
+    Ok(())
+}
+
+/// CULTRA-941: require a non-empty string field on an object. Returns a
+/// descriptive error with the full qualified path ("working_memory.phase")
+/// and the provided context hint when either the field is missing or
+/// present but empty/non-string.
+fn require_non_empty_string(
+    obj: &Map<String, Value>,
+    field: &str,
+    namespace: &str,
+    hint: &str,
+) -> Result<()> {
+    match obj.get(field) {
+        Some(v) if v.is_string() && !v.as_str().unwrap_or("").trim().is_empty() => Ok(()),
+        Some(_) => Err(anyhow!("{}.{} must be a non-empty string ({})", namespace, field, hint)),
+        None => Err(anyhow!("{}.{} is required (Engine V3)", namespace, field)),
+    }
+}
+
 fn save_session_state(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
-    // Fix: Convert context_snapshot from string to object if needed
-    if let Some(Value::String(json_str)) = args.get("context_snapshot") {
-        // Parse JSON string into object
-        match serde_json::from_str::<Value>(json_str) {
-            Ok(obj) => {
-                args.insert("context_snapshot".to_string(), obj);
-            }
-            Err(e) => {
-                return Err(anyhow!("Invalid JSON in context_snapshot: {}", e));
-            }
-        }
+    // Agents sometimes stringify nested objects — coerce before validating.
+    coerce_string_to_object(&mut args, "context_snapshot")?;
+    coerce_string_to_object(&mut args, "working_memory")?;
+
+    // Engine V3 validation for working_memory structure.
+    if let Some(wm) = args.get("working_memory").and_then(|v| v.as_object()) {
+        require_non_empty_string(wm, "phase", "working_memory",
+            "e.g., 'Implementation', 'Testing', 'Planning'")?;
+        require_non_empty_string(wm, "current_focus", "working_memory",
+            "describes what you're doing now")?;
+        require_non_empty_string(wm, "next_action", "working_memory",
+            "specific next step")?;
     }
 
-    // Fix: Convert working_memory from string to object if needed
-    if let Some(Value::String(json_str)) = args.get("working_memory") {
-        match serde_json::from_str::<Value>(json_str) {
-            Ok(obj) => {
-                args.insert("working_memory".to_string(), obj);
-            }
-            Err(e) => {
-                return Err(anyhow!("Invalid JSON in working_memory: {}", e));
-            }
-        }
-    }
-
-    // Engine V3 validation for working_memory structure
-    if let Some(wm) = args.get("working_memory") {
-        if let Some(wm_obj) = wm.as_object() {
-            // Check required fields
-            if let Some(phase) = wm_obj.get("phase") {
-                if !phase.is_string() || phase.as_str().unwrap_or("").trim().is_empty() {
-                    return Err(anyhow!("working_memory.phase must be a non-empty string (e.g., 'Implementation', 'Testing', 'Planning')"));
-                }
-            } else {
-                return Err(anyhow!("working_memory.phase is required (Engine V3)"));
-            }
-
-            if let Some(current_focus) = wm_obj.get("current_focus") {
-                if !current_focus.is_string()
-                    || current_focus.as_str().unwrap_or("").trim().is_empty()
-                {
-                    return Err(anyhow!("working_memory.current_focus must be a non-empty string describing what you're doing now"));
-                }
-            } else {
-                return Err(anyhow!(
-                    "working_memory.current_focus is required (Engine V3)"
-                ));
-            }
-
-            if let Some(next_action) = wm_obj.get("next_action") {
-                if !next_action.is_string() || next_action.as_str().unwrap_or("").trim().is_empty()
-                {
-                    return Err(anyhow!("working_memory.next_action must be a non-empty string with a specific next step"));
-                }
-            } else {
-                return Err(anyhow!(
-                    "working_memory.next_action is required (Engine V3)"
-                ));
-            }
-        }
-    }
-
-    // Engine V3 validation for context_snapshot structure
-    if let Some(cs) = args.get("context_snapshot") {
-        if let Some(cs_obj) = cs.as_object() {
-            // Check required field
-            if let Some(next_session_start) = cs_obj.get("next_session_start") {
-                if !next_session_start.is_string()
-                    || next_session_start.as_str().unwrap_or("").trim().is_empty()
-                {
-                    return Err(anyhow!("context_snapshot.next_session_start must be a non-empty string with clear resuming instructions"));
-                }
-            } else {
-                return Err(anyhow!(
-                    "context_snapshot.next_session_start is required (Engine V3)"
-                ));
-            }
-        }
+    // Engine V3 validation for context_snapshot structure.
+    if let Some(cs) = args.get("context_snapshot").and_then(|v| v.as_object()) {
+        require_non_empty_string(cs, "next_session_start", "context_snapshot",
+            "clear resuming instructions")?;
     }
 
     api_post(server, "/api/v2/sessions", args)
@@ -1598,7 +2362,7 @@ fn get_sessions(server: &Server, args: Map<String, Value>) -> Result<Value> {
         server,
         "/api/v2/sessions",
         &["project_id"],
-        &["limit"],
+        &["limit", "kind"],
         &args,
     )
 }
@@ -1621,8 +2385,7 @@ fn get_session_code_context(server: &Server, args: Map<String, Value>) -> Result
 
 /// Tool implementation: create_project
 fn create_project(server: &Server, args: Map<String, Value>) -> Result<Value> {
-    if !args.contains_key("project_id") || args.get("project_id").and_then(|v| v.as_str()).is_none()
-    {
+    if !args.contains_key("project_id") || args.get("project_id").and_then(|v| v.as_str()).is_none() {
         return Err(anyhow!("project_id is required"));
     }
     if !args.contains_key("name") || args.get("name").and_then(|v| v.as_str()).is_none() {
@@ -1633,10 +2396,38 @@ fn create_project(server: &Server, args: Map<String, Value>) -> Result<Value> {
 
 /// Tool implementation: get_tasks
 fn get_tasks(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
-    // Validate and normalize filter enums
-    if let Some(status) = parse_enum_param::<TaskStatus>(&args, "status")? {
-        args.insert("status".to_string(), Value::String(status.to_string()));
+    // CULTRA-939: status now accepts either a single string (legacy, normalized
+    // via the enum) or an array of strings (validated element-by-element and
+    // passed through; api_get_with_filters comma-joins it for the backend).
+    match args.get("status").cloned() {
+        Some(Value::String(_)) => {
+            if let Some(status) = parse_enum_param::<TaskStatus>(&args, "status")? {
+                args.insert("status".to_string(), Value::String(status.to_string()));
+            }
+        }
+        Some(Value::Array(arr)) => {
+            for v in &arr {
+                let s = v.as_str().ok_or_else(|| anyhow!(
+                    "status array must contain only strings, got: {}",
+                    get_value_type_name(v)
+                ))?;
+                let _: TaskStatus = serde_json::from_value(Value::String(s.to_string()))
+                    .map_err(|_| anyhow!(
+                        "Invalid status value '{}'. Valid values: [{}]",
+                        s,
+                        TaskStatus::valid_values().join(", ")
+                    ))?;
+            }
+        }
+        Some(Value::Null) | None => {}
+        Some(other) => {
+            return Err(anyhow!(
+                "status must be a string or array of strings, got: {}",
+                get_value_type_name(&other)
+            ));
+        }
     }
+
     if let Some(priority) = parse_enum_param::<Priority>(&args, "priority")? {
         args.insert("priority".to_string(), Value::String(priority.to_string()));
     }
@@ -1645,7 +2436,9 @@ fn get_tasks(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
         server,
         "/api/v2/tasks",
         &["project_id"],
-        &["status", "priority", "assigned_to"],
+        // CULTRA-939: pagination + sort surfaced for the new /api/v2/tasks
+        // wrapped response shape (CULTRA-929 A1).
+        &["status", "priority", "assigned_to", "limit", "offset", "sort", "dir"],
         &args,
     )
 }
@@ -1722,9 +2515,7 @@ fn get_task_chain(server: &Server, args: Map<String, Value>) -> Result<Value> {
         Some(query_params)
     };
 
-    server
-        .api
-        .get(&format!("/api/v2/tasks/{}/chain", task_id), query)
+    server.api.get(&format!("/api/v2/tasks/{}/chain", task_id), query)
 }
 
 /// Tool implementation: update_task_status
@@ -1791,22 +2582,17 @@ fn task_dependency(server: &Server, args: Map<String, Value>) -> Result<Value> {
         "add" => {
             let mut api_body = Map::new();
             api_body.insert("blocked_by".to_string(), depends_on.clone());
-            api_post(
+            api_post(server, &format!("/api/v2/tasks/{}/dependencies", task_id), api_body)
+        }
+        "remove" => {
+            api_delete(
                 server,
-                &format!("/api/v2/tasks/{}/dependencies", task_id),
-                api_body,
+                "/api/v2/tasks/{}/dependencies/{}",
+                &["task_id", "depends_on"],
+                &args,
             )
         }
-        "remove" => api_delete(
-            server,
-            "/api/v2/tasks/{}/dependencies/{}",
-            &["task_id", "depends_on"],
-            &args,
-        ),
-        other => Err(anyhow!(
-            "Invalid action '{}'. Must be 'add' or 'remove'",
-            other
-        )),
+        other => Err(anyhow!("Invalid action '{}'. Must be 'add' or 'remove'", other)),
     }
 }
 
@@ -1822,7 +2608,19 @@ fn add_progress_log(server: &Server, args: Map<String, Value>) -> Result<Value> 
 }
 
 /// Tool implementation: save_document
+fn resolve_content_file(args: &mut Map<String, Value>) -> Result<()> {
+    if let Some(file_path) = args.remove("content_file").and_then(|v| v.as_str().map(|s| s.to_string())) {
+        let file_content = std::fs::read_to_string(&file_path)
+            .map_err(|e| anyhow!("Failed to read file '{}': {}", file_path, e))?;
+        args.insert("content".to_string(), Value::String(file_content));
+    }
+    Ok(())
+}
+
 fn save_document(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
+    // If content_file is provided, read the file and use as content (overrides content)
+    resolve_content_file(&mut args)?;
+
     // Validate doc_type enum
     if let Some(doc_type) = parse_enum_param::<DocType>(&args, "doc_type")? {
         args.insert("doc_type".to_string(), Value::String(doc_type.to_string()));
@@ -1840,8 +2638,7 @@ fn get_documents(server: &Server, mut args: Map<String, Value>) -> Result<Value>
 
     // Convert tags array to comma-separated string for the API
     if let Some(Value::Array(tags)) = args.remove("tags") {
-        let tag_str: Vec<String> = tags
-            .iter()
+        let tag_str: Vec<String> = tags.iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
         if !tag_str.is_empty() {
@@ -1865,6 +2662,9 @@ fn get_document(server: &Server, args: Map<String, Value>) -> Result<Value> {
 
 /// Tool implementation: update_document
 fn update_document(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
+    // If content_file is provided, read the file and use as content (overrides content)
+    resolve_content_file(&mut args)?;
+
     let document_id = args
         .get("document_id")
         .and_then(|v| v.as_str())
@@ -1882,14 +2682,12 @@ fn update_document(server: &Server, mut args: Map<String, Value>) -> Result<Valu
 
 /// Tool implementation: link_document (consolidated from link_document + link_document_batch)
 fn link_document(server: &Server, args: Map<String, Value>) -> Result<Value> {
-    let _document_id = args
-        .get("document_id")
+    let _document_id = args.get("document_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("document_id is required"))?;
     validate_id("document_id", _document_id)?;
 
-    let task_ids = args
-        .get("task_ids")
+    let task_ids = args.get("task_ids")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("task_ids is required and must be an array"))?;
     if task_ids.is_empty() {
@@ -1966,7 +2764,13 @@ fn get_plans(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
         args.insert("status".to_string(), Value::String(status.to_string()));
     }
 
-    api_get_with_filters(server, "/api/v2/plans", &["project_id"], &["status"], &args)
+    api_get_with_filters(
+        server,
+        "/api/v2/plans",
+        &["project_id"],
+        &["status"],
+        &args,
+    )
 }
 
 /// Tool implementation: get_plan (consolidated from get_plan_status + get_plan_details)
@@ -1977,19 +2781,11 @@ fn get_plan(server: &Server, args: Map<String, Value>) -> Result<Value> {
         .ok_or_else(|| anyhow!("Missing required parameter: plan_id"))?;
     validate_id("plan_id", plan_id)?;
 
-    let detail = args
-        .get("detail")
-        .and_then(|v| v.as_str())
-        .unwrap_or("status");
+    let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("status");
     let endpoint = match detail {
         "status" => format!("/api/v2/plans/{}/status", plan_id),
         "full" => format!("/api/v2/plans/{}/details", plan_id),
-        other => {
-            return Err(anyhow!(
-                "Invalid detail value '{}'. Must be 'status' or 'full'",
-                other
-            ))
-        }
+        other => return Err(anyhow!("Invalid detail value '{}'. Must be 'status' or 'full'", other)),
     };
 
     server.api.get(&endpoint, None)
@@ -2024,25 +2820,47 @@ fn get_decisions(server: &Server, mut args: Map<String, Value>) -> Result<Value>
 // ========== AST Tool Implementations ==========
 
 /// Tool implementation: parse_file_ast
-fn parse_file_ast(server: &Server, args: Map<String, Value>) -> Result<Value> {
+fn parse_file_ast(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
     let file_path = args
         .get("file_path")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("Missing file_path"))?;
+        .ok_or_else(|| anyhow!("Missing file_path"))?
+        .to_string();
 
-    // Validate file exists and is readable
-    validate_file_exists(file_path)?;
+    // Validate file exists, is readable, and is within workspace
+    validate_file_exists(&file_path, &server.workspace_root)?;
 
-    // Get project_id (with default for backward compatibility)
+    // CULTRA-959: project_id resolution. Was unwrap_or("proj-cultra") which
+    // dropped the AST under Cultra's own meta-project regardless of the
+    // user's actual workspace — silently breaking subsequent
+    // search_code_context calls. The dead-code resolve_project_id helper
+    // (already in this file) was written exactly for this case but never
+    // wired in. It (a) prefers an explicit args["project_id"] when set,
+    // (b) falls back to the harness-injected default_project_id when
+    // available, (c) errors with a clear message when neither is set.
+    resolve_project_id(server, &mut args)?;
     let project_id = args
         .get("project_id")
         .and_then(|v| v.as_str())
-        .unwrap_or("proj-cultra");
+        .ok_or_else(|| anyhow!("project_id resolution succeeded but value is missing"))?
+        .to_string();
+
+    // CULTRA-906: optional cross-file caller enrichment via LSP references.
+    let with_callers = args
+        .get("with_callers")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // CULTRA-994: optional body preview — include the first N lines of each
+    // symbol's source so callers can orient without a separate Read call.
+    let preview_lines = args
+        .get("preview_lines")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
 
     // Parse file locally (fast, no network overhead)
     let parser = Parser::new();
-    let file_context = parser
-        .parse_file(file_path)
+    let file_context = parser.parse_file(&file_path)
         .map_err(|e| anyhow!("Failed to parse file: {}", e))?;
 
     // POST to API for storage (respects RLS, enables search_code_context)
@@ -2055,95 +2873,1372 @@ fn parse_file_ast(server: &Server, args: Map<String, Value>) -> Result<Value> {
         "ast_stats": file_context.ast_stats
     });
 
-    api_post(
-        server,
-        "/api/v2/ast/parse",
-        body.as_object().unwrap().clone(),
-    )?;
+    // unwrap: body is constructed above via the json!({...}) literal, which
+    // always produces Value::Object — as_object() is infallible here.
+    api_post(server, "/api/v2/ast/parse", body.as_object().unwrap().clone())?;
+
+    // Build symbols array, optionally enriched with caller lookups.
+    // Enrichment is best-effort: any LSP failure degrades gracefully to
+    // returning the symbol without a callers field.
+    let symbols_value = if with_callers {
+        enrich_symbols_with_callers(&file_context, server)
+    } else {
+        serde_json::to_value(&file_context.symbols)
+            .map_err(|e| anyhow!("Failed to serialize symbols: {}", e))?
+    };
+
+    // CULTRA-994: enrich symbols with body preview if requested.
+    let symbols_value = if let Some(n) = preview_lines {
+        let source = std::fs::read_to_string(&file_context.file_path).unwrap_or_default();
+        let source_lines: Vec<&str> = source.lines().collect();
+        match symbols_value {
+            Value::Array(syms) => {
+                let enriched: Vec<Value> = syms.into_iter().map(|mut sym| {
+                    if let Value::Object(ref mut obj) = sym {
+                        let start = obj.get("line")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1) as usize;
+                        let from = start.saturating_sub(1);
+                        let to = (from + n).min(source_lines.len());
+                        let preview: Vec<String> = source_lines[from..to]
+                            .iter().map(|s| s.to_string()).collect();
+                        obj.insert("preview".to_string(), json!(preview));
+                    }
+                    sym
+                }).collect();
+                Value::Array(enriched)
+            }
+            other => other,
+        }
+    } else {
+        symbols_value
+    };
 
     // Return AST metadata
     Ok(json!({
         "success": true,
         "file_path": file_context.file_path,
         "language": file_context.language,
-        "symbols": file_context.symbols,
+        "symbols": symbols_value,
         "imports": file_context.imports,
         "ast_stats": file_context.ast_stats
     }))
 }
 
-/// Tool implementation: analyze_file (consolidated from analyze_concurrency + analyze_react_component + analyze_css + css_variable_graph)
-fn analyze_file_tool(args: Map<String, Value>) -> Result<Value> {
+/// CULTRA-909: diff_file_ast — structural diff between two git revisions
+/// of the same file. Match symbols by name. Same name in both → potentially
+/// modified (signature delta). Name only in base → removed. Name only in
+/// head → added. No fuzzy rename detection (a renamed function shows as
+/// removed+added; the agent can correlate by signature similarity).
+fn diff_file_ast_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+    use crate::ast::parser::Parser;
+    use crate::workspace::git_repo_root;
+    use std::collections::HashMap;
+
+    let file_path = args
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: file_path"))?;
+    let base_ref = args
+        .get("base_ref")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: base_ref"))?;
+    let head_ref = args
+        .get("head_ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or("HEAD");
+
+    validate_file_exists(file_path, workspace_root)?;
+    let abs_path = std::path::Path::new(file_path);
+
+    // CULTRA-954: walk up from file_path to find the actual git repo root
+    // (the dir containing `.git`). The previous implementation assumed
+    // `workspace_root == git repo root`, which is only true when the MCP
+    // sandbox is launched at the repo root. Any nested layout — multi-crate
+    // workspace, monorepo, repo-in-subdirectory — broke with `git show
+    // HEAD:wrong/path`. Same family as CULTRA-952.
+    let repo = git_repo_root(abs_path, workspace_root).ok_or_else(|| {
+        anyhow!(
+            "No .git directory found between '{}' and the sandbox root '{}'. \
+             diff_file_ast requires the file to live inside a git repository.",
+            file_path,
+            workspace_root.display()
+        )
+    })?;
+
+    // Compute file_path relative to the git repo root, not the sandbox.
+    // canonical_file is needed because repo.root is canonicalized — both
+    // sides of strip_prefix must match symlinks consistently.
+    let canonical_file = abs_path
+        .canonicalize()
+        .map_err(|e| anyhow!("Failed to canonicalize '{}': {}", file_path, e))?;
+    let rel_path = repo
+        .relative_path(&canonical_file)
+        .map_err(|e| anyhow!("file_path is not inside the resolved git repo: {}", e))?
+        .to_string_lossy()
+        .into_owned();
+    let git_root = repo.root.clone();
+
+    // Pull the file at each ref into a tempfile, parse, return symbols.
+    // Run git from the resolved repo root so it doesn't depend on the
+    // process cwd (which may be the sandbox root, not the repo root).
+    let parser = Parser::new();
+    let parse_at_ref = |gitref: &str| -> Result<Vec<crate::ast::types::Symbol>> {
+        let output = std::process::Command::new("git")
+            .args(["show", &format!("{}:{}", gitref, rel_path)])
+            .current_dir(&git_root)
+            .output()
+            .map_err(|e| anyhow!("git show failed to spawn: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            return Err(anyhow!("git show {}:{} failed: {}", gitref, rel_path, stderr.trim()));
+        }
+        // Write to a temp file preserving the original extension so the
+        // parser dispatches to the right language frontend. Use stdlib
+        // temp_dir + a unique filename based on PID + nanos to avoid
+        // pulling tempfile into runtime deps.
+        let suffix = abs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{}", e))
+            .unwrap_or_default();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_path = std::env::temp_dir().join(format!(
+            "ast-diff-{}-{}{}",
+            std::process::id(),
+            nanos,
+            suffix
+        ));
+        std::fs::write(&tmp_path, &output.stdout)
+            .map_err(|e| anyhow!("temp write failed: {}", e))?;
+        let path_str = tmp_path.to_string_lossy().into_owned();
+        let parse_result = parser.parse_file(&path_str);
+        // Best-effort cleanup; we don't fail the call on cleanup errors.
+        let _ = std::fs::remove_file(&tmp_path);
+        let ctx = parse_result.map_err(|e| anyhow!("parse {}: {}", gitref, e))?;
+        Ok(ctx.symbols)
+    };
+
+    let base_symbols = parse_at_ref(base_ref)?;
+    let head_symbols = parse_at_ref(head_ref)?;
+
+    // Index by symbol name. Multiple symbols with the same name (overloads,
+    // method receivers) are collapsed by collecting into Vec.
+    let mut base_index: HashMap<String, Vec<&crate::ast::types::Symbol>> = HashMap::new();
+    for s in &base_symbols {
+        base_index.entry(s.name.clone()).or_default().push(s);
+    }
+    let mut head_index: HashMap<String, Vec<&crate::ast::types::Symbol>> = HashMap::new();
+    for s in &head_symbols {
+        head_index.entry(s.name.clone()).or_default().push(s);
+    }
+
+    let mut added: Vec<Value> = Vec::new();
+    let mut removed: Vec<Value> = Vec::new();
+    let mut modified: Vec<Value> = Vec::new();
+
+    // The Go parser stores signature as "name(...)" without param details, so
+    // we build a richer comparison key by joining the parameter list + return
+    // type. Two symbols are "the same" iff this composite key matches.
+    let comparison_key = |s: &crate::ast::types::Symbol| -> String {
+        let params: Vec<String> = s.parameters.iter()
+            .map(|p| format!("{}:{}", p.name, p.param_type))
+            .collect();
+        format!(
+            "{}|{}|{}",
+            s.signature,
+            params.join(","),
+            s.return_type.clone().unwrap_or_default()
+        )
+    };
+
+    let symbol_summary = |s: &crate::ast::types::Symbol| -> Value {
+        let params: Vec<Value> = s.parameters.iter()
+            .map(|p| json!({"name": p.name, "type": p.param_type}))
+            .collect();
+        json!({
+            "name": s.name,
+            "type": format!("{:?}", s.symbol_type),
+            "line": s.line,
+            "signature": s.signature,
+            "parameters": params,
+            "return_type": s.return_type,
+        })
+    };
+
+    // Symbols only in base → removed.
+    for (name, syms) in &base_index {
+        if !head_index.contains_key(name) {
+            for s in syms {
+                removed.push(symbol_summary(s));
+            }
+        }
+    }
+    // Symbols only in head → added.
+    for (name, syms) in &head_index {
+        if !base_index.contains_key(name) {
+            for s in syms {
+                added.push(symbol_summary(s));
+            }
+        }
+    }
+    // Symbols in both → modified iff comparison key (signature + params + return) changed.
+    for (name, base_syms) in &base_index {
+        if let Some(head_syms) = head_index.get(name) {
+            for (b, h) in base_syms.iter().zip(head_syms.iter()) {
+                if comparison_key(b) != comparison_key(h) {
+                    modified.push(json!({
+                        "name": name,
+                        "type": format!("{:?}", b.symbol_type),
+                        "base": symbol_summary(b),
+                        "head": symbol_summary(h),
+                    }));
+                }
+            }
+        }
+    }
+
+    Ok(json!({
+        "file_path": file_path,
+        "base_ref": base_ref,
+        "head_ref": head_ref,
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        "summary": {
+            "added": added.len(),
+            "removed": removed.len(),
+            "modified": modified.len(),
+            "base_symbol_count": base_symbols.len(),
+            "head_symbol_count": head_symbols.len(),
+        },
+    }))
+}
+
+/// CULTRA-908: analyze_changes — wrap analyze_files with a git-diff file
+/// list. Limits the analyzer scope to files changed between a ref and HEAD,
+/// filtered by language for the chosen analyzer.
+fn analyze_changes_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+    let since = args
+        .get("since")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: since"))?;
+
     let analyzer = args
         .get("analyzer")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing required parameter: analyzer"))?;
+    validate_analyzer(analyzer)?;
 
-    // Validate analyzer before doing any I/O
+    // CULTRA-956: include working-tree changes by default. The pre-fix
+    // version ran `git diff <since> HEAD`, which only considers committed
+    // changes between two refs and excludes uncommitted work. The natural
+    // use case for this tool is "analyze what my branch introduced," which
+    // almost always means uncommitted work, so the empty-result was a trap.
+    let include_working_tree = args
+        .get("include_working_tree")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // git diff --name-only --diff-filter=AM excludes deleted files (D) but
+    // keeps added (A) and modified (M). When include_working_tree is true
+    // we omit the HEAD endpoint so `git diff <since>` compares the working
+    // tree against `<since>` (which is what the user actually wants).
+    let mut git_args: Vec<&str> = vec!["diff", "--name-only", "--diff-filter=AM", since];
+    if !include_working_tree {
+        git_args.push("HEAD");
+    }
+    let output = std::process::Command::new("git")
+        .args(&git_args)
+        .current_dir(workspace_root)
+        .output()
+        .map_err(|e| anyhow!("failed to invoke git: {}", e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(anyhow!("git diff failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let extensions = analyzer_extensions(analyzer);
+    let mut file_paths: Vec<Value> = Vec::new();
+    let mut total_changed: usize = 0;
+    for relpath in stdout.lines() {
+        if relpath.is_empty() {
+            continue;
+        }
+        total_changed += 1;
+        // Filter by extension for the chosen analyzer.
+        if !file_matches_analyzer(relpath, &extensions) {
+            continue;
+        }
+        let abs = workspace_root.join(relpath);
+        // Skip files that no longer exist on disk (e.g., a quick deletion
+        // race or an unborn submodule path).
+        if !abs.exists() {
+            continue;
+        }
+        file_paths.push(json!(abs.to_string_lossy()));
+    }
+
+    if file_paths.is_empty() {
+        // CULTRA-956: distinguish "no diff at all" from "language filter
+        // rejected files." Pre-fix wording said the latter even when the
+        // real cause was the former, which sent users debugging the wrong
+        // problem.
+        let message = if total_changed == 0 {
+            if include_working_tree {
+                format!(
+                    "No changes found between '{}' and the working tree. \
+                     If you expected uncommitted changes here, double-check that 'since' \
+                     points at the right ref. To restrict to committed-only diffs, \
+                     pass include_working_tree=false.",
+                    since
+                )
+            } else {
+                format!(
+                    "No committed changes found between '{}' and HEAD. \
+                     To include uncommitted working-tree changes, pass include_working_tree=true \
+                     (the new default after CULTRA-956).",
+                    since
+                )
+            }
+        } else {
+            format!(
+                "Found {} changed file(s) but none matched the '{}' analyzer's language filter (extensions: {:?})",
+                total_changed, analyzer, extensions
+            )
+        };
+        return Ok(json!({
+            "analyzer": analyzer,
+            "since": since,
+            "include_working_tree": include_working_tree,
+            "total": 0,
+            "total_changed_files": total_changed,
+            "succeeded": 0,
+            "failed": 0,
+            "results": [],
+            "message": message,
+        }));
+    }
+
+    // Delegate to analyze_files. Build a fresh args map; analyze_files_tool
+    // does its own validation.
+    let mut delegate_args = Map::new();
+    delegate_args.insert("analyzer".to_string(), json!(analyzer));
+    delegate_args.insert("file_paths".to_string(), Value::Array(file_paths));
+    let mut result = analyze_files_tool(delegate_args, workspace_root)?;
+
+    // Annotate with the git ref used so the response is self-describing.
+    if let Value::Object(ref mut obj) = result {
+        obj.insert("since".to_string(), json!(since));
+        obj.insert("include_working_tree".to_string(), json!(include_working_tree));
+    }
+    Ok(result)
+}
+
+/// Map an analyzer name to the file extensions it supports. Used to filter
+/// the git-diff output before delegating to analyze_files.
+fn analyzer_extensions(analyzer: &str) -> &'static [&'static str] {
     match analyzer {
-        "concurrency" | "react" | "css" | "css_variables" => {}
-        other => {
-            return Err(anyhow!(
-                "Invalid analyzer '{}'. Must be 'concurrency', 'react', 'css', or 'css_variables'",
-                other
-            ))
+        "concurrency" => &["go"],
+        "react" => &["tsx", "jsx", "ts", "js"],
+        "css" => &["css", "scss", "sass"],
+        "css_variables" => &["css", "scss", "sass"],
+        "security" => &["go", "py", "js", "jsx", "ts", "tsx", "rs", "tf"],
+        "complexity" => &["go", "py", "js", "jsx", "ts", "tsx", "rs", "tf"],
+        _ => &[],
+    }
+}
+
+/// True if `path` ends with one of the listed extensions (case-insensitive).
+fn file_matches_analyzer(path: &str, extensions: &[&str]) -> bool {
+    let lower = path.to_lowercase();
+    extensions.iter().any(|ext| lower.ends_with(&format!(".{}", ext)))
+}
+
+/// CULTRA-907: find_dead_code — flag exported callables in a file that have
+/// no references (or only the declaration site itself) anywhere in the workspace.
+/// Requires a running language server. Documents per-symbol caveats.
+fn find_dead_code_tool(args: Map<String, Value>, server: &Server) -> Result<Value> {
+    use crate::ast::parser::Parser;
+    use crate::mcp::types::{Scope, SymbolType};
+
+    let file_path = args
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: file_path"))?;
+    validate_file_exists(file_path, &server.workspace_root)?;
+
+    // CULTRA-947: strict-mode opt-in. When true, a cold LSP index returns
+    // an early error rather than a silently-empty result set.
+    let require_warm_index = args
+        .get("require_warm_index")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // CULTRA-950: optional active warmup. When true, runs the per-language
+    // warmup command (cargo check / go build / tsc --noEmit) before
+    // querying LSP, so the index is populated. Cached per session.
+    let do_warmup = args
+        .get("warmup")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let parser = Parser::new();
+    let file_context = parser.parse_file(file_path)
+        .map_err(|e| anyhow!("Failed to parse file: {}", e))?;
+
+    // Warmup runs after we know the language but before any LSP calls.
+    let warmup_report: Option<crate::lsp::manager::WarmupReport> = if do_warmup {
+        Some(server.lsp.ensure_warm(&file_context.language.to_string(), std::path::Path::new(&file_context.file_path)))
+    } else {
+        None
+    };
+
+    let file_contents = std::fs::read_to_string(&file_context.file_path)
+        .map_err(|e| anyhow!("Failed to read file: {}", e))?;
+    let lines: Vec<&str> = file_contents.lines().collect();
+
+    let is_exported = |s: &Scope| matches!(s, Scope::Public | Scope::Exported);
+    let is_callable = |t: &SymbolType| matches!(t, SymbolType::Function | SymbolType::Method);
+
+    let mut dead: Vec<Value> = Vec::new();
+    let mut checked: usize = 0;
+    let mut lsp_failures: usize = 0;
+    // CULTRA-947: track whether ANY symbol has external (non-declaration)
+    // references. A warm LSP index reports at least the declaration site for
+    // every symbol, so "total_refs > 0" isn't a useful warmth signal — it'd
+    // fire for cold indexes on gopls too. The useful signal is whether LSP
+    // found any CROSS-site callers. If every symbol's external_refs comes
+    // back as zero, the file is either genuinely all-dead or the index hasn't
+    // picked up the callers yet — and a cold index is by far the more common
+    // explanation in practice.
+    let mut any_symbol_has_external_refs = false;
+
+    for sym in &file_context.symbols {
+        if !is_callable(&sym.symbol_type) || !is_exported(&sym.scope) {
+            continue;
+        }
+        checked += 1;
+
+        // Locate symbol-name column on its declared line.
+        let line_idx = sym.line.saturating_sub(1) as usize;
+        let column = match lines.get(line_idx).and_then(|l| l.find(sym.name.as_str())) {
+            Some(c) => c as u32,
+            None => continue, // Can't locate name → skip rather than false-positive.
+        };
+        let lsp_line = sym.line.saturating_sub(1);
+
+        let mut lsp_args = Map::new();
+        lsp_args.insert("action".to_string(), json!("references"));
+        lsp_args.insert("file_path".to_string(), json!(file_context.file_path));
+        lsp_args.insert("line".to_string(), json!(lsp_line));
+        lsp_args.insert("character".to_string(), json!(column));
+        // CULTRA-963: forward warmup so the retry loop handles slow LS indexing.
+        // Only the first symbol pays the warmup cost; subsequent are cached.
+        if do_warmup {
+            lsp_args.insert("warmup".to_string(), json!(true));
+        }
+
+        let refs_value = match crate::lsp::tools::lsp_query(lsp_args, &server.lsp) {
+            Ok(v) => v,
+            Err(_) => {
+                lsp_failures += 1;
+                continue; // LSP failure → skip; do NOT flag as dead.
+            }
+        };
+
+        let refs = refs_value.get("references")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let total_refs = refs.len();
+
+        // A symbol is "dead" if every reference is either the declaration
+        // site itself or absent. include_declaration=true means the
+        // declaration is normally included; we filter it out before counting.
+        let external_refs = refs.iter().filter(|loc| {
+            let same_file = loc
+                .get("uri")
+                .and_then(|u| u.as_str())
+                .map(|u| u.ends_with(&file_context.file_path))
+                .unwrap_or(false);
+            let same_line = loc
+                .get("range")
+                .and_then(|r| r.get("start"))
+                .and_then(|s| s.get("line"))
+                .and_then(|l| l.as_u64())
+                .map(|l| (l as u32) == lsp_line)
+                .unwrap_or(false);
+            !(same_file && same_line)
+        }).count();
+        if external_refs > 0 {
+            any_symbol_has_external_refs = true;
+        }
+
+        if external_refs == 0 {
+            // CULTRA-945: distinguish "proven dead" from "LSP didn't find callers".
+            //
+            //   high: references list is non-empty AND contains the
+            //         declaration site — LSP knows about this symbol and
+            //         confirmed no external callers. Safe to delete.
+            //
+            //   low:  references list is empty. Could be legitimately unused
+            //         OR the language server hasn't indexed cross-module
+            //         references yet (rust-analyzer is particularly prone to
+            //         this on cold start). Verify manually before deleting.
+            let confidence = if total_refs > 0 { "high" } else { "low" };
+            dead.push(json!({
+                "name": sym.name,
+                "type": format!("{:?}", sym.symbol_type),
+                "line": sym.line,
+                "signature": sym.signature,
+                "confidence": confidence,
+                "total_references": total_refs,
+            }));
         }
     }
+
+    // CULTRA-947: classify LSP index status.
+    //   warm:    at least one checked symbol returned non-zero references
+    //            → LSP is responsive and has some index coverage.
+    //   cold:    we checked at least one symbol and NONE had any references
+    //            → almost certainly the LSP index is not ready yet, not a
+    //            codebase where every exported fn is genuinely unused.
+    //   unknown: nothing to check (no exported callables) → can't tell.
+    let lsp_index_status = if checked == 0 {
+        "unknown"
+    } else if any_symbol_has_external_refs {
+        "warm"
+    } else {
+        "cold"
+    };
+
+    // Strict-mode opt-in: cold index + require_warm_index → early error so
+    // the caller doesn't have to guess whether the empty result is real.
+    if lsp_index_status == "cold" && require_warm_index {
+        return Err(anyhow!(
+            "LSP index is cold: checked {} exported symbol(s) and none returned any references. \
+             This almost always means the language server has not yet indexed the workspace. \
+             Either wait for indexing to complete and retry, or pass require_warm_index=false \
+             to accept best-effort results (with dead_symbols.confidence='low').",
+            checked
+        ));
+    }
+
+    let mut response = json!({
+        "file_path": file_context.file_path,
+        "language": file_context.language,
+        "checked_symbols": checked,
+        "dead_symbols": dead,
+        "lsp_failures": lsp_failures,
+        "lsp_index_status": lsp_index_status,
+        "caveats": [
+            "Dynamic dispatch (interface methods, reflection) is NOT detected and may produce false positives.",
+            "Build-tag-gated callers are NOT visible to LSP unless tags match the indexer config.",
+            "Test-only exports (callers in *_test.go) ARE detected by gopls but may not be by all servers.",
+            "An LSP failure on a symbol skips it (does not flag as dead). lsp_failures counts these.",
+            "Each dead_symbol has a confidence rating (CULTRA-945): 'high' means LSP confirmed the declaration site is the only reference; 'low' means LSP returned an empty references list, which can mean legitimately unused OR LSP has not yet indexed cross-module references (common for rust-analyzer on cold start). Verify 'low' confidence findings before deleting.",
+            "lsp_index_status (CULTRA-947): 'warm' means LSP returned references for at least one symbol. 'cold' means every checked symbol returned zero references — almost always an indexing gap, not real dead code. 'unknown' means nothing checkable. Pass require_warm_index=true to fail fast on a cold index.",
+            "Warmup race (CULTRA-952 follow-up): a successful warmup_report.status='warm' does NOT guarantee the LSP reference database is queryable on the very next call. cargo check / go build finishes before rust-analyzer / gopls finish populating their cross-file reference indexes — the gap is typically 20-60s. If this response shows lsp_index_status='cold' AND warmup_report.status='warm', the warning field will say so explicitly; retry in ~30s.",
+        ],
+    });
+
+    // CULTRA-947: when cold, surface a loud top-level warning so the caller
+    // sees the issue without having to inspect the caveat list.
+    //
+    // CULTRA-952 follow-up (Vestige verification): if warmup succeeded but
+    // results are still cold, that's the cargo-finished-but-LSP-still-indexing
+    // race — callout it explicitly so the agent knows to retry, not give up.
+    if lsp_index_status == "cold" {
+        let warning_text = build_cold_warning_for_find_dead_code(checked, warmup_report.as_ref());
+        if let Value::Object(ref mut obj) = response {
+            obj.insert("warning".to_string(), json!(warning_text));
+        }
+    }
+
+    // CULTRA-950: surface the warmup report so callers see the cost and
+    // cache state. Always emitted when warmup was requested, regardless of
+    // whether it succeeded — a "failed" warmup is signal too.
+    if let Some(report) = warmup_report {
+        if let Value::Object(ref mut obj) = response {
+            obj.insert("warmup_report".to_string(), serde_json::to_value(&report).unwrap_or(Value::Null));
+        }
+    }
+
+    Ok(response)
+}
+
+/// CULTRA-952 (post-verification): build the cold-index warning for
+/// find_dead_code, branching on whether warmup was attempted and what its
+/// outcome was. The cargo-warm-but-LSP-cold case is the most common race
+/// in practice (rust-analyzer's reference DB is populated async after
+/// cargo check finishes) and deserves a specific message so the agent
+/// retries instead of trusting the (correctly) empty result.
+fn build_cold_warning_for_find_dead_code(
+    checked: usize,
+    warmup_report: Option<&crate::lsp::manager::WarmupReport>,
+) -> String {
+    let warmup_succeeded = warmup_report
+        .map(|r| r.status == "warm" || (r.status == "cached" && r.cached_status.as_deref() == Some("warm")))
+        .unwrap_or(false);
+
+    if warmup_succeeded {
+        format!(
+            "LSP index appears cold despite warmup completing successfully. \
+             {} exported symbol(s) checked, all returned zero references. \
+             This is the known cargo-warm-but-LSP-cold race: cargo check finishing \
+             does not guarantee rust-analyzer's reference database is queryable yet — \
+             the index is populated async after cargo emits target-dir metadata, \
+             typically 20-60s later. Retry this call in ~30s. Results in this \
+             response are best-effort and every dead_symbol is marked confidence='low'.",
+            checked
+        )
+    } else {
+        format!(
+            "LSP index appears cold: {} exported symbol(s) checked, all returned zero references. \
+             Results are best-effort — every dead_symbol is marked confidence='low'. \
+             Either retry after the language server finishes indexing, pass warmup=true \
+             to actively warm the index, or pass require_warm_index=true to fail fast.",
+            checked
+        )
+    }
+}
+
+/// CULTRA-948: find_references — semantic call-site lookup with role
+/// classification. Anchors at `symbol`'s declaration in `file_path`, queries
+/// LSP textDocument/references, and tags each hit with a role field so the
+/// caller can tell a function call apart from a type reference or a doc
+/// comment without re-scanning the source with Grep.
+///
+/// Inherits the CULTRA-947 cold-index guard pattern from find_dead_code:
+/// when the references list is empty or declaration-only, lsp_index_status
+/// is set to "cold" and a top-level `warning` field surfaces the issue.
+/// Callers wanting to fail fast on cold indexes set require_warm_index=true.
+fn find_references_tool(args: Map<String, Value>, server: &Server) -> Result<Value> {
+    use crate::ast::parser::Parser;
+
+    let symbol = args
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: symbol"))?;
 
     let file_path = args
         .get("file_path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing required parameter: file_path"))?;
 
-    validate_file_exists(file_path)?;
+    validate_file_exists(file_path, &server.workspace_root)?;
 
+    let include_declaration = args
+        .get("include_declaration")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let require_warm_index = args
+        .get("require_warm_index")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // CULTRA-950: optional active warmup, same semantics as find_dead_code.
+    let do_warmup = args
+        .get("warmup")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // 1. Parse the anchor file and locate the symbol declaration.
+    let parser = Parser::new();
+    let file_context = parser.parse_file(file_path)
+        .map_err(|e| anyhow!("Failed to parse file: {}", e))?;
+
+    let warmup_report: Option<crate::lsp::manager::WarmupReport> = if do_warmup {
+        Some(server.lsp.ensure_warm(&file_context.language.to_string(), std::path::Path::new(&file_context.file_path)))
+    } else {
+        None
+    };
+
+    let anchor = file_context.symbols.iter()
+        .find(|s| s.name == symbol)
+        .ok_or_else(|| anyhow!(
+            "Symbol '{}' not found in {}. Use lsp_workspace_symbols to locate the file that declares it.",
+            symbol, file_path
+        ))?;
+
+    // 2. Find the byte column of the symbol name on its declared line. LSP
+    //    position queries take (line, character) and the call site in
+    //    find_dead_code uses byte offsets — stay consistent.
+    let anchor_contents = std::fs::read_to_string(&file_context.file_path)
+        .map_err(|e| anyhow!("Failed to read file: {}", e))?;
+    let anchor_lines: Vec<&str> = anchor_contents.lines().collect();
+    let anchor_line_idx = anchor.line.saturating_sub(1) as usize;
+    let anchor_col = anchor_lines
+        .get(anchor_line_idx)
+        .and_then(|l| l.find(symbol))
+        .ok_or_else(|| anyhow!(
+            "Could not locate symbol '{}' on declaration line {} of {}",
+            symbol, anchor.line, file_path
+        ))?;
+    let lsp_line = anchor.line.saturating_sub(1);
+
+    // 3. Query LSP references. An LSP failure (no server, missing binary,
+    //    file not yet indexed) gets normalised to an empty list and falls
+    //    through to the cold-index classifier below.
+    let mut lsp_args = Map::new();
+    lsp_args.insert("action".to_string(), json!("references"));
+    lsp_args.insert("file_path".to_string(), json!(file_context.file_path));
+    lsp_args.insert("line".to_string(), json!(lsp_line));
+    lsp_args.insert("character".to_string(), json!(anchor_col as u32));
+    // CULTRA-963/967: forward warmup to lsp_query so the retry loop fires.
+    // This handles languages (TS) where ensure_warm finishes but the LSP
+    // needs additional time to build its reference index.
+    if do_warmup {
+        lsp_args.insert("warmup".to_string(), json!(true));
+    }
+
+    let refs: Vec<Value> = match crate::lsp::tools::lsp_query(lsp_args, &server.lsp) {
+        Ok(v) => v.get("references")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    // 4. Classify each reference. Cache per-file source reads so a function
+    //    with 50 call sites in one file only reads that file once.
+    let mut file_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut results: Vec<Value> = Vec::new();
+    let mut any_non_definition = false;
+
+    for loc in &refs {
+        let uri = loc.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+        // file:// and file:/// both strip cleanly — the second slash stays.
+        let ref_path: String = uri.strip_prefix("file://").unwrap_or(uri).to_string();
+
+        let start = loc.get("range").and_then(|r| r.get("start"));
+        let ref_line = start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) as u32;
+        let ref_col = start.and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+
+        // Anchor-declaration detection: same file + same LSP line.
+        let is_def = ref_path.ends_with(&file_context.file_path) && ref_line == lsp_line;
+        if !is_def {
+            any_non_definition = true;
+        }
+
+        let context_line = file_cache
+            .entry(ref_path.clone())
+            .or_insert_with(|| {
+                std::fs::read_to_string(&ref_path)
+                    .map(|s| s.lines().map(String::from).collect())
+                    .unwrap_or_default()
+            })
+            .get(ref_line as usize)
+            .cloned()
+            .unwrap_or_default();
+
+        let role = classify_reference_role(&context_line, ref_col as usize, symbol.len(), is_def);
+
+        // Default: skip the declaration unless the caller opted in. Most
+        // refactor workflows only care about call sites.
+        if is_def && !include_declaration {
+            continue;
+        }
+
+        results.push(json!({
+            "file": ref_path,
+            "line": ref_line + 1,
+            "col": ref_col + 1,
+            "context": context_line.trim(),
+            "role": role,
+        }));
+    }
+
+    // 5. Cold-index classification. Mirrors find_dead_code (CULTRA-947):
+    //    warm = at least one non-declaration reference exists; cold = empty
+    //    or declaration-only. The "cold" signal on an empty list is
+    //    conservative — a symbol with genuinely zero callers is
+    //    indistinguishable from a cold index via one LSP call, so we flag
+    //    both the same way and let the caller verify manually.
+    let lsp_index_status = if refs.is_empty() {
+        "cold"
+    } else if any_non_definition {
+        "warm"
+    } else {
+        "cold"
+    };
+
+    if lsp_index_status == "cold" && require_warm_index {
+        return Err(anyhow!(
+            "LSP index is cold for symbol '{}': {} reference(s) returned, none outside the declaration site. \
+             This usually means the language server has not yet indexed cross-file callers. \
+             Either wait for indexing to complete and retry, or pass require_warm_index=false \
+             to accept best-effort results.",
+            symbol, refs.len()
+        ));
+    }
+
+    let mut response = json!({
+        "symbol": symbol,
+        "checked_at": format!("{}:{}:{}", file_context.file_path, anchor.line, anchor_col + 1),
+        "total_references": results.len(),
+        "results": results,
+        "lsp_index_status": lsp_index_status,
+        "role_buckets": ["definition", "call", "type_use", "doc", "unknown"],
+        "caveats": [
+            "Role classification is a fast heuristic on the character immediately following the symbol at each reference site: '(' → call; '{', '<', or '::' → type_use; doc-comment or inline-comment context → doc; else → unknown. Works well for Rust/Go/TS single-line call sites; fuzzy for macros, turbofish (foo::<T>() lands in type_use), multi-line calls, and /* */ block comments.",
+            "Scope is workspace-wide — the tool returns every textDocument/references hit. There is no file/crate scope filter in v1.",
+            "lsp_index_status (CULTRA-948, reusing the CULTRA-947 pattern): 'warm' means LSP returned at least one non-declaration reference. 'cold' means the references list was empty or declaration-only — usually an indexing gap, but also indistinguishable from a symbol that genuinely has no callers. Pass require_warm_index=true to fail fast on a cold index.",
+            "Warmup race (CULTRA-952 follow-up): a successful warmup_report.status='warm' does NOT guarantee the LSP reference database is queryable on the very next call. cargo check / go build finishes before rust-analyzer / gopls finish populating their cross-file reference indexes — the gap is typically 20-60s. If this response shows lsp_index_status='cold' AND warmup_report.status='warm', the warning field will say so explicitly; retry in ~30s.",
+            "Column positions are byte offsets, not UTF-16 code units. Matches the CULTRA LSP-backed tool convention but may drift on lines with multi-byte characters.",
+        ],
+    });
+
+    if lsp_index_status == "cold" {
+        let warning_text = build_cold_warning_for_find_references(symbol, refs.len(), warmup_report.as_ref());
+        if let Value::Object(ref mut obj) = response {
+            obj.insert("warning".to_string(), json!(warning_text));
+        }
+    }
+
+    // CULTRA-950: surface the warmup report. Same shape as find_dead_code.
+    if let Some(report) = warmup_report {
+        if let Value::Object(ref mut obj) = response {
+            obj.insert("warmup_report".to_string(), serde_json::to_value(&report).unwrap_or(Value::Null));
+        }
+    }
+
+    Ok(response)
+}
+
+/// CULTRA-952 (post-verification): twin of build_cold_warning_for_find_dead_code,
+/// for find_references. Same cargo-warm-but-LSP-cold race callout when
+/// warmup succeeded but the reference query came back empty/decl-only.
+fn build_cold_warning_for_find_references(
+    symbol: &str,
+    ref_count: usize,
+    warmup_report: Option<&crate::lsp::manager::WarmupReport>,
+) -> String {
+    let warmup_succeeded = warmup_report
+        .map(|r| r.status == "warm" || (r.status == "cached" && r.cached_status.as_deref() == Some("warm")))
+        .unwrap_or(false);
+
+    if warmup_succeeded {
+        format!(
+            "LSP index appears cold for symbol '{}' despite warmup completing successfully: \
+             {} reference(s) returned, none outside the declaration. This is the known \
+             cargo-warm-but-LSP-cold race: cargo check finishing does not guarantee \
+             rust-analyzer's reference database is queryable yet — the index is populated \
+             async after cargo emits target-dir metadata, typically 20-60s later. \
+             Retry this call in ~30s.",
+            symbol, ref_count
+        )
+    } else {
+        format!(
+            "LSP index appears cold for symbol '{}': {} reference(s) returned, none outside the declaration. \
+             Results are best-effort. Either retry after the language server finishes indexing, \
+             pass warmup=true to actively warm the index, or pass require_warm_index=true to fail fast.",
+            symbol, ref_count
+        )
+    }
+}
+
+/// CULTRA-948: classify a single reference hit into one of five role buckets
+/// by inspecting the source line. Cheap: one trim, one contains, one
+/// post-symbol char lookup. Per Vestige's pushback, we ship 5 buckets on day
+/// one rather than 3 — the refinement is cheap and the "other" catch-all would
+/// have forced callers to grep through it manually to split struct literals
+/// from doc comments.
+fn classify_reference_role(line: &str, col: usize, symbol_len: usize, is_def: bool) -> &'static str {
+    if is_def {
+        return "definition";
+    }
+
+    // Doc / comment detection first — a symbol that *appears* inside a
+    // comment shouldn't be mis-classified as a call just because the next
+    // character happens to be '('. We check both line-start doc markers and
+    // inline `//` comments that open before the symbol's column.
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("///")
+        || trimmed.starts_with("//!")
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/**")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("*/")
+    {
+        return "doc";
+    }
+    if let Some(prefix) = line.get(..col.min(line.len())) {
+        if prefix.contains("//") {
+            return "doc";
+        }
+    }
+
+    // Post-symbol inspection. Find the first non-whitespace char after the
+    // symbol; that single char is usually enough to disambiguate call from
+    // type usage.
+    let after_start = col.saturating_add(symbol_len);
+    let after = line.get(after_start..).map(|s| s.trim_start()).unwrap_or("");
+    let first = after.chars().next();
+
+    match first {
+        Some('(') => "call",
+        Some('{') => "type_use",
+        Some('<') => "type_use",
+        Some(':') if after.starts_with("::") => "type_use",
+        _ => "unknown",
+    }
+}
+
+/// CULTRA-906: walk an exported function/method symbol list and attach a
+/// `callers` array via LSP textDocument/references. Best-effort: any per-symbol
+/// failure (LSP error, position lookup miss) yields a symbol without the field.
+/// Default cap: top 10 callers per symbol.
+fn enrich_symbols_with_callers(file_context: &crate::ast::types::FileContext, server: &Server) -> Value {
+    use crate::mcp::types::{Scope, SymbolType};
+
+    const MAX_CALLERS_PER_SYMBOL: usize = 10;
+
+    // Read the file contents once so we can locate symbol-name columns.
+    let file_contents = match std::fs::read_to_string(&file_context.file_path) {
+        Ok(s) => s,
+        Err(_) => {
+            // Can't read the file; return symbols unchanged.
+            return serde_json::to_value(&file_context.symbols).unwrap_or(json!([]));
+        }
+    };
+    let lines: Vec<&str> = file_contents.lines().collect();
+
+    let is_exported = |scope: &Scope| -> bool {
+        matches!(scope, Scope::Public | Scope::Exported)
+    };
+    let is_callable = |t: &SymbolType| -> bool {
+        matches!(t, SymbolType::Function | SymbolType::Method)
+    };
+
+    let mut out: Vec<Value> = Vec::with_capacity(file_context.symbols.len());
+    for sym in &file_context.symbols {
+        let mut sym_value = match serde_json::to_value(sym) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Only look up callers for exported callables. Skipping private and
+        // non-callable symbols keeps cost bounded; the audit recommends this.
+        if !is_callable(&sym.symbol_type) || !is_exported(&sym.scope) {
+            out.push(sym_value);
+            continue;
+        }
+
+        // Find column of the symbol name on its declared line.
+        let line_idx = sym.line.saturating_sub(1) as usize;
+        let column = lines.get(line_idx)
+            .and_then(|line| line.find(sym.name.as_str()));
+        let column = match column {
+            Some(c) => c as u32,
+            None => {
+                // Couldn't locate the name on its line — skip enrichment.
+                out.push(sym_value);
+                continue;
+            }
+        };
+
+        // LSP positions are 0-indexed.
+        let lsp_line = sym.line.saturating_sub(1);
+
+        let mut lsp_args = Map::new();
+        lsp_args.insert("action".to_string(), json!("references"));
+        lsp_args.insert("file_path".to_string(), json!(file_context.file_path));
+        lsp_args.insert("line".to_string(), json!(lsp_line));
+        lsp_args.insert("character".to_string(), json!(column));
+        // CULTRA-964: pass warmup=true so the first symbol triggers
+        // ensure_warm + the retry loop. Cached after the first call,
+        // so subsequent symbols pay zero warmup cost.
+        lsp_args.insert("warmup".to_string(), json!(true));
+
+        match crate::lsp::tools::lsp_query(lsp_args, &server.lsp) {
+            Ok(refs_value) => {
+                let refs = refs_value.get("references")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+
+                // Filter out the declaration site itself and cap to top N.
+                let callers: Vec<Value> = refs.into_iter()
+                    .filter_map(|loc| {
+                        let uri = loc.get("uri")?.as_str()?.to_string();
+                        let range = loc.get("range")?;
+                        let start_line = range.get("start")?.get("line")?.as_u64()? as u32;
+                        // Skip the declaration itself (same file, same line as definition).
+                        if uri.ends_with(&file_context.file_path) && start_line == lsp_line {
+                            return None;
+                        }
+                        Some(json!({
+                            "uri": uri,
+                            "line": start_line + 1, // 1-indexed for human consumption
+                        }))
+                    })
+                    .take(MAX_CALLERS_PER_SYMBOL)
+                    .collect();
+
+                if let Value::Object(ref mut obj) = sym_value {
+                    obj.insert("callers".to_string(), json!(callers));
+                    obj.insert("caller_count".to_string(), json!(callers.len()));
+                }
+            }
+            Err(_) => {
+                // LSP unavailable or query failed — graceful degrade, no field added.
+            }
+        }
+
+        out.push(sym_value);
+    }
+
+    Value::Array(out)
+}
+
+/// Tool implementation: analyze_file (consolidated from analyze_concurrency + analyze_react_component + analyze_css + css_variable_graph)
+/// Validate analyzer name. Returns error for unknown values.
+fn validate_analyzer(analyzer: &str) -> Result<()> {
+    match analyzer {
+        "concurrency" | "react" | "css" | "css_variables" | "security" | "complexity" => Ok(()),
+        other => Err(anyhow!("Invalid analyzer '{}'. Must be 'concurrency', 'react', 'css', 'css_variables', 'security', or 'complexity'", other)),
+    }
+}
+
+/// Run a single analyzer against a single file. Pure helper used by both
+/// analyze_file_tool and analyze_files_tool. Caller is responsible for
+/// validating the analyzer name and the file path before calling.
+fn run_analyzer(analyzer: &str, file_path: &str) -> Result<Value> {
     match analyzer {
         "concurrency" => {
+            // CULTRA-910: dispatch by extension. .rs → Rust analyzer,
+            // everything else → Go analyzer (the original implementation).
+            if file_path.to_lowercase().ends_with(".rs") {
+                let analysis = crate::ast::analyze_concurrency_rust(file_path)
+                    .map_err(|e| anyhow!("Failed to analyze Rust concurrency: {}", e))?;
+                return serde_json::to_value(analysis)
+                    .map_err(|e| anyhow!("Failed to serialize result: {}", e));
+            }
             let analysis = analyze_concurrency(file_path)
                 .map_err(|e| anyhow!("Failed to analyze concurrency: {}", e))?;
-            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(analysis)
+                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "react" => {
             let analysis = analyze_react_component(file_path)
                 .map_err(|e| anyhow!("Failed to analyze React component: {}", e))?;
-            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(analysis)
+                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "css" => {
-            let analysis =
-                analyze_css(file_path).map_err(|e| anyhow!("Failed to analyze CSS: {}", e))?;
-            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            let analysis = analyze_css(file_path)
+                .map_err(|e| anyhow!("Failed to analyze CSS: {}", e))?;
+            serde_json::to_value(analysis)
+                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "css_variables" => {
             let graph = css_variable_graph(file_path)
                 .map_err(|e| anyhow!("Failed to build CSS variable graph: {}", e))?;
-            serde_json::to_value(graph).map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(graph)
+                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
-        _ => unreachable!("analyzer already validated"),
+        "security" => {
+            let analysis = analyze_security(file_path)
+                .map_err(|e| anyhow!("Failed to run security analysis: {}", e))?;
+            serde_json::to_value(analysis)
+                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+        }
+        "complexity" => {
+            let analysis = analyze_complexity(file_path)
+                .map_err(|e| anyhow!("Failed to run complexity analysis: {}", e))?;
+            serde_json::to_value(analysis)
+                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+        }
+        _ => Err(anyhow!("analyzer already validated; this should be unreachable")),
     }
 }
 
+fn analyze_file_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+    let analyzer = args
+        .get("analyzer")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: analyzer"))?;
+    validate_analyzer(analyzer)?;
+
+    let file_path = args
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: file_path"))?;
+    validate_file_exists(file_path, workspace_root)?;
+
+    run_analyzer(analyzer, file_path)
+}
+
+/// CULTRA-949: analyze_symbol — filter analyze_file(complexity)'s output to a
+/// single function so a refactor loop can cheaply check "did my edit move the
+/// needle?" without re-ingesting ~100 functions of JSON every iteration.
+///
+/// v1 supports analyzer="complexity" only. The implementation runs the full
+/// analyzer (dominated by the tree-sitter parse) then filters the results
+/// in-process — strictly cheaper than writing a parallel one-symbol analyzer
+/// and impossible to drift out of sync with analyze_file.
+///
+/// Delta mode: when delta_against is passed as an inline object with any of
+/// {cyclomatic, cognitive, lines, rating}, the corresponding metric is
+/// rendered as {prev, now, delta} instead of a scalar. This is purely a
+/// presentation layer — no server-side baseline storage, per the task spec.
+fn analyze_symbol_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+    let analyzer = args
+        .get("analyzer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("complexity");
+    if analyzer != "complexity" {
+        return Err(anyhow!(
+            "analyze_symbol v1 only supports analyzer='complexity' (got '{}'). \
+             Other analyzers will be added if the pattern recurs.",
+            analyzer
+        ));
+    }
+
+    let file_path = args
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: file_path"))?;
+    validate_file_exists(file_path, workspace_root)?;
+
+    let symbol = args
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: symbol"))?;
+
+    let analysis = analyze_complexity(file_path)
+        .map_err(|e| anyhow!("Failed to run complexity analysis: {}", e))?;
+
+    // Filter to functions named `symbol`. Preserves the order from the
+    // analyzer walker so the first match is deterministic (first occurrence
+    // in source).
+    let matches: Vec<_> = analysis.functions.iter()
+        .filter(|f| f.name == symbol)
+        .collect();
+
+    if matches.is_empty() {
+        let available: Vec<&str> = analysis.functions.iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        return Err(anyhow!(
+            "Symbol '{}' not found in {} (analyzer: complexity). \
+             Available functions ({}): {}. \
+             Check spelling or run analyze_file for the full list.",
+            symbol,
+            file_path,
+            available.len(),
+            if available.is_empty() { "<none>".to_string() } else { available.join(", ") }
+        ));
+    }
+
+    let first = matches[0];
+    let overload_warning = if matches.len() > 1 {
+        Some(format!(
+            "Multiple functions named '{}' found ({} total) — returning the first match at {}. \
+             analyze_symbol v1 does not disambiguate by receiver/signature.",
+            symbol, matches.len(), first.location
+        ))
+    } else {
+        None
+    };
+
+    // Delta-against-baseline rendering. Each metric's baseline is optional:
+    // a baseline with only `cyclomatic` renders just that metric as a delta
+    // and the rest as scalars.
+    let baseline = args.get("delta_against").and_then(|v| v.as_object());
+    let delta_mode = baseline.is_some();
+
+    let mk_delta = |prev: Option<i64>, now: u32| -> Value {
+        match prev {
+            Some(p) => json!({"prev": p, "now": now, "delta": (now as i64) - p}),
+            None => json!(now),
+        }
+    };
+
+    let (cyclomatic_v, cognitive_v, lines_v, rating_v) = if let Some(b) = baseline {
+        let cyc = mk_delta(b.get("cyclomatic").and_then(|v| v.as_i64()), first.cyclomatic);
+        let cog = mk_delta(b.get("cognitive").and_then(|v| v.as_i64()), first.cognitive);
+        let lin = mk_delta(b.get("lines").and_then(|v| v.as_i64()), first.lines);
+        let rat = match b.get("rating").and_then(|v| v.as_str()) {
+            Some(prev) => json!({"prev": prev, "now": first.rating.clone()}),
+            None => json!(first.rating.clone()),
+        };
+        (cyc, cog, lin, rat)
+    } else {
+        (
+            json!(first.cyclomatic),
+            json!(first.cognitive),
+            json!(first.lines),
+            json!(first.rating.clone()),
+        )
+    };
+
+    let mut response = json!({
+        "analyzer": "complexity",
+        "file_path": analysis.file_path,
+        "language": analysis.language,
+        "name": first.name,
+        "location": first.location,
+        "line_start": first.line_start,
+        "line_end": first.line_end,
+        "cyclomatic": cyclomatic_v,
+        "cognitive": cognitive_v,
+        "lines": lines_v,
+        "rating": rating_v,
+        "delta_mode": delta_mode,
+    });
+
+    if let Value::Object(ref mut obj) = response {
+        if let Some(recv) = &first.receiver {
+            obj.insert("receiver".to_string(), json!(recv));
+        }
+        if let Some(w) = overload_warning {
+            obj.insert("warning".to_string(), json!(w));
+        }
+    }
+
+    Ok(response)
+}
+
+/// CULTRA-905: analyze_files (plural) — bulk analyzer over many files in parallel.
+/// Uses std::thread::scope so per-file failures don't poison other workers and
+/// the result vector preserves input order. Returns:
+///   [{file_path, success, result?, error?}, ...]
+fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+    let analyzer = args
+        .get("analyzer")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: analyzer"))?;
+    validate_analyzer(analyzer)?;
+
+    let file_paths_value = args
+        .get("file_paths")
+        .ok_or_else(|| anyhow!("Missing required parameter: file_paths"))?;
+    let file_paths_arr = file_paths_value
+        .as_array()
+        .ok_or_else(|| anyhow!("file_paths must be an array of strings"))?;
+    if file_paths_arr.is_empty() {
+        return Err(anyhow!("file_paths must contain at least one entry"));
+    }
+    if file_paths_arr.len() > 500 {
+        return Err(anyhow!("file_paths capped at 500 entries per call (got {})", file_paths_arr.len()));
+    }
+
+    // Validate every entry up front. Path validation is cheap (filesystem
+    // stat) and doing it serially before spawning threads keeps error
+    // messages deterministic.
+    let mut file_paths: Vec<String> = Vec::with_capacity(file_paths_arr.len());
+    for (i, v) in file_paths_arr.iter().enumerate() {
+        let s = v.as_str().ok_or_else(|| anyhow!("file_paths[{}] is not a string", i))?;
+        file_paths.push(s.to_string());
+    }
+
+    // Cap concurrency so a 500-file batch doesn't spawn 500 threads.
+    // 8 is a sensible default for CPU-bound tree-sitter parsing on most hosts.
+    let max_workers = 8usize.min(file_paths.len());
+    let chunk_size = (file_paths.len() + max_workers - 1) / max_workers;
+    let analyzer_owned = analyzer.to_string();
+    let workspace_root_owned: std::path::PathBuf = workspace_root.to_path_buf();
+
+    // Each entry is (index, FileResult). Output is sorted back to input order.
+    let mut results: Vec<(usize, Value)> = Vec::with_capacity(file_paths.len());
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(max_workers);
+        for chunk_idx in 0..max_workers {
+            let start = chunk_idx * chunk_size;
+            if start >= file_paths.len() {
+                break;
+            }
+            let end = std::cmp::min(start + chunk_size, file_paths.len());
+            let chunk: Vec<(usize, String)> = (start..end)
+                .map(|i| (i, file_paths[i].clone()))
+                .collect();
+            let analyzer_ref = &analyzer_owned;
+            let workspace_ref = &workspace_root_owned;
+            handles.push(scope.spawn(move || {
+                let mut local: Vec<(usize, Value)> = Vec::with_capacity(chunk.len());
+                for (idx, path) in chunk {
+                    let entry = match validate_file_exists(&path, workspace_ref) {
+                        Err(e) => json!({
+                            "file_path": path,
+                            "success": false,
+                            "error": format!("{}", e),
+                        }),
+                        Ok(_) => match run_analyzer(analyzer_ref, &path) {
+                            Ok(v) => json!({
+                                "file_path": path,
+                                "success": true,
+                                "result": v,
+                            }),
+                            Err(e) => json!({
+                                "file_path": path,
+                                "success": false,
+                                "error": format!("{}", e),
+                            }),
+                        },
+                    };
+                    local.push((idx, entry));
+                }
+                local
+            }));
+        }
+        for h in handles {
+            if let Ok(local) = h.join() {
+                results.extend(local);
+            }
+        }
+    });
+
+    // Restore input order.
+    results.sort_by_key(|(i, _)| *i);
+    let ordered: Vec<Value> = results.into_iter().map(|(_, v)| v).collect();
+
+    let total = ordered.len();
+    let succeeded = ordered.iter().filter(|v| v.get("success").and_then(|s| s.as_bool()).unwrap_or(false)).count();
+
+    Ok(json!({
+        "analyzer": analyzer,
+        "total": total,
+        "succeeded": succeeded,
+        "failed": total - succeeded,
+        "results": ordered,
+    }))
+}
+
 /// Tool implementation: find_interface_implementations
-fn find_interface_implementations_tool(args: Map<String, Value>) -> Result<Value> {
+fn find_interface_implementations_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
     let file_path = args
         .get("file_path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing file_path"))?;
 
-    // Validate file exists and is readable
-    validate_file_exists(file_path)?;
+    validate_file_exists(file_path, workspace_root)?;
 
-    let interface_name = args.get("interface_name").and_then(|v| v.as_str());
+    let interface_name = args
+        .get("interface_name")
+        .and_then(|v| v.as_str());
 
     let analysis = find_interface_implementations(file_path, interface_name)
         .map_err(|e| anyhow!("Failed to find interface implementations: {}", e))?;
 
-    serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(analysis)
+        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
 
 // ========== CSS Analysis Tools ==========
 
 /// Tool implementation: find_css_rules
-fn find_css_rules_tool(args: Map<String, Value>) -> Result<Value> {
+fn find_css_rules_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
     let file_path = args
         .get("file_path")
         .and_then(|v| v.as_str())
@@ -2154,16 +4249,17 @@ fn find_css_rules_tool(args: Map<String, Value>) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing pattern"))?;
 
-    validate_file_exists(file_path)?;
+    validate_file_exists(file_path, workspace_root)?;
 
     let rules = find_css_rules(file_path, pattern)
         .map_err(|e| anyhow!("Failed to find CSS rules: {}", e))?;
 
-    serde_json::to_value(rules).map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(rules)
+        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
 
 /// Tool implementation: find_unused_selectors
-fn find_unused_selectors_tool(args: Map<String, Value>) -> Result<Value> {
+fn find_unused_selectors_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
     let css_path = args
         .get("css_path")
         .and_then(|v| v.as_str())
@@ -2174,7 +4270,7 @@ fn find_unused_selectors_tool(args: Map<String, Value>) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing component_dir"))?;
 
-    validate_file_exists(css_path)?;
+    validate_file_exists(css_path, workspace_root)?;
 
     // Walk component_dir for matching files
     let component_paths = collect_component_files(component_dir)?;
@@ -2183,7 +4279,8 @@ fn find_unused_selectors_tool(args: Map<String, Value>) -> Result<Value> {
     let unused = find_unused_selectors(css_path, &path_refs)
         .map_err(|e| anyhow!("Failed to find unused selectors: {}", e))?;
 
-    serde_json::to_value(unused).map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(unused)
+        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
 
 /// Walk a directory and collect .tsx/.ts/.jsx/.js/.html file paths
@@ -2195,18 +4292,7 @@ fn collect_component_files(dir: &str) -> Result<Vec<String>> {
         if path.is_dir() {
             // Skip common non-source directories
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if matches!(
-                    name,
-                    "node_modules"
-                        | ".git"
-                        | "dist"
-                        | "build"
-                        | "target"
-                        | ".next"
-                        | "__pycache__"
-                        | ".venv"
-                        | "vendor"
-                ) {
+                if matches!(name, "node_modules" | ".git" | "dist" | "build" | "target" | ".next" | "__pycache__" | ".venv" | "vendor") {
                     return;
                 }
             }
@@ -2233,7 +4319,7 @@ fn collect_component_files(dir: &str) -> Result<Vec<String>> {
 // ========== CSS Analysis Tools V2 ==========
 
 /// Tool implementation: resolve_tailwind_classes
-fn resolve_tailwind_classes_tool(args: Map<String, Value>) -> Result<Value> {
+fn resolve_tailwind_classes_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
     let classes_val = args
         .get("classes")
         .ok_or_else(|| anyhow!("Missing required parameter: classes"))?;
@@ -2248,19 +4334,88 @@ fn resolve_tailwind_classes_tool(args: Map<String, Value>) -> Result<Value> {
     let css_path = args.get("css_path").and_then(|v| v.as_str());
 
     if let Some(path) = css_path {
-        validate_file_exists(path)?;
+        validate_file_exists(path, workspace_root)?;
     }
 
     let class_refs: Vec<&str> = classes.iter().map(|s| s.as_str()).collect();
     let result = resolve_tailwind_classes(&class_refs, css_path)
         .map_err(|e| anyhow!("Failed to resolve Tailwind classes: {}", e))?;
 
-    serde_json::to_value(result).map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(result)
+        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
+
 
 // ========== Engine V2 Intelligence Tools ==========
 
 /// Tool implementation: search_code_context
+/// CULTRA-940: collected filter parameters for search_code_context.
+/// All Options so "unset" means "no filter".
+struct SymbolFilters<'a> {
+    symbol_name: Option<&'a str>,
+    symbol_type: Option<&'a str>,
+    receiver: Option<&'a str>,
+    scope: Option<&'a str>,
+    calls: Option<&'a str>,
+}
+
+impl<'a> SymbolFilters<'a> {
+    fn from_args(args: &'a Map<String, Value>) -> Self {
+        Self {
+            symbol_name: args.get("symbol_name").and_then(|v| v.as_str()),
+            symbol_type: args.get("symbol_type").and_then(|v| v.as_str()),
+            receiver: args.get("receiver").and_then(|v| v.as_str()),
+            scope: args.get("scope").and_then(|v| v.as_str()),
+            calls: args.get("calls").and_then(|v| v.as_str()),
+        }
+    }
+
+    /// True iff every active filter matches. A filter is inactive (passes) when None.
+    fn matches(&self, sym: &Map<String, Value>) -> bool {
+        if let Some(f) = self.symbol_name {
+            if !sym_field_contains_ci(sym, "name", f) { return false; }
+        }
+        if let Some(f) = self.symbol_type {
+            if !sym_field_eq(sym, "type", f) { return false; }
+        }
+        if let Some(f) = self.receiver {
+            if !sym_field_eq(sym, "receiver", f) { return false; }
+        }
+        if let Some(f) = self.scope {
+            if !sym_field_eq(sym, "scope", f) { return false; }
+        }
+        if let Some(f) = self.calls {
+            if !sym_calls_contain(sym, f) { return false; }
+        }
+        true
+    }
+}
+
+fn sym_field_contains_ci(sym: &Map<String, Value>, field: &str, needle: &str) -> bool {
+    sym.get(field)
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_lowercase().contains(&needle.to_lowercase()))
+        .unwrap_or(false)
+}
+
+fn sym_field_eq(sym: &Map<String, Value>, field: &str, expected: &str) -> bool {
+    sym.get(field).and_then(|v| v.as_str()) == Some(expected)
+}
+
+fn sym_calls_contain(sym: &Map<String, Value>, needle: &str) -> bool {
+    sym.get("calls")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().any(|c| c.as_str().map(|s| s.contains(needle)).unwrap_or(false)))
+        .unwrap_or(false)
+}
+
+fn ctx_matches_file_pattern(ctx: &Map<String, Value>, pattern: &str) -> bool {
+    ctx.get("file_path")
+        .and_then(|v| v.as_str())
+        .map(|fp| fp.contains(pattern))
+        .unwrap_or(true) // missing file_path → don't filter
+}
+
 fn search_code_context(server: &Server, args: Map<String, Value>) -> Result<Value> {
     let _project_id = args
         .get("project_id")
@@ -2276,125 +4431,30 @@ fn search_code_context(server: &Server, args: Map<String, Value>) -> Result<Valu
         &args,
     )?;
 
-    // Extract filter parameters
-    let symbol_name = args.get("symbol_name").and_then(|v| v.as_str());
-    let symbol_type = args.get("symbol_type").and_then(|v| v.as_str());
+    let filters = SymbolFilters::from_args(&args);
     let file_pattern = args.get("file_pattern").and_then(|v| v.as_str());
-    let calls = args.get("calls").and_then(|v| v.as_str());
-    let receiver = args.get("receiver").and_then(|v| v.as_str());
-    let scope = args.get("scope").and_then(|v| v.as_str());
     let limit = parse_positive_int(&args, "limit", Some(1), Some(500))?.unwrap_or(50) as usize;
 
-    // Search through code context locally
-    let mut results = Vec::new();
+    let mut results: Vec<Value> = Vec::new();
 
-    if let Some(context_array) = code_context.as_array() {
-        for ctx in context_array {
-            if let Some(ctx_obj) = ctx.as_object() {
-                // Filter by file_pattern if provided
-                if let Some(pattern) = file_pattern {
-                    if let Some(file_path) = ctx_obj.get("file_path").and_then(|v| v.as_str()) {
-                        if !file_path.contains(pattern) {
-                            continue;
-                        }
-                    }
-                }
+    for ctx in code_context.as_array().into_iter().flatten() {
+        if results.len() >= limit { break; }
+        let Some(ctx_obj) = ctx.as_object() else { continue; };
 
-                // Search through symbols
-                if let Some(symbols) = ctx_obj.get("symbols").and_then(|v| v.as_array()) {
-                    for sym in symbols {
-                        if let Some(sym_obj) = sym.as_object() {
-                            let mut matches = true;
+        if let Some(pattern) = file_pattern {
+            if !ctx_matches_file_pattern(ctx_obj, pattern) { continue; }
+        }
 
-                            // Filter by symbol_name
-                            if let Some(name_filter) = symbol_name {
-                                if let Some(name) = sym_obj.get("name").and_then(|v| v.as_str()) {
-                                    if !name.to_lowercase().contains(&name_filter.to_lowercase()) {
-                                        matches = false;
-                                    }
-                                } else {
-                                    matches = false;
-                                }
-                            }
+        let symbols = match ctx_obj.get("symbols").and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => continue,
+        };
 
-                            // Filter by symbol_type
-                            if matches {
-                                if let Some(type_filter) = symbol_type {
-                                    if let Some(sym_type) =
-                                        sym_obj.get("type").and_then(|v| v.as_str())
-                                    {
-                                        if sym_type != type_filter {
-                                            matches = false;
-                                        }
-                                    } else {
-                                        matches = false;
-                                    }
-                                }
-                            }
-
-                            // Filter by receiver (Go only)
-                            if matches {
-                                if let Some(receiver_filter) = receiver {
-                                    if let Some(sym_receiver) =
-                                        sym_obj.get("receiver").and_then(|v| v.as_str())
-                                    {
-                                        if sym_receiver != receiver_filter {
-                                            matches = false;
-                                        }
-                                    } else {
-                                        matches = false;
-                                    }
-                                }
-                            }
-
-                            // Filter by scope
-                            if matches {
-                                if let Some(scope_filter) = scope {
-                                    if let Some(sym_scope) =
-                                        sym_obj.get("scope").and_then(|v| v.as_str())
-                                    {
-                                        if sym_scope != scope_filter {
-                                            matches = false;
-                                        }
-                                    } else {
-                                        matches = false;
-                                    }
-                                }
-                            }
-
-                            // Filter by calls
-                            if matches {
-                                if let Some(calls_filter) = calls {
-                                    if let Some(sym_calls) =
-                                        sym_obj.get("calls").and_then(|v| v.as_array())
-                                    {
-                                        let calls_match = sym_calls.iter().any(|c| {
-                                            c.as_str()
-                                                .map(|s| s.contains(calls_filter))
-                                                .unwrap_or(false)
-                                        });
-                                        if !calls_match {
-                                            matches = false;
-                                        }
-                                    } else {
-                                        matches = false;
-                                    }
-                                }
-                            }
-
-                            if matches {
-                                results.push(sym.clone());
-                                if results.len() >= limit {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if results.len() >= limit {
-                    break;
-                }
+        for sym in symbols {
+            if results.len() >= limit { break; }
+            let Some(sym_obj) = sym.as_object() else { continue; };
+            if filters.matches(sym_obj) {
+                results.push(sym.clone());
             }
         }
     }
@@ -2407,43 +4467,41 @@ fn search_code_context(server: &Server, args: Map<String, Value>) -> Result<Valu
 }
 
 /// Tool implementation: read_symbol_lines
-fn read_symbol_lines(args: Map<String, Value>) -> Result<Value> {
+fn read_symbol_lines(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let (file_path, start_line, end_line) =
-        if let Some(location) = args.get("location").and_then(|v| v.as_str()) {
-            // Parse location string "file.go:57-130" or "file.go:57"
-            split_location(location)?
-        } else {
-            // Use explicit parameters
-            let file_path = args
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("file_path or location is required"))?
-                .to_string();
+    let (file_path, start_line, end_line) = if let Some(location) = args.get("location").and_then(|v| v.as_str()) {
+        // Parse location string "file.go:57-130" or "file.go:57"
+        split_location(location)?
+    } else {
+        // Use explicit parameters
+        let file_path = args
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("file_path or location is required"))?
+            .to_string();
 
-            let start_line = args
-                .get("start_line")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| anyhow!("start_line is required when using file_path"))?
-                as usize;
+        let start_line = args
+            .get("start_line")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| anyhow!("start_line is required when using file_path"))? as usize;
 
-            let end_line = args
-                .get("end_line")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as usize)
-                .unwrap_or(start_line);
+        let end_line = args
+            .get("end_line")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as usize)
+            .unwrap_or(start_line);
 
-            (file_path, start_line, end_line)
-        };
+        (file_path, start_line, end_line)
+    };
 
-    // Validate file exists and is readable
-    validate_file_exists(&file_path)?;
+    // Validate file exists, is readable, and is within workspace
+    validate_file_exists(&file_path, workspace_root)?;
 
     // Read file lines
-    let file =
-        File::open(&file_path).map_err(|e| anyhow!("Failed to open file {}: {}", file_path, e))?;
+    let file = File::open(&file_path)
+        .map_err(|e| anyhow!("Failed to open file {}: {}", file_path, e))?;
 
     let reader = BufReader::new(file);
     let mut content = Vec::new();
@@ -2504,23 +4562,13 @@ fn query_context(server: &Server, args: Map<String, Value>) -> Result<Value> {
         "use_retrievability": args.get("use_retrievability").and_then(|v| v.as_bool()).unwrap_or(false)
     });
 
-    api_post(
-        server,
-        "/api/v2/vector/query",
-        body.as_object().unwrap().clone(),
-    )
+    // unwrap: body is a json!({...}) literal — always Value::Object.
+    api_post(server, "/api/v2/vector/query", body.as_object().unwrap().clone())
 }
 
 /// Tool implementation: add_graph_edge
 fn add_graph_edge(server: &Server, args: Map<String, Value>) -> Result<Value> {
-    let required_fields = [
-        "from_type",
-        "from_id",
-        "to_type",
-        "to_id",
-        "edge_type",
-        "project_id",
-    ];
+    let required_fields = ["from_type", "from_id", "to_type", "to_id", "edge_type", "project_id"];
     for field in &required_fields {
         if !args.contains_key(*field) || args.get(*field).and_then(|v| v.as_str()).is_none() {
             return Err(anyhow!("Missing required parameter: {}", field));
@@ -2586,12 +4634,8 @@ fn get_graph_neighbors(server: &Server, args: Map<String, Value>) -> Result<Valu
 /// Split location string "file.go:57-130" into (file_path, start_line, end_line)
 fn split_location(location: &str) -> Result<(String, usize, usize)> {
     // Find the LAST colon - handles Windows paths like C:\path:42
-    let colon_pos = location.rfind(':').ok_or_else(|| {
-        anyhow!(
-            "Invalid location format '{}' - expected 'file:line' or 'file:start-end'",
-            location
-        )
-    })?;
+    let colon_pos = location.rfind(':')
+        .ok_or_else(|| anyhow!("Invalid location format '{}' - expected 'file:line' or 'file:start-end'", location))?;
     let file_path = location[..colon_pos].to_string();
     let line_part = &location[colon_pos + 1..];
 
@@ -2602,20 +4646,545 @@ fn split_location(location: &str) -> Result<(String, usize, usize)> {
             return Err(anyhow!("Invalid line range format"));
         }
 
-        let start_line = range[0]
-            .parse::<usize>()
+        let start_line = range[0].parse::<usize>()
             .map_err(|_| anyhow!("Invalid start line number"))?;
-        let end_line = range[1]
-            .parse::<usize>()
+        let end_line = range[1].parse::<usize>()
             .map_err(|_| anyhow!("Invalid end line number"))?;
 
         Ok((file_path, start_line, end_line))
     } else {
         // Single line: "57"
-        let line = line_part
-            .parse::<usize>()
+        let line = line_part.parse::<usize>()
             .map_err(|_| anyhow!("Invalid line number"))?;
         Ok((file_path, line, line))
+    }
+}
+
+// ============================================================================
+// Tool: contextual_search — grep + AST symbol annotation (CULTRA-995)
+// ============================================================================
+
+/// Search for a text pattern and annotate each match with the containing AST symbol.
+/// Combines ripgrep-style text search with parse_file_ast-level context.
+fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+    use crate::ast::parser::Parser;
+    use std::process::Command;
+
+    let pattern = args
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: pattern"))?;
+
+    // Default search path is the workspace root
+    let search_path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(|p| std::path::PathBuf::from(p))
+        .unwrap_or_else(|| workspace_root.to_path_buf());
+
+    // Validate path is within workspace
+    if !search_path.starts_with(workspace_root) {
+        return Err(anyhow!("Search path must be within the workspace root"));
+    }
+
+    let file_glob = args.get("glob").and_then(|v| v.as_str());
+    let max_matches = args
+        .get("max_results")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(100) as usize;
+
+    // Step 1: grep for the pattern using ripgrep (preferred) or grep (fallback)
+    let has_rg = Command::new("rg").arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status().is_ok();
+    let mut cmd = if has_rg {
+        let mut c = Command::new("rg");
+        c.args(["--line-number", "--no-heading", "--with-filename", "--max-count", "50"]);
+        if let Some(glob) = file_glob {
+            c.args(["--glob", glob]);
+        }
+        c.arg(pattern);
+        c.arg(&search_path);
+        c
+    } else {
+        let mut c = Command::new("grep");
+        c.args(["-rn", "--include"]);
+        if let Some(glob) = file_glob {
+            c.arg(glob);
+        } else {
+            c.arg("*");
+        }
+        c.arg(pattern);
+        c.arg(&search_path);
+        c
+    };
+
+    let output = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| anyhow!("Failed to run search: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Step 2: parse grep output (file:line:text format)
+    struct GrepHit {
+        file: String,
+        line: u32,
+        text: String,
+    }
+
+    let mut hits: Vec<GrepHit> = Vec::new();
+    for line in stdout.lines() {
+        if hits.len() >= max_matches { break; }
+        // Parse "file:line:text" — handle Windows paths with drive letters
+        let parts: Vec<&str> = line.splitn(3, ':').collect();
+        if parts.len() >= 3 {
+            if let Ok(line_num) = parts[1].parse::<u32>() {
+                hits.push(GrepHit {
+                    file: parts[0].to_string(),
+                    line: line_num,
+                    text: parts[2].to_string(),
+                });
+            }
+        }
+    }
+
+    if hits.is_empty() {
+        return Ok(json!({
+            "matches": [],
+            "total": 0,
+            "pattern": pattern,
+        }));
+    }
+
+    // Step 3: group by file and parse AST for each unique file
+    let parser = Parser::new();
+    let mut ast_cache: std::collections::HashMap<String, Vec<(String, String, u32, u32)>> = std::collections::HashMap::new();
+
+    for hit in &hits {
+        if ast_cache.contains_key(&hit.file) { continue; }
+        // Parse the file's AST to get symbol ranges
+        let symbols: Vec<(String, String, u32, u32)> = match parser.parse_file(&hit.file) {
+            Ok(ctx) => ctx.symbols.iter().map(|s| {
+                (s.name.clone(), format!("{:?}", s.symbol_type).to_lowercase(), s.line, s.end_line)
+            }).collect(),
+            Err(_) => Vec::new(), // Unsupported language — no symbol context
+        };
+        ast_cache.insert(hit.file.clone(), symbols);
+    }
+
+    // Step 4: annotate each hit with the containing symbol
+    let mut matches: Vec<Value> = Vec::new();
+    let workspace_str = workspace_root.to_string_lossy();
+
+    for hit in &hits {
+        let relative_file = hit.file.strip_prefix(workspace_str.as_ref())
+            .unwrap_or(&hit.file)
+            .trim_start_matches('/');
+
+        let containing_symbol = ast_cache.get(&hit.file)
+            .and_then(|symbols| {
+                // Find the innermost symbol containing this line
+                symbols.iter()
+                    .filter(|(_, _, start, end)| hit.line >= *start && hit.line <= *end)
+                    .max_by_key(|(_, _, start, _)| *start) // innermost = highest start line
+                    .map(|(name, sym_type, start, end)| {
+                        json!({
+                            "name": name,
+                            "type": sym_type,
+                            "line": start,
+                            "end_line": end,
+                        })
+                    })
+            });
+
+        let mut entry = json!({
+            "file": relative_file,
+            "line": hit.line,
+            "text": hit.text.trim(),
+        });
+        if let Some(sym) = containing_symbol {
+            entry.as_object_mut().unwrap().insert("containing_symbol".to_string(), sym);
+        }
+        matches.push(entry);
+    }
+
+    let total = matches.len();
+    Ok(json!({
+        "matches": matches,
+        "total": total,
+        "pattern": pattern,
+        "files_searched": ast_cache.len(),
+    }))
+}
+
+// ============================================================================
+// Tool: project_info — structured manifest reader (CULTRA-996)
+// ============================================================================
+
+fn project_info_tool(args: Map<String, Value>, server: &Server) -> Result<Value> {
+    let project_path = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| server.workspace_root.clone());
+
+    if !project_path.starts_with(&server.workspace_root) {
+        return Err(anyhow!("Path must be within the workspace root"));
+    }
+    if !project_path.is_dir() {
+        return Err(anyhow!("Path '{}' is not a directory", project_path.display()));
+    }
+
+    // Detect manifest type by checking for known files
+    let manifests = [
+        ("Cargo.toml", "rust", "cargo"),
+        ("pyproject.toml", "python", "uv"),
+        ("package.json", "javascript", "npm"),
+        ("go.mod", "go", "go"),
+        ("composer.json", "php", "composer"),
+    ];
+
+    for (filename, language, default_pm) in &manifests {
+        let manifest_path = project_path.join(filename);
+        if manifest_path.exists() {
+            let content = std::fs::read_to_string(&manifest_path)
+                .map_err(|e| anyhow!("Failed to read {}: {}", filename, e))?;
+
+            let info = match *language {
+                "rust" => parse_cargo_toml(&content, &project_path),
+                "python" => parse_pyproject_toml(&content, &project_path),
+                "javascript" => parse_package_json(&content, &project_path),
+                "go" => parse_go_mod(&content, &project_path),
+                "php" => parse_composer_json(&content, &project_path),
+                _ => json!({"language": language}),
+            };
+
+            let mut result = json!({
+                "language": language,
+                "manifest": filename,
+                "manifest_path": manifest_path.to_string_lossy(),
+                "package_manager": default_pm,
+            });
+
+            // Merge parsed info
+            if let (Value::Object(ref mut base), Value::Object(parsed)) = (&mut result, info) {
+                for (k, v) in parsed {
+                    base.insert(k, v);
+                }
+            }
+
+            // Check LSP availability via PATH
+            let lsp_binary = match *language {
+                "rust" => "rust-analyzer",
+                "python" => "pyright-langserver",
+                "javascript" => "typescript-language-server",
+                "go" => "gopls",
+                "php" => "intelephense",
+                _ => "",
+            };
+            if !lsp_binary.is_empty() {
+                let available = std::process::Command::new(lsp_binary)
+                    .arg("--version")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok();
+                result.as_object_mut().unwrap().insert("lsp".to_string(), json!({
+                    "server": lsp_binary,
+                    "available": available,
+                }));
+            }
+
+            // Count source files
+            let extensions: &[&str] = match *language {
+                "rust" => &["rs"],
+                "python" => &["py"],
+                "javascript" => &["js", "jsx", "ts", "tsx"],
+                "go" => &["go"],
+                "php" => &["php"],
+                _ => &[],
+            };
+            let (source_count, test_count) = count_project_files(&project_path, extensions);
+            result.as_object_mut().unwrap().insert("files".to_string(), json!({
+                "source": source_count,
+                "test": test_count,
+            }));
+
+            return Ok(result);
+        }
+    }
+
+    Err(anyhow!("No recognized manifest file found in '{}'", project_path.display()))
+}
+
+
+fn parse_cargo_toml(content: &str, project_path: &std::path::Path) -> Value {
+    let mut deps = Vec::new();
+    let mut dev_deps = Vec::new();
+    let mut name = String::new();
+    let mut version = String::new();
+    let mut edition = String::new();
+    let mut rust_version = String::new();
+
+    let mut section = "";
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            section = if trimmed.starts_with("[package]") { "package" }
+                else if trimmed.starts_with("[dependencies]") { "deps" }
+                else if trimmed.starts_with("[dev-dependencies]") { "dev-deps" }
+                else { "other" };
+            continue;
+        }
+        if let Some((key, val)) = trimmed.split_once('=') {
+            let key = key.trim();
+            let val = val.trim().trim_matches('"');
+            match section {
+                "package" => match key {
+                    "name" => name = val.to_string(),
+                    "version" => version = val.to_string(),
+                    "edition" => edition = val.to_string(),
+                    "rust-version" => rust_version = val.to_string(),
+                    _ => {}
+                },
+                "deps" => deps.push(key.to_string()),
+                "dev-deps" => dev_deps.push(key.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    let has_workspace = project_path.join("Cargo.lock").exists();
+
+    json!({
+        "name": name,
+        "version": version,
+        "edition": edition,
+        "rust_version": rust_version,
+        "dependencies": deps,
+        "dev_dependencies": dev_deps,
+        "has_lockfile": has_workspace,
+    })
+}
+
+fn parse_pyproject_toml(content: &str, project_path: &std::path::Path) -> Value {
+    let mut deps = Vec::new();
+    let mut dev_deps = Vec::new();
+    let mut name = String::new();
+    let mut version = String::new();
+    let mut python_version = String::new();
+    let mut in_deps = false;
+    let mut in_dev_deps = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_deps = false;
+            in_dev_deps = false;
+        }
+        if trimmed == "dependencies = [" || trimmed.starts_with("dependencies = [") {
+            in_deps = true;
+            // Handle inline single-line arrays
+            if trimmed.contains(']') {
+                in_deps = false;
+            }
+            continue;
+        }
+        if trimmed.contains("dev-dependencies") || trimmed.contains("dev.dependencies") {
+            in_dev_deps = true;
+            continue;
+        }
+        if trimmed == "]" {
+            in_deps = false;
+            in_dev_deps = false;
+            continue;
+        }
+
+        if in_deps {
+            let dep = trimmed.trim_matches(',').trim().trim_matches('"').to_string();
+            if !dep.is_empty() { deps.push(dep); }
+        } else if in_dev_deps {
+            if let Some((key, _)) = trimmed.split_once('=') {
+                dev_deps.push(key.trim().trim_matches('"').to_string());
+            }
+        }
+
+        // Package metadata
+        if let Some((key, val)) = trimmed.split_once('=') {
+            let key = key.trim();
+            let val = val.trim().trim_matches('"');
+            match key {
+                "name" => if name.is_empty() { name = val.to_string(); },
+                "version" => if version.is_empty() { version = val.to_string(); },
+                "requires-python" => python_version = val.to_string(),
+                _ => {}
+            }
+        }
+    }
+
+    let pm = if project_path.join("uv.lock").exists() { "uv" }
+        else if project_path.join("poetry.lock").exists() { "poetry" }
+        else if project_path.join("Pipfile.lock").exists() { "pipenv" }
+        else { "pip" };
+
+    let has_venv = project_path.join(".venv").exists() || project_path.join("venv").exists();
+
+    json!({
+        "name": name,
+        "version": version,
+        "python_version": python_version,
+        "package_manager": pm,
+        "dependencies": deps,
+        "dev_dependencies": dev_deps,
+        "has_venv": has_venv,
+    })
+}
+
+fn parse_package_json(content: &str, project_path: &std::path::Path) -> Value {
+    let parsed: Value = serde_json::from_str(content).unwrap_or(json!({}));
+    let obj = parsed.as_object();
+
+    let name = obj.and_then(|o| o.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let version = obj.and_then(|o| o.get("version")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let deps: Vec<String> = obj.and_then(|o| o.get("dependencies"))
+        .and_then(|v| v.as_object())
+        .map(|d| d.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let dev_deps: Vec<String> = obj.and_then(|o| o.get("devDependencies"))
+        .and_then(|v| v.as_object())
+        .map(|d| d.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let pm = if project_path.join("bun.lock").exists() || project_path.join("bun.lockb").exists() { "bun" }
+        else if project_path.join("pnpm-lock.yaml").exists() { "pnpm" }
+        else if project_path.join("yarn.lock").exists() { "yarn" }
+        else { "npm" };
+
+    // Detect TS/Svelte/React
+    let has_ts = deps.iter().chain(dev_deps.iter()).any(|d| d == "typescript");
+    let has_svelte = deps.iter().chain(dev_deps.iter()).any(|d| d.contains("svelte"));
+    let has_react = deps.iter().chain(dev_deps.iter()).any(|d| d == "react");
+    let framework = if has_svelte { "svelte" }
+        else if has_react { "react" }
+        else if has_ts { "typescript" }
+        else { "javascript" };
+
+    json!({
+        "name": name,
+        "version": version,
+        "package_manager": pm,
+        "language": framework,
+        "dependencies": deps,
+        "dev_dependencies": dev_deps,
+        "has_typescript": has_ts,
+    })
+}
+
+fn parse_go_mod(content: &str, _project_path: &std::path::Path) -> Value {
+    let mut module = String::new();
+    let mut go_version = String::new();
+    let mut deps = Vec::new();
+
+    let mut in_require = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("module ") {
+            module = trimmed.strip_prefix("module ").unwrap_or("").to_string();
+        } else if trimmed.starts_with("go ") {
+            go_version = trimmed.strip_prefix("go ").unwrap_or("").to_string();
+        } else if trimmed == "require (" {
+            in_require = true;
+        } else if trimmed == ")" {
+            in_require = false;
+        } else if in_require {
+            if let Some(dep) = trimmed.split_whitespace().next() {
+                if !dep.starts_with("//") {
+                    deps.push(dep.to_string());
+                }
+            }
+        }
+    }
+
+    json!({
+        "name": module,
+        "go_version": go_version,
+        "dependencies": deps,
+    })
+}
+
+fn parse_composer_json(content: &str, _project_path: &std::path::Path) -> Value {
+    let parsed: Value = serde_json::from_str(content).unwrap_or(json!({}));
+    let obj = parsed.as_object();
+
+    let name = obj.and_then(|o| o.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let php_version = obj.and_then(|o| o.get("require"))
+        .and_then(|v| v.as_object())
+        .and_then(|r| r.get("php"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let deps: Vec<String> = obj.and_then(|o| o.get("require"))
+        .and_then(|v| v.as_object())
+        .map(|d| d.keys().filter(|k| *k != "php").cloned().collect())
+        .unwrap_or_default();
+
+    let dev_deps: Vec<String> = obj.and_then(|o| o.get("require-dev"))
+        .and_then(|v| v.as_object())
+        .map(|d| d.keys().cloned().collect())
+        .unwrap_or_default();
+
+    json!({
+        "name": name,
+        "php_version": php_version,
+        "dependencies": deps,
+        "dev_dependencies": dev_deps,
+    })
+}
+
+fn count_project_files(path: &std::path::Path, extensions: &[&str]) -> (usize, usize) {
+    let mut source = 0usize;
+    let mut test = 0usize;
+    count_files_recursive(path, extensions, &mut source, &mut test);
+    (source, test)
+}
+
+fn count_files_recursive(dir: &std::path::Path, extensions: &[&str], source: &mut usize, test: &mut usize) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_str().unwrap_or("");
+
+        // Skip hidden dirs, node_modules, vendor, target, __pycache__, .venv
+        if name_str.starts_with('.') || name_str == "node_modules" || name_str == "vendor"
+            || name_str == "target" || name_str == "__pycache__" || name_str == ".venv"
+            || name_str == "venv"
+        {
+            continue;
+        }
+
+        if path.is_dir() {
+            count_files_recursive(&path, extensions, source, test);
+        } else if path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !extensions.contains(&ext) { continue; }
+
+            let path_str = path.to_string_lossy();
+            if path_str.contains("test") || path_str.contains("_test.") || path_str.contains(".test.") {
+                *test += 1;
+            } else {
+                *source += 1;
+            }
+        }
     }
 }
 
@@ -2728,19 +5297,13 @@ mod tests {
         args.insert("depth".to_string(), json!(0));
         let result = parse_positive_int(&args, "depth", Some(1), Some(5));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be at least 1"));
+        assert!(result.unwrap_err().to_string().contains("must be at least 1"));
 
         // Test above range
         args.insert("depth".to_string(), json!(10));
         let result = parse_positive_int(&args, "depth", Some(1), Some(5));
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must be at most 5"));
+        assert!(result.unwrap_err().to_string().contains("must be at most 5"));
     }
 
     #[test]
@@ -2751,14 +5314,15 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         writeln!(file, "test content").unwrap();
 
-        // Should pass validation
-        let result = validate_file_exists(file_path.to_str().unwrap());
+        // Should pass validation (file is within workspace)
+        let result = validate_file_exists(file_path.to_str().unwrap(), temp_dir.path());
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_file_exists_missing() {
-        let result = validate_file_exists("/tmp/nonexistent_file_12345.txt");
+        let workspace = std::path::Path::new("/tmp");
+        let result = validate_file_exists("/tmp/nonexistent_file_12345.txt", workspace);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("File not found"));
@@ -2769,13 +5333,34 @@ mod tests {
     fn test_validate_file_exists_directory() {
         // Create a temporary directory
         let temp_dir = TempDir::new().unwrap();
+        let nested = temp_dir.path().join("subdir");
+        std::fs::create_dir(&nested).unwrap();
 
         // Should fail because it's a directory, not a file
-        let result = validate_file_exists(temp_dir.path().to_str().unwrap());
+        let result = validate_file_exists(nested.to_str().unwrap(), temp_dir.path());
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Path exists but is not a file"));
         assert!(err.contains("Expected a regular file"));
+    }
+
+    #[test]
+    fn test_validate_file_exists_outside_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        // Create a file outside the workspace
+        let outside_file = temp_dir.path().join("secret.txt");
+        let mut file = File::create(&outside_file).unwrap();
+        writeln!(file, "sensitive data").unwrap();
+
+        // Should fail — file is outside workspace
+        let result = validate_file_exists(outside_file.to_str().unwrap(), &workspace);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Access denied"));
+        assert!(err.contains("outside the workspace"));
     }
 
     #[test]
@@ -2798,20 +5383,14 @@ mod tests {
     fn test_split_location_invalid_format() {
         let result = split_location("file.go");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid location format"));
+        assert!(result.unwrap_err().to_string().contains("Invalid location format"));
     }
 
     #[test]
     fn test_split_location_invalid_line_number() {
         let result = split_location("file.go:abc");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid line number"));
+        assert!(result.unwrap_err().to_string().contains("Invalid line number"));
     }
 
     // Helper to create a test server (API calls will fail but validation runs first)
@@ -2859,12 +5438,9 @@ mod tests {
     fn test_batch_recursive_call_blocked() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert(
-            "operations".to_string(),
-            json!([
-                {"tool": "batch", "args": {"operations": [{"tool": "get_task", "args": {}}]}}
-            ]),
-        );
+        args.insert("operations".to_string(), json!([
+            {"tool": "batch", "args": {"operations": [{"tool": "get_task", "args": {}}]}}
+        ]));
         let result = batch(&mut server, args).unwrap();
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
@@ -2876,35 +5452,26 @@ mod tests {
     fn test_batch_unknown_tool_returns_error_result() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert(
-            "operations".to_string(),
-            json!([
-                {"tool": "nonexistent_tool_xyz", "args": {}}
-            ]),
-        );
+        args.insert("operations".to_string(), json!([
+            {"tool": "nonexistent_tool_xyz", "args": {}}
+        ]));
         let result = batch(&mut server, args).unwrap();
         assert_eq!(result["total"], 1);
         let results = result["results"].as_array().unwrap();
         assert_eq!(results[0]["index"], 0);
         assert_eq!(results[0]["tool"], "nonexistent_tool_xyz");
         assert_eq!(results[0]["success"], false);
-        assert!(results[0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("Unknown tool"));
+        assert!(results[0]["error"].as_str().unwrap().contains("Unknown tool"));
     }
 
     #[test]
     fn test_batch_result_structure() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert(
-            "operations".to_string(),
-            json!([
-                {"tool": "unknown_a", "args": {}},
-                {"tool": "unknown_b", "args": {}}
-            ]),
-        );
+        args.insert("operations".to_string(), json!([
+            {"tool": "unknown_a", "args": {}},
+            {"tool": "unknown_b", "args": {}}
+        ]));
         let result = batch(&mut server, args).unwrap();
         assert_eq!(result["total"], 2);
         let results = result["results"].as_array().unwrap();
@@ -2918,15 +5485,1674 @@ mod tests {
     fn test_batch_missing_tool_field() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert(
-            "operations".to_string(),
-            json!([
-                {"args": {}}
-            ]),
-        );
+        args.insert("operations".to_string(), json!([
+            {"args": {}}
+        ]));
         let result = batch(&mut server, args).unwrap();
         let results = result["results"].as_array().unwrap();
         assert_eq!(results[0]["success"], false);
         assert!(results[0]["error"].as_str().unwrap().contains("'tool'"));
+    }
+
+    #[test]
+    fn test_parse_timestamp_secs_rfc3339_basic() {
+        // 2026-04-11T01:30:00Z = 1775871000
+        assert_eq!(parse_timestamp_secs("2026-04-11T01:30:00Z"), 1775871000);
+    }
+
+    #[test]
+    fn test_parse_timestamp_secs_leap_day() {
+        // 2024-02-29T12:00:00Z = 1709208000
+        assert_eq!(parse_timestamp_secs("2024-02-29T12:00:00Z"), 1709208000);
+    }
+
+    #[test]
+    fn test_parse_timestamp_secs_year_boundary() {
+        // 2026-12-31T23:59:59Z = 1798761599
+        assert_eq!(parse_timestamp_secs("2026-12-31T23:59:59Z"), 1798761599);
+        // 2027-01-01T00:00:00Z = 1798761600
+        assert_eq!(parse_timestamp_secs("2027-01-01T00:00:00Z"), 1798761600);
+    }
+
+    #[test]
+    fn test_parse_timestamp_secs_microseconds() {
+        // Postgres json_agg format with microseconds — should parse, truncating fractional seconds
+        assert_eq!(parse_timestamp_secs("2026-04-11T01:30:00.123456Z"), 1775871000);
+    }
+
+    #[test]
+    fn test_parse_timestamp_secs_malformed() {
+        assert_eq!(parse_timestamp_secs("not a date"), 0);
+    }
+
+    #[test]
+    fn test_parse_timestamp_secs_empty() {
+        assert_eq!(parse_timestamp_secs(""), 0);
+    }
+
+    // CULTRA-905: analyze_files (plural) bulk endpoint tests.
+
+    fn write_go_file(dir: &TempDir, name: &str, contents: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let mut f = File::create(&path).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_analyze_files_returns_one_entry_per_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = write_go_file(&dir, "a.go", "package main\nfunc main() {}\n");
+        let p2 = write_go_file(&dir, "b.go", "package main\nfunc helper() {}\n");
+        let p3 = write_go_file(&dir, "c.go", "package main\nimport \"sync\"\nvar _ sync.Mutex\n");
+
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("complexity"));
+        args.insert("file_paths".to_string(), json!([
+            p1.to_str().unwrap(),
+            p2.to_str().unwrap(),
+            p3.to_str().unwrap(),
+        ]));
+
+        let workspace = std::path::PathBuf::from("/");
+        let result = analyze_files_tool(args, &workspace).unwrap();
+
+        assert_eq!(result["total"], 3);
+        assert_eq!(result["succeeded"], 3);
+        assert_eq!(result["failed"], 0);
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_analyze_files_preserves_input_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..5)
+            .map(|i| write_go_file(&dir, &format!("f{}.go", i), "package main\n"))
+            .collect();
+
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("security"));
+        args.insert("file_paths".to_string(), json!(
+            paths.iter().map(|p| p.to_str().unwrap()).collect::<Vec<_>>()
+        ));
+
+        let workspace = std::path::PathBuf::from("/");
+        let result = analyze_files_tool(args, &workspace).unwrap();
+        let results = result["results"].as_array().unwrap();
+        for (i, entry) in results.iter().enumerate() {
+            assert_eq!(
+                entry["file_path"].as_str().unwrap(),
+                paths[i].to_str().unwrap(),
+                "result {} out of order", i
+            );
+        }
+    }
+
+    #[test]
+    fn test_analyze_files_isolates_per_file_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = write_go_file(&dir, "good.go", "package main\nfunc main() {}\n");
+        let bad = dir.path().join("nonexistent.go");
+
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("complexity"));
+        args.insert("file_paths".to_string(), json!([
+            good.to_str().unwrap(),
+            bad.to_str().unwrap(),
+        ]));
+
+        let workspace = std::path::PathBuf::from("/");
+        let result = analyze_files_tool(args, &workspace).unwrap();
+        assert_eq!(result["total"], 2);
+        assert_eq!(result["succeeded"], 1);
+        assert_eq!(result["failed"], 1);
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results[0]["success"], json!(true));
+        assert_eq!(results[1]["success"], json!(false));
+        assert!(results[1]["error"].is_string());
+    }
+
+    #[test]
+    fn test_analyze_files_rejects_invalid_analyzer() {
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("garbage"));
+        args.insert("file_paths".to_string(), json!(["/tmp/x.go"]));
+        let workspace = std::path::PathBuf::from("/");
+        let err = analyze_files_tool(args, &workspace).unwrap_err();
+        assert!(err.to_string().contains("Invalid analyzer"));
+    }
+
+    #[test]
+    fn test_analyze_files_rejects_empty_array() {
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("security"));
+        args.insert("file_paths".to_string(), json!([]));
+        let workspace = std::path::PathBuf::from("/");
+        let err = analyze_files_tool(args, &workspace).unwrap_err();
+        assert!(err.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn test_analyze_files_rejects_non_string_entry() {
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("security"));
+        args.insert("file_paths".to_string(), json!(["/tmp/x.go", 42]));
+        let workspace = std::path::PathBuf::from("/");
+        let err = analyze_files_tool(args, &workspace).unwrap_err();
+        assert!(err.to_string().contains("not a string"));
+    }
+
+    // CULTRA-906: caller enrichment tests (LSP graceful degradation).
+    // The full callgraph path requires a running language server, which we
+    // don't spin up in unit tests. These tests cover the no-LSP path: the
+    // enrichment helper must return symbols unchanged (no callers field) when
+    // LSP queries fail, and parse_file_ast must not panic with with_callers=true.
+
+    #[test]
+    fn test_enrich_symbols_degrades_gracefully_without_lsp() {
+        use crate::ast::parser::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ExportedHelper() int {{").unwrap();
+        writeln!(f, "    return 42").unwrap();
+        writeln!(f, "}}").unwrap();
+        writeln!(f, "func unexportedHelper() int {{").unwrap();
+        writeln!(f, "    return 7").unwrap();
+        writeln!(f, "}}").unwrap();
+        drop(f);
+
+        let parser = Parser::new();
+        let file_context = parser.parse_file(path.to_str().unwrap()).unwrap();
+        let server = test_server();
+
+        let result = enrich_symbols_with_callers(&file_context, &server);
+        let arr = result.as_array().expect("expected array");
+        assert!(!arr.is_empty(), "expected at least one symbol");
+
+        // No symbol should panic. The "callers" field, if present, must be
+        // a (possibly empty) array. LSPManager may either fail (no field) or
+        // return an empty references list (empty array) — both are degraded
+        // states we accept.
+        for entry in arr {
+            let obj = entry.as_object().expect("symbol should serialize as object");
+            assert!(obj.contains_key("name"), "symbol missing name");
+            if let Some(callers) = obj.get("callers") {
+                assert!(callers.is_array(), "callers must be an array, got {:?}", callers);
+            }
+        }
+    }
+
+    // CULTRA-908: analyze_changes tests. We use a real on-disk git repo
+    // (init + commit) to exercise the actual git diff invocation rather
+    // than mocking. Each test sets up its own tempdir → no shared state.
+
+    fn init_git_repo(dir: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git command failed to spawn");
+            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["config", "commit.gpgsign", "false"]);
+    }
+
+    fn commit_all(dir: &std::path::Path, msg: &str) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git command failed");
+            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", msg]);
+    }
+
+    #[test]
+    fn test_analyze_changes_filters_to_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        std::fs::write(dir.path().join("safe.go"), "package main\nfunc Helper() {}\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        std::fs::write(dir.path().join("changed.go"), "package main\nfunc Changed() {}\n").unwrap();
+        commit_all(dir.path(), "add changed");
+
+        let mut args = Map::new();
+        args.insert("since".to_string(), json!("HEAD~1"));
+        args.insert("analyzer".to_string(), json!("complexity"));
+        let result = analyze_changes_tool(args, dir.path()).expect("should not error");
+
+        let total = result["total"].as_u64().unwrap();
+        assert_eq!(total, 1, "expected 1 file analyzed, got {}: {:?}", total, result);
+        let results = result["results"].as_array().unwrap();
+        assert!(results[0]["file_path"].as_str().unwrap().ends_with("changed.go"));
+    }
+
+    #[test]
+    fn test_analyze_changes_no_changes_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        let mut args = Map::new();
+        args.insert("since".to_string(), json!("HEAD"));
+        args.insert("analyzer".to_string(), json!("security"));
+        let result = analyze_changes_tool(args, dir.path()).expect("should not error");
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["results"], json!([]));
+    }
+
+    #[test]
+    fn test_analyze_changes_invalid_ref_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        let mut args = Map::new();
+        args.insert("since".to_string(), json!("nonexistent-ref"));
+        args.insert("analyzer".to_string(), json!("security"));
+        let err = analyze_changes_tool(args, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("git diff failed"), "expected git error, got: {}", err);
+    }
+
+    #[test]
+    fn test_analyze_changes_filters_by_analyzer_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        std::fs::write(dir.path().join("styles.css"), ".x { color: red; }\n").unwrap();
+        std::fs::write(dir.path().join("more.go"), "package main\nfunc M() {}\n").unwrap();
+        commit_all(dir.path(), "add mixed");
+
+        let mut args = Map::new();
+        args.insert("since".to_string(), json!("HEAD~1"));
+        args.insert("analyzer".to_string(), json!("concurrency"));
+        let result = analyze_changes_tool(args, dir.path()).unwrap();
+        assert_eq!(result["total"], 1);
+        let results = result["results"].as_array().unwrap();
+        assert!(results[0]["file_path"].as_str().unwrap().ends_with("more.go"));
+    }
+
+    // CULTRA-956: include_working_tree default + descriptive empty messages.
+
+    #[test]
+    fn test_analyze_changes_includes_working_tree_by_default() {
+        // Working-tree file is uncommitted; with the new default it must
+        // be included in the diff. Pre-fix this returned 0 because the
+        // tool ran `git diff <since> HEAD` which excluded uncommitted work.
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        // Touch a.go and add a new file IN THE WORKING TREE only.
+        std::fs::write(dir.path().join("a.go"), "package main\nfunc Live() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.go"), "package main\nfunc B() {}\n").unwrap();
+        // Note: NOT committed.
+
+        let mut args = Map::new();
+        args.insert("since".to_string(), json!("HEAD"));
+        args.insert("analyzer".to_string(), json!("complexity"));
+        let result = analyze_changes_tool(args, dir.path()).unwrap();
+        let total = result["total"].as_u64().unwrap();
+        assert!(total >= 1,
+            "working-tree changes should be included by default, got total={}", total);
+        assert_eq!(result["include_working_tree"], true);
+    }
+
+    #[test]
+    fn test_analyze_changes_committed_only_mode_excludes_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        // Working-tree only — NOT committed.
+        std::fs::write(dir.path().join("a.go"), "package main\nfunc New() {}\n").unwrap();
+
+        let mut args = Map::new();
+        args.insert("since".to_string(), json!("HEAD"));
+        args.insert("analyzer".to_string(), json!("complexity"));
+        args.insert("include_working_tree".to_string(), json!(false));
+        let result = analyze_changes_tool(args, dir.path()).unwrap();
+        // include_working_tree=false → only committed diff between HEAD..HEAD = empty.
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["include_working_tree"], false);
+    }
+
+    #[test]
+    fn test_analyze_changes_no_changes_message_is_specific() {
+        // CULTRA-956: empty result must say "no changes found between X
+        // and the working tree" instead of the misleading
+        // "language filter rejected files."
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        let mut args = Map::new();
+        args.insert("since".to_string(), json!("HEAD"));
+        args.insert("analyzer".to_string(), json!("complexity"));
+        let result = analyze_changes_tool(args, dir.path()).unwrap();
+        assert_eq!(result["total"], 0);
+        let msg = result["message"].as_str().unwrap();
+        assert!(
+            msg.contains("No changes found")
+                || msg.contains("no changes found"),
+            "empty diff should say 'no changes found', got: {}",
+            msg
+        );
+        assert!(!msg.contains("language filter rejected"),
+            "empty diff must NOT blame the language filter when there's no diff at all");
+    }
+
+    #[test]
+    fn test_analyze_changes_language_filter_message_is_specific() {
+        // The OTHER empty case: there ARE changes, but none match the
+        // analyzer's language filter. The message should say so explicitly
+        // and report the changed-file count.
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("a.go"), "package main\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        // Add a non-Go file (CSS isn't in the complexity analyzer's
+        // extension list, so it'll be filtered out).
+        std::fs::write(dir.path().join("styles.css"), ".x{color:red}\n").unwrap();
+        commit_all(dir.path(), "add css");
+
+        let mut args = Map::new();
+        args.insert("since".to_string(), json!("HEAD~1"));
+        args.insert("analyzer".to_string(), json!("complexity"));
+        let result = analyze_changes_tool(args, dir.path()).unwrap();
+        assert_eq!(result["total"], 0);
+        let msg = result["message"].as_str().unwrap();
+        assert!(msg.contains("language filter") || msg.contains("none matched"),
+            "should blame the language filter, got: {}", msg);
+        assert!(result["total_changed_files"].as_u64().unwrap() >= 1,
+            "should report the count of files that were filtered out");
+    }
+
+    #[test]
+    fn test_analyze_changes_skips_deleted_files() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        std::fs::write(dir.path().join("doomed.go"), "package main\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        std::fs::remove_file(dir.path().join("doomed.go")).unwrap();
+        commit_all(dir.path(), "delete");
+
+        let mut args = Map::new();
+        args.insert("since".to_string(), json!("HEAD~1"));
+        args.insert("analyzer".to_string(), json!("complexity"));
+        let result = analyze_changes_tool(args, dir.path()).unwrap();
+        assert_eq!(result["total"], 0, "deleted files must not appear in analysis");
+    }
+
+    // CULTRA-909: diff_file_ast tests. Real git repo with two commits.
+
+    #[test]
+    fn test_diff_file_ast_added_and_removed_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        let file = dir.path().join("api.go");
+        std::fs::write(&file, "package main\nfunc Old() {}\nfunc Stable() {}\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        std::fs::write(&file, "package main\nfunc New() {}\nfunc Stable() {}\n").unwrap();
+        commit_all(dir.path(), "swap Old for New");
+
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(file.to_str().unwrap()));
+        args.insert("base_ref".to_string(), json!("HEAD~1"));
+        let result = diff_file_ast_tool(args, dir.path()).expect("should not error");
+
+        let added: Vec<_> = result["added"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect();
+        let removed: Vec<_> = result["removed"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect();
+        assert!(added.contains(&"New".to_string()), "expected New in added, got {:?}", added);
+        assert!(removed.contains(&"Old".to_string()), "expected Old in removed, got {:?}", removed);
+        // Stable function appears in neither.
+        assert!(!added.contains(&"Stable".to_string()));
+        assert!(!removed.contains(&"Stable".to_string()));
+    }
+
+    #[test]
+    fn test_diff_file_ast_signature_change_in_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        let file = dir.path().join("sig.go");
+        std::fs::write(&file, "package main\nfunc DoWork(x int) {}\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        std::fs::write(&file, "package main\nfunc DoWork(x int, y string) {}\n").unwrap();
+        commit_all(dir.path(), "add y param");
+
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(file.to_str().unwrap()));
+        args.insert("base_ref".to_string(), json!("HEAD~1"));
+        let result = diff_file_ast_tool(args, dir.path()).unwrap();
+
+        let modified = result["modified"].as_array().unwrap();
+        assert_eq!(modified.len(), 1, "expected 1 modified, got {:?}", modified);
+        let entry = &modified[0];
+        assert_eq!(entry["name"], "DoWork");
+        let base_params = entry["base"]["parameters"].as_array().unwrap();
+        let head_params = entry["head"]["parameters"].as_array().unwrap();
+        assert_eq!(base_params.len(), 1, "base should have 1 param");
+        assert_eq!(head_params.len(), 2, "head should have 2 params");
+        assert!(head_params.iter().any(|p| p["name"] == "y"), "head should include y param: {:?}", head_params);
+    }
+
+    #[test]
+    fn test_diff_file_ast_identical_files_empty_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        let file = dir.path().join("same.go");
+        std::fs::write(&file, "package main\nfunc Same() {}\n").unwrap();
+        commit_all(dir.path(), "init");
+        // No changes, just another commit.
+        std::fs::write(dir.path().join("other.txt"), "x").unwrap();
+        commit_all(dir.path(), "noise");
+
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(file.to_str().unwrap()));
+        args.insert("base_ref".to_string(), json!("HEAD~1"));
+        let result = diff_file_ast_tool(args, dir.path()).unwrap();
+
+        assert_eq!(result["added"], json!([]));
+        assert_eq!(result["removed"], json!([]));
+        assert_eq!(result["modified"], json!([]));
+    }
+
+    #[test]
+    fn test_diff_file_ast_invalid_ref_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        init_git_repo(dir.path());
+        let file = dir.path().join("a.go");
+        std::fs::write(&file, "package main\n").unwrap();
+        commit_all(dir.path(), "init");
+
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(file.to_str().unwrap()));
+        args.insert("base_ref".to_string(), json!("nonexistent-ref-xyz"));
+        let err = diff_file_ast_tool(args, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("git show"), "expected git error, got: {}", err);
+    }
+
+    #[test]
+    fn test_diff_file_ast_nested_git_repo_walks_up_to_repo_root() {
+        // CULTRA-954 reproduction: sandbox at outer dir, git repo nested
+        // one level deep (sandbox/crate/.git), source file at
+        // sandbox/crate/api.go. The pre-fix code ran `git show
+        // HEAD:crate/api.go` from the sandbox (which has no .git) and
+        // failed. The fix walks up from file_path to find .git, runs git
+        // from there, and computes the rel_path against the resolved
+        // repo root (so the path is `api.go`, not `crate/api.go`).
+        let outer = tempfile::tempdir().unwrap();
+        let crate_dir = outer.path().join("vux");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        init_git_repo(&crate_dir);
+
+        let file = crate_dir.join("api.go");
+        std::fs::write(&file, "package main\nfunc Old() {}\n").unwrap();
+        commit_all(&crate_dir, "init");
+
+        std::fs::write(&file, "package main\nfunc New() {}\n").unwrap();
+        commit_all(&crate_dir, "swap");
+
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(file.to_str().unwrap()));
+        args.insert("base_ref".to_string(), json!("HEAD~1"));
+        // Sandbox is the OUTER dir; the git repo is nested inside.
+        let result = diff_file_ast_tool(args, outer.path())
+            .expect("nested git repo should be discovered via walk-up");
+
+        let added: Vec<_> = result["added"].as_array().unwrap().iter()
+            .map(|s| s["name"].as_str().unwrap().to_string()).collect();
+        let removed: Vec<_> = result["removed"].as_array().unwrap().iter()
+            .map(|s| s["name"].as_str().unwrap().to_string()).collect();
+        assert!(added.contains(&"New".to_string()),
+            "expected New in added (proves git ran from the right cwd), got: {:?}", added);
+        assert!(removed.contains(&"Old".to_string()),
+            "expected Old in removed, got: {:?}", removed);
+    }
+
+    #[test]
+    fn test_diff_file_ast_no_git_repo_returns_clear_error() {
+        // CULTRA-954: file inside the sandbox but outside any git repo →
+        // skip the cryptic "git show failed" error in favor of a clear
+        // "no .git found" message naming the sandbox root.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("orphan.go");
+        std::fs::write(&file, "package main\n").unwrap();
+
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(file.to_str().unwrap()));
+        args.insert("base_ref".to_string(), json!("HEAD"));
+        let err = diff_file_ast_tool(args, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(".git") && msg.contains("sandbox"),
+            "error should mention .git and sandbox boundary, got: {}", msg);
+    }
+
+    // CULTRA-907: find_dead_code tests. Same constraint as caller enrichment:
+    // we don't spin up a real LSP server in unit tests, so we cover the
+    // graceful-degradation contract (LSP failure → symbol skipped, not flagged
+    // as dead) and validate response shape.
+
+    #[test]
+    fn test_find_dead_code_returns_shape_without_lsp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dead.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ExportedA() {{}}").unwrap();
+        writeln!(f, "func ExportedB() {{}}").unwrap();
+        writeln!(f, "func privateC() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+
+        let result = find_dead_code_tool(args, &server).expect("should not error");
+        let obj = result.as_object().unwrap();
+
+        assert!(obj.contains_key("file_path"));
+        assert!(obj.contains_key("checked_symbols"));
+        assert!(obj.contains_key("dead_symbols"));
+        assert!(obj.contains_key("lsp_failures"));
+        assert!(obj.contains_key("caveats"));
+
+        // 2 exported functions checked; private one skipped.
+        let checked = obj["checked_symbols"].as_u64().unwrap();
+        assert_eq!(checked, 2, "expected 2 checked exported symbols, got {}", checked);
+
+        // Without LSP, every symbol either gets skipped (lsp_failures bumped)
+        // or returns no references (would be flagged dead). Either is a valid
+        // degraded outcome — assert dead_symbols is an array and lsp_failures
+        // is a non-negative integer.
+        assert!(obj["dead_symbols"].is_array());
+        assert!(obj["lsp_failures"].is_u64());
+    }
+
+    #[test]
+    fn test_find_dead_code_rejects_missing_file_path() {
+        let server = test_server();
+        let args = Map::new();
+        let err = find_dead_code_tool(args, &server).unwrap_err();
+        assert!(err.to_string().contains("file_path"));
+    }
+
+    #[test]
+    fn test_find_dead_code_confidence_field_present() {
+        // CULTRA-945: every entry in dead_symbols must carry a confidence
+        // field ("high" | "low") and a total_references count so callers
+        // can tell "proven dead" apart from "LSP didn't index yet".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deadc.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ExportedUnused() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        let result = find_dead_code_tool(args, &server).unwrap();
+
+        // Verify caveats mention CULTRA-945 confidence behaviour.
+        let caveats = result["caveats"].as_array().unwrap();
+        let joined: String = caveats.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ");
+        assert!(joined.contains("CULTRA-945") && joined.contains("confidence"),
+            "expected CULTRA-945 confidence caveat, got: {}", joined);
+
+        // Every dead entry must have confidence + total_references.
+        let dead = result["dead_symbols"].as_array().unwrap();
+        for entry in dead {
+            let obj = entry.as_object().unwrap();
+            assert!(obj.contains_key("confidence"), "dead entry missing confidence: {:?}", obj);
+            assert!(obj.contains_key("total_references"), "dead entry missing total_references: {:?}", obj);
+            let c = obj["confidence"].as_str().unwrap();
+            assert!(c == "high" || c == "low", "confidence must be 'high' or 'low', got: {}", c);
+        }
+    }
+
+    // CULTRA-947: index-cold status surfacing tests.
+
+    #[test]
+    fn test_find_dead_code_reports_cold_index_status() {
+        // Without a running LSP, all symbol references come back empty —
+        // the cold-index signature. Must surface lsp_index_status='cold'
+        // AND a top-level warning field (not just a caveat).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cold.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ExportedA() {{}}").unwrap();
+        writeln!(f, "func ExportedB() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        let result = find_dead_code_tool(args, &server).unwrap();
+
+        assert_eq!(result["lsp_index_status"], "cold",
+            "expected cold status when no LSP index, got {:?}", result["lsp_index_status"]);
+        let warning = result.get("warning").and_then(|v| v.as_str())
+            .expect("cold status must surface a top-level warning");
+        assert!(warning.contains("cold"), "warning should mention cold: {}", warning);
+        assert!(warning.contains("require_warm_index"),
+            "warning should point at the require_warm_index knob: {}", warning);
+    }
+
+    #[test]
+    fn test_find_dead_code_unknown_status_when_nothing_checked() {
+        // A file with only private symbols has zero exported callables to
+        // check → lsp_index_status='unknown' and no warning.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private_only.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func private1() {{}}").unwrap();
+        writeln!(f, "func private2() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        let result = find_dead_code_tool(args, &server).unwrap();
+
+        assert_eq!(result["checked_symbols"], 0);
+        assert_eq!(result["lsp_index_status"], "unknown");
+        assert!(result.get("warning").is_none(),
+            "unknown status must not emit a warning, got {:?}", result.get("warning"));
+    }
+
+    #[test]
+    fn test_find_dead_code_require_warm_index_errors_on_cold() {
+        // Strict mode: cold index + require_warm_index=true → early error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cold_strict.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ExportedFn() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("require_warm_index".to_string(), json!(true));
+        let err = find_dead_code_tool(args, &server).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cold"), "expected cold-index error, got: {}", msg);
+        assert!(msg.contains("require_warm_index"),
+            "error should reference require_warm_index, got: {}", msg);
+    }
+
+    #[test]
+    fn test_find_dead_code_require_warm_index_false_still_returns_result() {
+        // Explicit false should be equivalent to omitting the flag — still
+        // returns best-effort result with the warning, not an error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cold_false.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ExportedFn() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("require_warm_index".to_string(), json!(false));
+        let result = find_dead_code_tool(args, &server).expect("should not error in lax mode");
+        assert_eq!(result["lsp_index_status"], "cold");
+        assert!(result.get("warning").is_some(), "should still surface warning");
+    }
+
+    #[test]
+    fn test_find_dead_code_skips_private_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("only_private.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func helper1() {{}}").unwrap();
+        writeln!(f, "func helper2() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+
+        let result = find_dead_code_tool(args, &server).unwrap();
+        assert_eq!(result["checked_symbols"], 0);
+        assert_eq!(result["dead_symbols"], json!([]));
+    }
+
+    // CULTRA-948: find_references tests. Same constraint as find_dead_code
+    // tests: unit tests don't spin up a real LSP server, so we cover the
+    // parameter-validation contract, response shape, the role classifier
+    // directly, and the cold-index graceful-degradation path.
+
+    #[test]
+    fn test_find_references_missing_symbol_param() {
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!("/tmp/whatever.go"));
+        let err = find_references_tool(args, &server).unwrap_err();
+        assert!(err.to_string().contains("symbol"),
+            "expected symbol param error, got: {}", err);
+    }
+
+    #[test]
+    fn test_find_references_missing_file_path_param() {
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("symbol".to_string(), json!("Foo"));
+        let err = find_references_tool(args, &server).unwrap_err();
+        assert!(err.to_string().contains("file_path"),
+            "expected file_path param error, got: {}", err);
+    }
+
+    #[test]
+    fn test_find_references_symbol_not_in_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs_missing.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ActualFn() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("symbol".to_string(), json!("NonexistentFn"));
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        let err = find_references_tool(args, &server).unwrap_err();
+        assert!(err.to_string().contains("NonexistentFn"),
+            "expected symbol-not-found error naming the symbol, got: {}", err);
+    }
+
+    #[test]
+    fn test_find_references_returns_shape_without_lsp() {
+        // No LSP running → empty refs → cold-index path. Must produce a
+        // well-formed response with the expected top-level fields, a cold
+        // status, and a top-level warning.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs_shape.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func MyFunc() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("symbol".to_string(), json!("MyFunc"));
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        let result = find_references_tool(args, &server).expect("should not error in lax mode");
+        let obj = result.as_object().unwrap();
+
+        assert_eq!(obj["symbol"], "MyFunc");
+        assert!(obj.contains_key("checked_at"));
+        assert!(obj.contains_key("results"));
+        assert!(obj.contains_key("total_references"));
+        assert!(obj.contains_key("lsp_index_status"));
+        assert!(obj["results"].is_array());
+        assert_eq!(obj["lsp_index_status"], "cold");
+        assert!(obj.get("warning").is_some(),
+            "cold status must surface a top-level warning");
+        let warning = obj["warning"].as_str().unwrap();
+        assert!(warning.contains("cold"), "warning should mention cold: {}", warning);
+        assert!(warning.contains("require_warm_index"),
+            "warning should point at the require_warm_index knob: {}", warning);
+    }
+
+    #[test]
+    fn test_find_references_require_warm_index_errors_on_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs_strict.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func Strict() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("symbol".to_string(), json!("Strict"));
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("require_warm_index".to_string(), json!(true));
+        let err = find_references_tool(args, &server).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cold"), "expected cold-index error, got: {}", msg);
+        assert!(msg.contains("require_warm_index"),
+            "error should reference require_warm_index, got: {}", msg);
+    }
+
+    #[test]
+    fn test_find_references_require_warm_index_false_still_returns_result() {
+        // Explicit false == omitting the flag → best-effort result with warning.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs_lax.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func Lax() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("symbol".to_string(), json!("Lax"));
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("require_warm_index".to_string(), json!(false));
+        let result = find_references_tool(args, &server)
+            .expect("explicit false should not error");
+        assert_eq!(result["lsp_index_status"], "cold");
+        assert!(result.get("warning").is_some());
+    }
+
+    // Role classifier unit tests — pure function, no LSP/fs needed.
+
+    #[test]
+    fn test_classify_reference_role_definition_shortcircuits() {
+        assert_eq!(
+            classify_reference_role("func Foo() {}", 5, 3, true),
+            "definition"
+        );
+    }
+
+    #[test]
+    fn test_classify_reference_role_call_paren() {
+        // `    self.build(arg)` — `build` at col 9, len 5, followed by '('
+        assert_eq!(
+            classify_reference_role("    self.build(arg)", 9, 5, false),
+            "call"
+        );
+    }
+
+    #[test]
+    fn test_classify_reference_role_type_use_struct_literal() {
+        // `let x = MyStruct { a: 1 };` — `MyStruct` at col 8, len 8, followed by ' {'
+        assert_eq!(
+            classify_reference_role("let x = MyStruct { a: 1 };", 8, 8, false),
+            "type_use"
+        );
+    }
+
+    #[test]
+    fn test_classify_reference_role_type_use_path() {
+        // `MyModule::new()` — `MyModule` at col 0, len 8, followed by '::'
+        assert_eq!(
+            classify_reference_role("MyModule::new()", 0, 8, false),
+            "type_use"
+        );
+    }
+
+    #[test]
+    fn test_classify_reference_role_type_use_generic_open() {
+        // `Vec<MyType>` — `Vec` at col 0, len 3, followed by '<'
+        assert_eq!(
+            classify_reference_role("Vec<MyType>", 0, 3, false),
+            "type_use"
+        );
+    }
+
+    #[test]
+    fn test_classify_reference_role_doc_triple_slash() {
+        // `/// See compose_inputs for details.` — symbol inside /// doc
+        assert_eq!(
+            classify_reference_role("/// See compose_inputs for details.", 8, 14, false),
+            "doc"
+        );
+    }
+
+    #[test]
+    fn test_classify_reference_role_doc_line_comment() {
+        // `// calls build(arg) internally` — symbol inside // line comment
+        assert_eq!(
+            classify_reference_role("// calls build(arg) internally", 9, 5, false),
+            "doc"
+        );
+    }
+
+    #[test]
+    fn test_classify_reference_role_doc_trailing_comment() {
+        // `x = 1; // compose_inputs is deprecated` — // opens before symbol col
+        assert_eq!(
+            classify_reference_role("x = 1; // compose_inputs is deprecated", 10, 14, false),
+            "doc"
+        );
+    }
+
+    #[test]
+    fn test_classify_reference_role_doc_block_continuation() {
+        // ` * uses compose_inputs ...` — multi-line /* */ block continuation
+        assert_eq!(
+            classify_reference_role(" * uses compose_inputs here", 8, 14, false),
+            "doc"
+        );
+    }
+
+    #[test]
+    fn test_classify_reference_role_unknown_fallback() {
+        // `foo;` — next char is ';', no match
+        assert_eq!(
+            classify_reference_role("foo;", 0, 3, false),
+            "unknown"
+        );
+    }
+
+    // CULTRA-950: warmup parameter wiring tests. Verify the find_dead_code
+    // and find_references tools both surface a warmup_report in the
+    // response when warmup=true, and omit it when warmup is unset.
+
+    // CULTRA-938 / CULTRA-939: get_tasks + recent_activity tests for the
+    // new /api/v2/tasks wrapped response shape and multi-status filtering.
+    // These tests run against test_server() which has no live backend, so
+    // the HTTP call always fails — what we're verifying is the validation
+    // path BEFORE the HTTP call. A validation error proves the validator
+    // ran; a network error means validation passed.
+
+    fn err_is_status_validation(result: &Result<Value>) -> bool {
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                msg.contains("Invalid status") || msg.contains("status array must")
+                    || msg.contains("status must be")
+            }
+            Ok(_) => false,
+        }
+    }
+
+    // CULTRA-958: end-to-end test for the concurrency analyzer's Rust path.
+    // The internal analyze_concurrency_rust has 9 unit tests covering each
+    // primitive (tokio::spawn, std::thread::spawn, Arc<Mutex>, mpsc, select!,
+    // async/await, dedup), but those bypass the analyze_file dispatcher.
+    // This test goes through the public entrypoint so the .rs → Rust
+    // analyzer routing in run_analyzer is also under test.
+
+    #[test]
+    fn test_analyze_file_concurrency_rust_detects_tokio_primitives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.rs");
+        let body = r#"use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
+use tokio::select;
+
+pub struct Daemon {
+    state: Arc<Mutex<u32>>,
+}
+
+pub async fn run() {
+    let (tx, mut rx) = mpsc::channel::<u32>(16);
+    tokio::spawn(async move {
+        tx.send(1).await.unwrap();
+    });
+    select! {
+        _ = rx.recv() => {},
+        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+    }
+}
+"#;
+        std::fs::write(&path, body).unwrap();
+
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("analyzer".to_string(), json!("concurrency"));
+        let result = analyze_file_tool(args, dir.path()).unwrap();
+
+        assert_eq!(result["language"], "rust");
+
+        let spawns = result["spawns"].as_array().expect("spawns should be array");
+        assert!(!spawns.is_empty(),
+            "tokio::spawn must be detected by the Rust analyzer dispatcher path, got: {:?}", spawns);
+
+        let sync = result["synchronization"].as_array().expect("synchronization should be array");
+        assert!(sync.iter().any(|s| s["kind"].as_str().unwrap_or("").contains("Mutex")),
+            "Mutex must be detected, got: {:?}", sync);
+
+        let channels = result["channels"].as_array().expect("channels should be array");
+        assert!(!channels.is_empty(),
+            "mpsc::channel must be detected, got: {:?}", channels);
+
+        let selects = result["selects"].as_array().expect("selects should be array");
+        assert!(!selects.is_empty(),
+            "tokio::select! must be detected, got: {:?}", selects);
+
+        let async_fns = result["async_functions"].as_array().expect("async_functions should be array");
+        assert!(!async_fns.is_empty(),
+            "async fn must be detected, got: {:?}", async_fns);
+
+        let await_count = result["await_points"].as_u64().unwrap_or(0);
+        assert!(await_count > 0,
+            "await points must be detected, got: {}", await_count);
+    }
+
+    #[test]
+    fn test_analyze_file_concurrency_rust_empty_for_sync_only_file() {
+        // CULTRA-958: a Rust file with no concurrency primitives must
+        // legitimately return all-empty fields. This is the case Tin-chan
+        // saw on channel.rs and mistook for "the analyzer is Rust-blind."
+        // Pinned here so future regressions stay diagnosable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.rs");
+        std::fs::write(&path, "pub fn add(a: i32, b: i32) -> i32 { a + b }\n").unwrap();
+
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("analyzer".to_string(), json!("concurrency"));
+        let result = analyze_file_tool(args, dir.path()).unwrap();
+
+        assert_eq!(result["language"], "rust");
+        assert_eq!(result["spawns"], json!([]));
+        assert_eq!(result["synchronization"], json!([]));
+        assert_eq!(result["channels"], json!([]));
+        assert_eq!(result["selects"], json!([]));
+        assert_eq!(result["async_functions"], json!([]));
+        assert_eq!(result["await_points"], 0);
+    }
+
+    // CULTRA-959: resolve_project_id tests. The helper had been dead-code
+    // since shipping; CULTRA-959 wires it into parse_file_ast and these
+    // tests pin its behavior so it can't regress.
+
+    #[test]
+    fn test_resolve_project_id_passes_through_explicit_value() {
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("project_id".to_string(), json!("vestige"));
+        resolve_project_id(&server, &mut args).unwrap();
+        assert_eq!(args.get("project_id").unwrap(), "vestige");
+    }
+
+    #[test]
+    fn test_resolve_project_id_falls_back_to_server_default() {
+        // CULTRA-959: when project_id is missing from args, the helper
+        // injects the harness-provided default. Previously parse_file_ast
+        // hardcoded "proj-cultra" instead of consulting this default.
+        use crate::api_client::APIClient;
+        use crate::lsp::LSPManager;
+        let api = APIClient::new("http://localhost:0".to_string(), "test-key".to_string()).unwrap();
+        let lsp = LSPManager::new("/tmp");
+        let server = Server::new(api, lsp).with_default_project(Some("vestige".to_string()));
+
+        let mut args = Map::new();
+        resolve_project_id(&server, &mut args).unwrap();
+        assert_eq!(args.get("project_id").unwrap(), "vestige",
+            "should inject the server's default_project_id");
+    }
+
+    #[test]
+    fn test_resolve_project_id_errors_when_missing_and_no_default() {
+        // No project_id in args AND no harness default → clear error,
+        // not silent fallback to a wrong project.
+        let server = test_server();
+        let mut args = Map::new();
+        let err = resolve_project_id(&server, &mut args).unwrap_err();
+        assert!(err.to_string().contains("project_id"),
+            "error should name the missing parameter, got: {}", err);
+        assert!(err.to_string().contains("CLAUDE.md") || err.to_string().contains("default"),
+            "error should explain where the default would come from, got: {}", err);
+    }
+
+    #[test]
+    fn test_resolve_project_id_treats_empty_string_as_missing() {
+        // Empty string falls through to the default (or errors).
+        use crate::api_client::APIClient;
+        use crate::lsp::LSPManager;
+        let api = APIClient::new("http://localhost:0".to_string(), "test-key".to_string()).unwrap();
+        let lsp = LSPManager::new("/tmp");
+        let server = Server::new(api, lsp).with_default_project(Some("vestige".to_string()));
+
+        let mut args = Map::new();
+        args.insert("project_id".to_string(), json!(""));
+        resolve_project_id(&server, &mut args).unwrap();
+        assert_eq!(args.get("project_id").unwrap(), "vestige",
+            "empty project_id should fall through to the harness default");
+    }
+
+    #[test]
+    fn test_get_tasks_accepts_legacy_single_status_string() {
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("project_id".to_string(), json!("proj-x"));
+        args.insert("status".to_string(), json!("done"));
+        let result = get_tasks(&server, args);
+        assert!(!err_is_status_validation(&result),
+            "single-string status should pass validation, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_get_tasks_accepts_multi_status_array() {
+        // CULTRA-939: status as array of valid statuses → validation passes,
+        // backend call fails (no live server), but the failure is NOT a
+        // validation error.
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("project_id".to_string(), json!("proj-x"));
+        args.insert("status".to_string(), json!(["done", "cancelled"]));
+        let result = get_tasks(&server, args);
+        assert!(!err_is_status_validation(&result),
+            "valid status array should pass validation, got: {:?}", result);
+    }
+
+    #[test]
+    fn test_get_tasks_rejects_invalid_status_in_array() {
+        // CULTRA-939: array containing a value not in TaskStatus → validation
+        // fires before the HTTP call.
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("project_id".to_string(), json!("proj-x"));
+        args.insert("status".to_string(), json!(["done", "totally_made_up_xyzzy"]));
+        let err = get_tasks(&server, args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("totally_made_up_xyzzy") || msg.contains("Invalid status"),
+            "expected validation error naming the bad value, got: {}", msg);
+    }
+
+    #[test]
+    fn test_get_tasks_rejects_non_string_array_element() {
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("project_id".to_string(), json!("proj-x"));
+        args.insert("status".to_string(), json!(["done", 42]));
+        let err = get_tasks(&server, args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("status array must contain only strings")
+                || msg.contains("must be a string"),
+            "expected element type error, got: {}", msg);
+    }
+
+    #[test]
+    fn test_get_tasks_rejects_non_string_non_array_status() {
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("project_id".to_string(), json!("proj-x"));
+        args.insert("status".to_string(), json!(42));
+        let err = get_tasks(&server, args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("status must be a string or array"),
+            "expected type error for scalar status, got: {}", msg);
+    }
+
+    #[test]
+    fn test_recent_activity_unwraps_new_tasks_response_shape() {
+        // CULTRA-938: document the shape coercion contract. The production
+        // code uses this exact match expression to handle both the new
+        // wrapped response {tasks, total, limit, offset} and the legacy bare
+        // array. Pin both shapes here so a future refactor can't silently
+        // break either branch.
+        let new_shape = json!({"tasks": [{"task_id": "X-1"}, {"task_id": "X-2"}], "total": 2});
+        let legacy_shape = json!([{"task_id": "X-1"}]);
+        let empty_object = json!({});
+
+        let unwrap = |v: Value| -> Value {
+            match v.get("tasks").cloned() {
+                Some(arr) => arr,
+                None => v,
+            }
+        };
+
+        let from_new = unwrap(new_shape);
+        assert!(from_new.is_array(), "new wrapped shape must unwrap to array");
+        assert_eq!(from_new.as_array().unwrap().len(), 2);
+
+        let from_legacy = unwrap(legacy_shape);
+        assert!(from_legacy.is_array(), "legacy bare array must pass through");
+        assert_eq!(from_legacy.as_array().unwrap().len(), 1);
+
+        let from_empty = unwrap(empty_object);
+        // Empty object has no "tasks" key → falls through to original. The
+        // downstream filter_recent will then call .as_array() → None →
+        // empty vec, which is correct (no items match a missing list).
+        assert!(from_empty.is_object());
+    }
+
+    #[test]
+    fn test_find_dead_code_warmup_off_by_default_no_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nowarmup.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ExportedFn() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        let result = find_dead_code_tool(args, &server).unwrap();
+        assert!(result.get("warmup_report").is_none(),
+            "warmup_report should be absent when warmup is not requested");
+    }
+
+    #[test]
+    fn test_find_dead_code_warmup_on_surfaces_report() {
+        // CULTRA-952: warmup now requires a manifest in the file's ancestor
+        // chain. Create a go.mod alongside the .go file so resolve_warmup_target
+        // succeeds and we exercise the run-warmup path (success or failure)
+        // rather than the skipped-no-manifest path.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module testmod\n").unwrap();
+        let path = dir.path().join("warmup.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ExportedFn() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("warmup".to_string(), json!(true));
+        let result = find_dead_code_tool(args, &server).unwrap();
+        let report = result.get("warmup_report")
+            .and_then(|v| v.as_object())
+            .expect("warmup_report should be present when warmup=true");
+
+        assert_eq!(report["language"], "go");
+        let status = report["status"].as_str().unwrap();
+        assert!(
+            matches!(status, "warm" | "failed" | "cached"),
+            "status should be warm/failed/cached for go (got {})", status
+        );
+        assert!(report.contains_key("elapsed_ms"));
+        assert!(report.contains_key("cached"));
+        assert!(report.contains_key("manifest_dir"),
+            "CULTRA-952: report must surface the resolved manifest_dir");
+    }
+
+    // CULTRA-952 (post-verification): the cargo-warm-but-LSP-cold race.
+    // When warmup succeeds but the LSP query still returns cold, the
+    // warning text must explicitly call out the race so the agent retries
+    // instead of trusting the (correctly empty) result.
+
+    #[test]
+    fn test_build_cold_warning_calls_out_race_when_warmup_succeeded() {
+        use crate::lsp::manager::WarmupReport;
+        let report = WarmupReport {
+            language: "rust".to_string(),
+            status: "warm".to_string(),
+            cached: false,
+            elapsed_ms: 27000,
+            command: Some("cargo check ...".to_string()),
+            message: None,
+            cached_status: None,
+            manifest_dir: Some("/x".to_string()),
+        };
+        let warning = build_cold_warning_for_find_dead_code(5, Some(&report));
+        assert!(warning.contains("despite warmup completing successfully"),
+            "should mention the race: {}", warning);
+        assert!(warning.contains("cargo-warm-but-LSP-cold")
+                || warning.contains("Retry") || warning.contains("retry"),
+            "should suggest retry: {}", warning);
+        assert!(warning.contains("20-60s") || warning.contains("30s"),
+            "should give the latency window: {}", warning);
+    }
+
+    #[test]
+    fn test_build_cold_warning_calls_out_race_when_cached_warmup_was_warm() {
+        // Cached warm result also counts — the original outcome was still
+        // a successful cargo check, just replayed from cache.
+        use crate::lsp::manager::WarmupReport;
+        let report = WarmupReport {
+            language: "rust".to_string(),
+            status: "cached".to_string(),
+            cached: true,
+            elapsed_ms: 1234,
+            command: Some("cargo check ...".to_string()),
+            message: None,
+            cached_status: Some("warm".to_string()),
+            manifest_dir: Some("/x".to_string()),
+        };
+        let warning = build_cold_warning_for_find_dead_code(5, Some(&report));
+        assert!(warning.contains("despite warmup"),
+            "cached-warm should also trigger the race callout: {}", warning);
+    }
+
+    #[test]
+    fn test_build_cold_warning_no_race_callout_when_warmup_failed() {
+        // Failed warmup → standard cold-index warning, NOT the race message.
+        // The agent shouldn't be told to "retry in 30s" when the actual
+        // problem is that cargo check itself failed.
+        use crate::lsp::manager::WarmupReport;
+        let report = WarmupReport {
+            language: "rust".to_string(),
+            status: "failed".to_string(),
+            cached: false,
+            elapsed_ms: 100,
+            command: Some("cargo check ...".to_string()),
+            message: Some("cargo check failed".to_string()),
+            cached_status: None,
+            manifest_dir: Some("/x".to_string()),
+        };
+        let warning = build_cold_warning_for_find_dead_code(5, Some(&report));
+        assert!(!warning.contains("despite warmup completing successfully"),
+            "failed warmup must NOT trigger the race callout: {}", warning);
+    }
+
+    #[test]
+    fn test_build_cold_warning_no_race_callout_when_warmup_not_requested() {
+        // No warmup at all → standard cold-index warning that suggests
+        // passing warmup=true.
+        let warning = build_cold_warning_for_find_dead_code(5, None);
+        assert!(!warning.contains("despite warmup"),
+            "no-warmup case must not mention the race: {}", warning);
+        assert!(warning.contains("warmup=true") || warning.contains("require_warm_index"),
+            "no-warmup case should suggest the warmup or strict-mode opt-in: {}", warning);
+    }
+
+    #[test]
+    fn test_build_cold_warning_for_find_references_calls_out_race() {
+        use crate::lsp::manager::WarmupReport;
+        let report = WarmupReport {
+            language: "rust".to_string(),
+            status: "warm".to_string(),
+            cached: false,
+            elapsed_ms: 27000,
+            command: Some("cargo check ...".to_string()),
+            message: None,
+            cached_status: None,
+            manifest_dir: Some("/x".to_string()),
+        };
+        let warning = build_cold_warning_for_find_references("compose_from_diff_screens", 1, Some(&report));
+        assert!(warning.contains("compose_from_diff_screens"),
+            "should name the symbol: {}", warning);
+        assert!(warning.contains("despite warmup completing successfully"),
+            "should call out the race: {}", warning);
+    }
+
+    #[test]
+    fn test_find_dead_code_warmup_on_no_manifest_skipped() {
+        // CULTRA-952: a .go file with no go.mod in its ancestor chain
+        // returns status='skipped' with a message naming the missing manifest.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func ExportedFn() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("warmup".to_string(), json!(true));
+        let result = find_dead_code_tool(args, &server).unwrap();
+        let report = result.get("warmup_report")
+            .and_then(|v| v.as_object())
+            .expect("warmup_report should be present");
+        assert_eq!(report["status"], "skipped");
+        let msg = report["message"].as_str().unwrap();
+        assert!(msg.contains("go.mod"),
+            "skipped message should name the missing manifest, got: {}", msg);
+    }
+
+    #[test]
+    fn test_find_dead_code_warmup_on_unsupported_language_skipped() {
+        // Python has no warmup command → status='skipped', not an error.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("script.py");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "def exported_fn():").unwrap();
+        writeln!(f, "    pass").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("warmup".to_string(), json!(true));
+        let result = find_dead_code_tool(args, &server)
+            .expect("warmup on python should not error — should skip gracefully");
+        let report = result.get("warmup_report")
+            .and_then(|v| v.as_object())
+            .expect("warmup_report should be present");
+        assert_eq!(report["status"], "skipped");
+        assert!(report["message"].is_string(),
+            "skipped report should explain why");
+    }
+
+    #[test]
+    fn test_find_references_warmup_on_surfaces_report() {
+        // CULTRA-952: same manifest requirement as find_dead_code.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("go.mod"), "module testmod\n").unwrap();
+        let path = dir.path().join("refs_warm.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func Target() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("symbol".to_string(), json!("Target"));
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("warmup".to_string(), json!(true));
+        let result = find_references_tool(args, &server).unwrap();
+        let report = result.get("warmup_report")
+            .and_then(|v| v.as_object())
+            .expect("warmup_report should be present when warmup=true");
+        assert_eq!(report["language"], "go");
+        assert!(report.contains_key("status"));
+        assert!(report.contains_key("elapsed_ms"));
+        assert!(report.contains_key("manifest_dir"),
+            "CULTRA-952: report must surface the resolved manifest_dir");
+    }
+
+    #[test]
+    fn test_find_references_warmup_off_by_default_no_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs_nowarm.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func Target() {{}}").unwrap();
+        drop(f);
+
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("symbol".to_string(), json!("Target"));
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        let result = find_references_tool(args, &server).unwrap();
+        assert!(result.get("warmup_report").is_none());
+    }
+
+    // CULTRA-949: analyze_symbol tests. Exercises the full analyze_complexity
+    // pipeline against a synthesized Go file, so these do real tree-sitter
+    // parses — same pattern the existing complexity integration tests use.
+    // Reuses the write_go_file helper defined earlier in this test module.
+
+    #[test]
+    fn test_analyze_symbol_requires_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut args = Map::new();
+        args.insert("symbol".to_string(), json!("Foo"));
+        let err = analyze_symbol_tool(args, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("file_path"),
+            "expected file_path error, got: {}", err);
+    }
+
+    #[test]
+    fn test_analyze_symbol_requires_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "a.go",
+            "package main\nfunc Foo() {}\n");
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        let err = analyze_symbol_tool(args, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("symbol"),
+            "expected symbol error, got: {}", err);
+    }
+
+    #[test]
+    fn test_analyze_symbol_rejects_unsupported_analyzer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "a.go",
+            "package main\nfunc Foo() {}\n");
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("symbol".to_string(), json!("Foo"));
+        args.insert("analyzer".to_string(), json!("security"));
+        let err = analyze_symbol_tool(args, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("complexity"),
+            "expected analyzer rejection, got: {}", err);
+    }
+
+    #[test]
+    fn test_analyze_symbol_not_found_lists_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "avail.go",
+            "package main\nfunc Alpha() {}\nfunc Beta() {}\n");
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("symbol".to_string(), json!("Gamma"));
+        let err = analyze_symbol_tool(args, dir.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Gamma"), "should name the missing symbol: {}", msg);
+        assert!(msg.contains("Alpha") || msg.contains("Beta"),
+            "should list available functions: {}", msg);
+    }
+
+    #[test]
+    fn test_analyze_symbol_returns_scalar_metrics_without_baseline() {
+        // Simple function → cyclomatic/cognitive are scalars, delta_mode=false.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "scalar.go",
+            "package main\nfunc Simple() int { return 1 }\n");
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("symbol".to_string(), json!("Simple"));
+        let result = analyze_symbol_tool(args, dir.path()).unwrap();
+
+        assert_eq!(result["name"], "Simple");
+        assert_eq!(result["delta_mode"], false);
+        assert!(result["cyclomatic"].is_number(),
+            "cyclomatic should be scalar in non-delta mode, got: {:?}", result["cyclomatic"]);
+        assert!(result["cognitive"].is_number());
+        assert!(result["lines"].is_number());
+        assert!(result["rating"].is_string());
+        assert!(result.get("location").is_some());
+        assert_eq!(result["analyzer"], "complexity");
+    }
+
+    #[test]
+    fn test_analyze_symbol_delta_mode_renders_prev_now_delta() {
+        // Inline baseline → each baseline-covered metric renders as
+        // {prev, now, delta}.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "delta.go",
+            "package main\nfunc Target() int { return 1 }\n");
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("symbol".to_string(), json!("Target"));
+        args.insert("delta_against".to_string(), json!({
+            "cyclomatic": 17,
+            "cognitive": 26,
+            "lines": 128,
+            "rating": "complex"
+        }));
+        let result = analyze_symbol_tool(args, dir.path()).unwrap();
+
+        assert_eq!(result["delta_mode"], true);
+
+        let cyc = result["cyclomatic"].as_object().expect("cyclomatic should be object in delta mode");
+        assert_eq!(cyc["prev"], 17);
+        assert!(cyc.contains_key("now"));
+        assert!(cyc.contains_key("delta"));
+        let delta = cyc["delta"].as_i64().unwrap();
+        let now = cyc["now"].as_i64().unwrap();
+        assert_eq!(delta, now - 17);
+
+        let rating = result["rating"].as_object().expect("rating should be object when baseline had rating");
+        assert_eq!(rating["prev"], "complex");
+        assert!(rating.contains_key("now"));
+    }
+
+    #[test]
+    fn test_analyze_symbol_delta_mode_partial_baseline() {
+        // Baseline with only cyclomatic → cyclomatic renders as delta,
+        // other metrics stay scalar.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "partial.go",
+            "package main\nfunc Partial() int { return 1 }\n");
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("symbol".to_string(), json!("Partial"));
+        args.insert("delta_against".to_string(), json!({"cyclomatic": 10}));
+        let result = analyze_symbol_tool(args, dir.path()).unwrap();
+
+        assert_eq!(result["delta_mode"], true);
+        assert!(result["cyclomatic"].is_object(),
+            "cyclomatic should be delta-shaped when in baseline");
+        assert!(result["cognitive"].is_number(),
+            "cognitive should stay scalar when not in baseline");
+        assert!(result["lines"].is_number());
+        assert!(result["rating"].is_string());
+    }
+
+    #[test]
+    fn test_analyze_symbol_branching_increases_cyclomatic() {
+        // Sanity: a function with multiple branches has cyclomatic > 1.
+        // Pinning a specific number would couple us to the analyzer's
+        // counting, which is a test-the-implementation anti-pattern.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "branchy.go",
+            "package main\n\
+             func Branchy(x int) int {\n\
+             \tif x > 0 {\n\
+             \t\tif x > 10 { return 2 }\n\
+             \t\treturn 1\n\
+             \t}\n\
+             \tfor i := 0; i < 3; i++ { x++ }\n\
+             \treturn x\n\
+             }\n");
+        let mut args = Map::new();
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("symbol".to_string(), json!("Branchy"));
+        let result = analyze_symbol_tool(args, dir.path()).unwrap();
+        let cyc = result["cyclomatic"].as_u64().unwrap();
+        assert!(cyc > 1, "branchy function should have cyclomatic > 1, got {}", cyc);
+    }
+
+    #[test]
+    fn test_enrich_symbols_skips_unexported_symbols() {
+        // Even if LSP were available, the helper must skip private symbols
+        // entirely as a perf optimization. With no LSP, both branches yield
+        // a symbol without callers — but importantly, no panic / no error.
+        use crate::ast::parser::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("only_private.go");
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "func privateOne() {{}}").unwrap();
+        writeln!(f, "func privateTwo() {{}}").unwrap();
+        drop(f);
+
+        let parser = Parser::new();
+        let file_context = parser.parse_file(path.to_str().unwrap()).unwrap();
+        let server = test_server();
+
+        let result = enrich_symbols_with_callers(&file_context, &server);
+        let arr = result.as_array().expect("expected array");
+        for entry in arr {
+            let obj = entry.as_object().unwrap();
+            assert!(!obj.contains_key("callers"));
+        }
     }
 }

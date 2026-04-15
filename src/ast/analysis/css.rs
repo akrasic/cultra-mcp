@@ -295,6 +295,8 @@ fn parse_line(state: &mut ParserState, line: &str, line_num: usize) {
             return;
         }
 
+        // unwrap: chars.peek() at the top of the loop already returned Some,
+        // so the iterator has at least one more element.
         let (_, ch) = chars.next().unwrap();
 
         match ch {
@@ -842,7 +844,10 @@ fn dfs_cycle(
     for dep_name in &nodes[u].depends_on {
         if let Some(&v) = name_to_idx.get(dep_name) {
             if color[v] == 1 {
-                // Found cycle — extract from path
+                // Found cycle — extract from path.
+                // unwrap: color[v]==1 means v is currently on the DFS stack,
+                // so v is guaranteed to be present in `path` by the traversal
+                // invariant.
                 let cycle_start = path.iter().position(|&x| x == v).unwrap();
                 let cycle: Vec<String> = path[cycle_start..]
                     .iter()

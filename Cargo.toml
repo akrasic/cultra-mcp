@@ -25,6 +25,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Home directory expansion
 dirs = "6.0"
 
+# Date/time parsing (RFC 3339)
+time = { version = "0.3", features = ["parsing", "formatting"] }
+
 # Tree-sitter for AST parsing
 tree-sitter = "0.26"
 tree-sitter-go = "0.25"
@@ -32,10 +35,11 @@ tree-sitter-typescript = "0.23"
 tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-javascript = "0.25"
+tree-sitter-hcl = "1.1"
 streaming-iterator = "0.1"
 
 [dev-dependencies]
-which = "7.0"
+which = "8.0"
 tempfile = "3.13"
 
 [profile.release]

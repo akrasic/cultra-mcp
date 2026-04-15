@@ -368,7 +368,7 @@ fn extract_select_statements(
                 for i in 0..select_stmt.child_count() {
                     if let Some(child) = select_stmt.child(i as u32) {
                         match child.kind() {
-                            "communication_clause" => {
+                            "communication_case" => {
                                 if let Ok(case_content) = child.utf8_text(content) {
                                     cases.push(case_content.to_string());
                                 }

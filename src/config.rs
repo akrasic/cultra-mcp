@@ -63,3 +63,25 @@ impl Config {
         Ok(config)
     }
 }
+
+/// Detect default project_id from CLAUDE.md in the current working directory.
+/// Looks for the pattern `**Project:** <project_id>` in the first 20 lines.
+pub fn detect_project_id(workspace_root: &std::path::Path) -> Option<String> {
+    let claude_md = workspace_root.join("CLAUDE.md");
+    let content = fs::read_to_string(&claude_md).ok()?;
+
+    for line in content.lines().take(20) {
+        // Match: **Project:** project-id
+        if let Some(rest) = line.strip_prefix("**Project:**") {
+            let project_id = rest
+                .split('|')  // Handle "**Project:** xxx | **Updated:** ..."
+                .next()?
+                .trim()
+                .to_string();
+            if !project_id.is_empty() && !project_id.starts_with("{{") {
+                return Some(project_id);
+            }
+        }
+    }
+    None
+}

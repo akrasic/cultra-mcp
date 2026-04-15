@@ -114,7 +114,22 @@ impl LSPClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())  // Suppress LSP server logs for now
             .spawn()
-            .map_err(|e| LSPError::ServerStartFailed(format!("{} {:?}: {}", resolved_binary, final_args, e)))?;
+            .map_err(|e| {
+                let mut msg = format!("{} {:?}: {}", resolved_binary, final_args, e);
+                // CULTRA-975: add install hints when the binary isn't found.
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    let hint = match language {
+                        "python" => "Install with: pip install pyright (or: npm install -g pyright)",
+                        "svelte" => "Install with: npm install -g svelte-language-server",
+                        "typescript" | "javascript" => "Install with: npm install -g typescript-language-server typescript",
+                        "rust" => "Install with: rustup component add rust-analyzer",
+                        "go" => "Install with: go install golang.org/x/tools/gopls@latest",
+                        _ => "Ensure the language server binary is in your PATH",
+                    };
+                    msg.push_str(&format!(". {}", hint));
+                }
+                LSPError::ServerStartFailed(msg)
+            })?;
 
         let stdin = process
             .stdin
@@ -161,6 +176,9 @@ impl LSPClient {
                 vec!["--stdio".to_string()],
             )),
             "python" => Ok(("pyright-langserver".to_string(), vec!["--stdio".to_string()])),
+            // CULTRA-972: svelte-language-server exposes a `svelteserver` binary
+            // that speaks LSP over stdio, same pattern as typescript-language-server.
+            "svelte" => Ok(("svelteserver".to_string(), vec!["--stdio".to_string()])),
             _ => Err(LSPError::ServerNotFound {
                 language: language.to_string(),
                 binary: "unknown".to_string(),
@@ -602,6 +620,7 @@ pub fn detect_language(file_path: &str) -> Result<String> {
         "ts" | "tsx" => Ok("typescript".to_string()),
         "js" | "jsx" => Ok("typescript".to_string()),
         "py" => Ok("python".to_string()),
+        "svelte" => Ok("svelte".to_string()),
         _ => Err(LSPError::InvalidResponse(format!(
             "Unsupported file extension: {}",
             extension

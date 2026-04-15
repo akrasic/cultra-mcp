@@ -8,11 +8,19 @@ use serde_json::{json, Value};
 pub struct Server {
     pub api: APIClient,
     pub lsp: lsp::LSPManager,
+    pub default_project_id: Option<String>,
+    pub workspace_root: std::path::PathBuf,
 }
 
 impl Server {
     pub fn new(api: APIClient, lsp: lsp::LSPManager) -> Self {
-        Self { api, lsp }
+        let workspace_root = lsp.workspace_root().to_path_buf();
+        Self { api, lsp, default_project_id: None, workspace_root }
+    }
+
+    pub fn with_default_project(mut self, project_id: Option<String>) -> Self {
+        self.default_project_id = project_id;
+        self
     }
 
     /// Handle incoming MCP request

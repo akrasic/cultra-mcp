@@ -398,7 +398,9 @@ pub enum Language {
     Javascript,
     Python,
     Rust,
+    Terraform,
     Php,
+    Svelte,
     #[serde(other)]
     Other,
 }
@@ -411,7 +413,9 @@ impl fmt::Display for Language {
             Language::Javascript => write!(f, "javascript"),
             Language::Python => write!(f, "python"),
             Language::Rust => write!(f, "rust"),
+            Language::Terraform => write!(f, "terraform"),
             Language::Php => write!(f, "php"),
+            Language::Svelte => write!(f, "svelte"),
             Language::Other => write!(f, "other"),
         }
     }
@@ -425,7 +429,9 @@ impl Language {
             "js" | "jsx" => Language::Javascript,
             "py" => Language::Python,
             "rs" => Language::Rust,
+            "tf" | "tfvars" => Language::Terraform,
             "php" => Language::Php,
+            "svelte" => Language::Svelte,
             _ => Language::Other,
         }
     }
@@ -437,7 +443,9 @@ impl Language {
             "javascript" | "js" => Language::Javascript,
             "python" | "py" => Language::Python,
             "rust" | "rs" => Language::Rust,
+            "terraform" | "tf" | "hcl" => Language::Terraform,
             "php" => Language::Php,
+            "svelte" => Language::Svelte,
             _ => Language::Other,
         }
     }
@@ -453,7 +461,9 @@ impl std::str::FromStr for Language {
             "javascript" | "js" => Language::Javascript,
             "python" | "py" => Language::Python,
             "rust" | "rs" => Language::Rust,
+            "terraform" | "tf" | "hcl" => Language::Terraform,
             "php" => Language::Php,
+            "svelte" => Language::Svelte,
             _ => Language::Other,
         })
     }

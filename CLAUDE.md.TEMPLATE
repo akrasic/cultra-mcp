@@ -25,6 +25,72 @@ Violating these creates gaps in the audit trail. A task you didn't track is a ch
 
 ---
 
+## Harness Contract
+
+This section declares project capabilities so the harness running Claude (e.g. Claude Code) knows how to behave for this project. The block below is machine-parseable: harness implementations should look for a fenced code block tagged `harness-contract` and consume its YAML body. Older harnesses that don't recognize the tag will render it as a normal code block — the section is backwards-compatible.
+
+```harness-contract
+# Task tracking
+# When this project declares an external task tracker, the harness's built-in
+# TaskCreate primitive should NOT be suggested or nudged toward — using both
+# fragments the audit trail. The harness should suppress reminders that
+# advertise the built-in primitives listed under suppress_builtin_reminders.
+task_tracker:
+  type: mcp
+  namespace: {{MCP_NAMESPACE}}
+  canonical_tools:
+    - mcp__{{MCP_NAMESPACE}}__save_task
+    - mcp__{{MCP_NAMESPACE}}__update_task_status
+    - mcp__{{MCP_NAMESPACE}}__add_progress_log
+    - mcp__{{MCP_NAMESPACE}}__search_tasks
+  suppress_builtin_reminders:
+    - TaskCreate
+    - TaskUpdate
+
+# Tool preload
+# Tools the harness should warm at session start so the agent can call them
+# without a ToolSearch round-trip. Project-author-curated — list the tools
+# you actually reach for on this project. Derived per-project CLAUDE.md
+# files MAY add or remove entries here based on what the project actually uses.
+preload_tools:
+  - mcp__{{MCP_NAMESPACE}}__load_session_state
+  - mcp__{{MCP_NAMESPACE}}__save_session_state
+  - mcp__{{MCP_NAMESPACE}}__save_task
+  - mcp__{{MCP_NAMESPACE}}__update_task_status
+  - mcp__{{MCP_NAMESPACE}}__add_progress_log
+  - mcp__{{MCP_NAMESPACE}}__search_tasks
+  - mcp__{{MCP_NAMESPACE}}__save_plan
+  - mcp__{{MCP_NAMESPACE}}__get_plan
+  - mcp__{{MCP_NAMESPACE}}__save_document
+  - mcp__{{MCP_NAMESPACE}}__update_document
+  - mcp__{{MCP_NAMESPACE}}__link_document
+  - mcp__{{MCP_NAMESPACE}}__batch
+  - mcp__{{MCP_NAMESPACE}}__parse_file_ast
+  - mcp__{{MCP_NAMESPACE}}__analyze_file
+  - mcp__{{MCP_NAMESPACE}}__lsp
+  - mcp__{{MCP_NAMESPACE}}__lsp_workspace_symbols
+  - mcp__{{MCP_NAMESPACE}}__search_code_context
+  - mcp__{{MCP_NAMESPACE}}__recent_activity
+  - mcp__{{MCP_NAMESPACE}}__unified_search
+```
+
+**Why this matters:** without this contract, the harness has to guess. It defaults to nudging the agent toward its built-in `TaskCreate` primitive even when the project has a richer external tracker, and it lazy-loads MCP tool schemas one ToolSearch round-trip at a time. Both behaviors are reasonable defaults for a fresh project but adversarial to a project that has already declared its workflow. The contract above lets the project author override those defaults declaratively, in a file the harness already reads on every turn.
+
+**For projects without an MCP task tracker:** delete this entire section. The harness's default behavior (suggest `TaskCreate`, lazy-load tools via `ToolSearch`) is correct in that case.
+
+---
+
+## Communication Rules
+
+- If you're unsure, say "I'm not sure" — not a confident-sounding guess
+- If the code is wrong, say it's wrong — don't say "this looks mostly good but..."
+- If a request doesn't make sense, ask — don't assume and build the wrong thing
+- If you made a mistake, own it and fix it — don't explain it away
+- Don't perform helpfulness. Be helpful. There's a difference.
+- Truth over comfort. Always.
+
+---
+
 ## Session Start
 
 [OPTIONAL: With MCP tools]
@@ -336,7 +402,11 @@ Write tests first. Not after, not "when there's time," not "if it makes sense." 
 
 ---
 
-**Template Version:** 2.4 (Mar 1, 2026)
+**Template Version:** 2.6 (Apr 11, 2026)
 **Source:** Based on Cultra Engine V3 (claude-session-manager)
+
+### Changelog
+- **2.6 (Apr 11, 2026)** — Added `## Harness Contract` section. Declares task-tracker canonical tools (with built-in reminder suppression list) and a preload-tools list, both inside a fenced `harness-contract` YAML block. Skipped 2.5 in the in-repo file: 2.5 was previously served only by the MCP `get_template` endpoint and never landed in the repo. The 2.5 additions (Skills, KB & Search, security/complexity analyzers, document `content_file`) need to be folded into this file before the next MCP endpoint resync.
+- **2.4 (Mar 1, 2026)** — Prior in-repo version.
 
 *Customize for your project. Remove optional sections you don't need. Replace all {{PLACEHOLDERS}}. See CLAUDE_TEMPLATE_GUIDE.md for detailed instructions.*
