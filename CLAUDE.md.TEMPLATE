@@ -1,13 +1,8 @@
-# {{PROJECT_NAME}} Development Guide
+# {{PROJECT_NAME}} — Cultra-driven CLAUDE.md
 
-**Project:** {{PROJECT_ID}} | **Updated:** {{DATE}}
+**Project:** {{PROJECT_ID}} | **Engine:** V3 | **Updated:** {{DATE}}
 
----
-
-## Customization
-
-**Before using:** Replace all `{{PLACEHOLDERS}}`, remove `[OPTIONAL]` sections you don't need.
-See `CLAUDE_TEMPLATE_GUIDE.md` for detailed setup instructions.
+> Drop this file into your project as `CLAUDE.md` and replace the `{{...}}` placeholders. The Code Intelligence section is the same one served by `get_template({name: "claude_md"})` and stays canonical; the workflow sections are the battle-tested defaults the cultra MCP server expects you to follow.
 
 ---
 
@@ -15,11 +10,11 @@ See `CLAUDE_TEMPLATE_GUIDE.md` for detailed setup instructions.
 
 These are not optional. Do not skip them. Do not rationalize exceptions.
 
-1. **Load context** at the start of every session
-2. **Create a task** before ANY code change — every change gets a task ID for traceability
-3. **Log progress with file paths** — `"Fixed X in handlers.go:234"` not `"Fixed X"`
-4. **Save state** when work is done
-5. [OPTIONAL] **Use MCP code intelligence tools** for code exploration — AST/LSP are 10-100x faster than reading files, and give more context than grep/sed. This is not optional when the tools are available.
+1. **Load session state** at the start of every session
+2. **Create a task or pick up an existing one** before ANY code change — every change gets a task ID for traceability
+3. **Use MCP code intelligence tools** for code exploration — AST/LSP are 10-100x faster than reading files, and give more context than grep/sed. See Code Intelligence section. This is not optional.
+4. **Log progress with file paths** — `"Fixed X in handlers.go:234"` not `"Fixed X"`
+5. **Save session state** when work is done
 
 Violating these creates gaps in the audit trail. A task you didn't track is a change you can't reference later.
 
@@ -27,101 +22,92 @@ Violating these creates gaps in the audit trail. A task you didn't track is a ch
 
 ## Harness Contract
 
-This section declares project capabilities so the harness running Claude (e.g. Claude Code) knows how to behave for this project. The block below is machine-parseable: harness implementations should look for a fenced code block tagged `harness-contract` and consume its YAML body. Older harnesses that don't recognize the tag will render it as a normal code block — the section is backwards-compatible.
+This block declares project capabilities so the harness running Claude Code knows how to behave. The block is machine-parseable: harness implementations look for a fenced block tagged `harness-contract` and consume its YAML body. Older harnesses that don't recognize the tag render it as a normal code block — backwards-compatible.
 
 ```harness-contract
 # Task tracking
-# When this project declares an external task tracker, the harness's built-in
-# TaskCreate primitive should NOT be suggested or nudged toward — using both
-# fragments the audit trail. The harness should suppress reminders that
-# advertise the built-in primitives listed under suppress_builtin_reminders.
+# This project uses Cultra MCP as its canonical task tracker. The harness's
+# built-in TaskCreate primitive should NOT be suggested or nudged toward —
+# using both fragments the audit trail. The harness should suppress reminders
+# that advertise the built-in primitives listed under suppress_builtin_reminders.
 task_tracker:
   type: mcp
-  namespace: {{MCP_NAMESPACE}}
+  namespace: cultra
   canonical_tools:
-    - mcp__{{MCP_NAMESPACE}}__save_task
-    - mcp__{{MCP_NAMESPACE}}__update_task_status
-    - mcp__{{MCP_NAMESPACE}}__add_progress_log
-    - mcp__{{MCP_NAMESPACE}}__search_tasks
+    - mcp__cultra__save_task
+    - mcp__cultra__update_task_status
+    - mcp__cultra__add_progress_log
+    - mcp__cultra__search_tasks
   suppress_builtin_reminders:
     - TaskCreate
     - TaskUpdate
 
 # Tool preload
 # Tools the harness should warm at session start so the agent can call them
-# without a ToolSearch round-trip. Project-author-curated — list the tools
-# you actually reach for on this project. Derived per-project CLAUDE.md
-# files MAY add or remove entries here based on what the project actually uses.
+# without a ToolSearch round-trip. This is the working set you'll reach for
+# in nearly every session.
 preload_tools:
-  - mcp__{{MCP_NAMESPACE}}__load_session_state
-  - mcp__{{MCP_NAMESPACE}}__save_session_state
-  - mcp__{{MCP_NAMESPACE}}__save_task
-  - mcp__{{MCP_NAMESPACE}}__update_task_status
-  - mcp__{{MCP_NAMESPACE}}__add_progress_log
-  - mcp__{{MCP_NAMESPACE}}__search_tasks
-  - mcp__{{MCP_NAMESPACE}}__save_plan
-  - mcp__{{MCP_NAMESPACE}}__get_plan
-  - mcp__{{MCP_NAMESPACE}}__save_document
-  - mcp__{{MCP_NAMESPACE}}__update_document
-  - mcp__{{MCP_NAMESPACE}}__link_document
-  - mcp__{{MCP_NAMESPACE}}__batch
-  - mcp__{{MCP_NAMESPACE}}__parse_file_ast
-  - mcp__{{MCP_NAMESPACE}}__analyze_file
-  - mcp__{{MCP_NAMESPACE}}__lsp
-  - mcp__{{MCP_NAMESPACE}}__lsp_workspace_symbols
-  - mcp__{{MCP_NAMESPACE}}__search_code_context
-  - mcp__{{MCP_NAMESPACE}}__recent_activity
-  - mcp__{{MCP_NAMESPACE}}__unified_search
+  - mcp__cultra__load_session_state
+  - mcp__cultra__save_session_state
+  - mcp__cultra__save_task
+  - mcp__cultra__update_task_status
+  - mcp__cultra__update_task
+  - mcp__cultra__add_progress_log
+  - mcp__cultra__search_tasks
+  - mcp__cultra__get_task
+  - mcp__cultra__save_plan
+  - mcp__cultra__get_plan
+  - mcp__cultra__save_document
+  - mcp__cultra__update_document
+  - mcp__cultra__link_document
+  - mcp__cultra__batch
+  - mcp__cultra__parse_file_ast
+  - mcp__cultra__analyze_file
+  - mcp__cultra__lsp
+  - mcp__cultra__lsp_workspace_symbols
+  - mcp__cultra__contextual_search
+  - mcp__cultra__project_info
+  - mcp__cultra__recent_activity
+  - mcp__cultra__unified_search
+  - mcp__cultra__get_execution_waves
 ```
 
-**Why this matters:** without this contract, the harness has to guess. It defaults to nudging the agent toward its built-in `TaskCreate` primitive even when the project has a richer external tracker, and it lazy-loads MCP tool schemas one ToolSearch round-trip at a time. Both behaviors are reasonable defaults for a fresh project but adversarial to a project that has already declared its workflow. The contract above lets the project author override those defaults declaratively, in a file the harness already reads on every turn.
-
-**For projects without an MCP task tracker:** delete this entire section. The harness's default behavior (suggest `TaskCreate`, lazy-load tools via `ToolSearch`) is correct in that case.
-
----
-
-## Communication Rules
-
-- If you're unsure, say "I'm not sure" — not a confident-sounding guess
-- If the code is wrong, say it's wrong — don't say "this looks mostly good but..."
-- If a request doesn't make sense, ask — don't assume and build the wrong thing
-- If you made a mistake, own it and fix it — don't explain it away
-- Don't perform helpfulness. Be helpful. There's a difference.
-- Truth over comfort. Always.
+**Why this matters:** without this contract, the harness has to guess. It defaults to nudging the agent toward its built-in `TaskCreate` primitive even when the project has a richer external tracker, and it lazy-loads MCP tool schemas one ToolSearch round-trip at a time. Both behaviors are reasonable defaults for a fresh project but adversarial to a project that has already declared its workflow.
 
 ---
 
 ## Session Start
 
-[OPTIONAL: With MCP tools]
 ```javascript
-// Use batch to load session + search tasks in one call
-batch({operations: [
-  {tool: "load_session_state", args: {project_id: "{{PROJECT_ID}}", strategy: "relevant", include_plan_context: true}},
-  {tool: "search_tasks", args: {project_id: "{{PROJECT_ID}}", query: "relevant keywords"}}
-]})
+session = load_session_state({
+  project_id: "{{PROJECT_ID}}",
+  strategy: "relevant",
+  include_plan_context: true
+})
 
+// load_session_state returns a `plan_ascii` field when the session has a
+// current_plan_id — a server-rendered ASCII wave diagram of the active plan.
+// Show it to the user; it makes the wave structure legible at a glance.
+
+// Search for existing work before creating new tasks
+existing = search_tasks({project_id: "{{PROJECT_ID}}", query: "relevant keywords"})
+
+// Tell the user what you found
 "Resuming from [date]: [what was happening]
 Current work: [task/plan status]
 Ready to continue."
-```
-
-[ALTERNATIVE: Without MCP tools]
-```
-// Check recent git commits, read SESSION_NOTES.md, ask user for context
-git log --oneline -10
 ```
 
 ---
 
 ## Session End
 
-[OPTIONAL: With MCP tools]
 ```javascript
 save_session_state({
   project_id: "{{PROJECT_ID}}",
-  current_plan_id: "plan-x",
-  current_task_id: "TASK-123",
+  current_plan_id: "plan-x",      // if using a plan
+  current_task_id: "{{PROJECT_ID_UPPER}}-123",
+  kind: "work",                   // work | exploration | qa | throwaway
   working_memory: {
     phase: "Implementation",            // Required
     current_focus: "What you're doing", // Required
@@ -129,23 +115,16 @@ save_session_state({
   },
   context_snapshot: {
     next_session_start: "Clear instruction for next instance",  // Required
-    files_modified: ["file.{{EXT}}:23 (what changed)"],
-    tasks_completed: ["TASK-123"],
+    files_modified: ["file.ext:23 (what changed)"],
+    tasks_completed: ["{{PROJECT_ID_UPPER}}-123"],
     decisions_made: ["Why you chose X over Y"]
   }
 })
 ```
 
-[ALTERNATIVE: Without MCP tools]
-```markdown
-<!-- Update docs/SESSION_NOTES.md -->
-## Session {{DATE}}
-**Current focus:** What you're doing
-**Next action:** Specific next step
-**Files modified:** file.{{EXT}}:23 (what changed)
-```
+`kind` classifies the session so noisy exploration / qa / throwaway runs can be filtered out of `get_sessions` and `recent_activity`. Default: `work`.
 
-Save at discrete work units (think git commits). Not after every tool call.
+Save at discrete work units (think git commits). Not after every tool call. Not before you've accomplished anything.
 
 ---
 
@@ -156,37 +135,62 @@ Before starting, ask: **"Is this 1 task or 3+ related tasks?"**
 ### Single Task
 
 ```javascript
-task = create_task({title: "Fix validation bug in handlers.{{EXT}}", status: "in_progress"})
+task = save_task({title: "Fix validation bug in handlers.go", status: "in_progress"})
 // Do the work
-log_progress({what: "Fixed validation in handlers.{{EXT}}:234"})
-complete_task({task_id, status: "done"})
+add_progress_log({task_id, who: "claude", what: "Fixed validation in handlers.go:234"})
+update_task_status({task_id, status: "done"})
+```
+
+**One-call shortcut:** `save_task`, `update_task`, and `update_task_status` accept an optional inline `progress_log: {who, what}` that writes the log in the same call. Halves round-trips for the common "do work + log it" pattern:
+```javascript
+update_task_status({
+  task_id,
+  status: "done",
+  progress_log: {who: "claude", what: "Fixed validation in handlers.go:234, all tests green"}
+})
+```
+
+**Optimistic concurrency:** task / plan / document writes accept `if_version: N`. Stale writes return a 409-style conflict with the current version embedded for retry. Use this when multiple agents may be writing the same project.
+
+**Typed relationships + external blockers:**
+```javascript
+// supersedes: mark OLD-1 as superseded by NEW-1
+task_dependency({action: "add", task_id: "OLD-1", depends_on: "NEW-1", type: "supersedes"})
+get_task_chain({task_id: "OLD-1", relationship_type: "supersedes"})
+
+// External (non-task) blockers — inline on save_task / update_task (replace-all semantics)
+save_task({
+  project_id: "{{PROJECT_ID}}",
+  title: "Ship feature X",
+  external_blockers: [
+    {reason: "Blocked on legal review", contact: "legal@example.com", eta: "2026-04-20T00:00:00Z"}
+  ]
+})
 ```
 
 ### 3+ Related Tasks — Create a Plan First
 
 **The 3-Task Rule:** When you're about to create the third related task, stop. Create a plan first.
 
-[CUSTOMIZE] Adjust this threshold (2+, 4+) based on your project. 3+ is recommended.
+**Sequence matters:** Plan → Document → Tasks → Link → **Verify the wave structure**.
 
-**Sequence matters:** Plan -> Document -> Tasks -> Link
-
-[OPTIONAL: With MCP tools]
 ```javascript
 // 1. Create plan
 plan = save_plan({
-  plan_id: "plan-{{FEATURE_ID}}",
-  title: "{{FEATURE_SET}}",
-  status: "in_progress",
-  problem: "What problem this solves",
-  goal: "What you're achieving",
-  approach: "Technical strategy"
+  plan_id: "plan-auth-system",
+  title: "User Authentication System",
+  status: "in_progress",                         // or "draft" — see Complex Work below
+  problem: "No user authentication",
+  goal: "JWT-based auth with refresh tokens",
+  approach: "Fiber middleware + PostgreSQL",
+  estimated_duration: "3-4 hours"
 })
 
 // 2. Document IMMEDIATELY
 doc = save_document({
-  document_id: "doc-{{FEATURE_ID}}-plan",
+  document_id: "doc-auth-plan",
   project_id: "{{PROJECT_ID}}",
-  title: "{{FEATURE_SET}} - Implementation Plan",
+  title: "Auth System - Implementation Plan",
   doc_type: "plan_details",
   content: `
 # Goal
@@ -203,16 +207,13 @@ doc = save_document({
 # Success Criteria
 - [ ] Measurable criterion 1
 - [ ] Measurable criterion 2
-
-# Key Decisions
-- Decision X because Y
 `
 })
 
 // 3. Create tasks under the plan
-task1 = save_task({plan_id: plan.plan_id, title: "Task 1", status: "todo"})
-task2 = save_task({plan_id: plan.plan_id, title: "Task 2", status: "todo"})
-task3 = save_task({plan_id: plan.plan_id, title: "Task 3", status: "todo"})
+task1 = save_task({plan_id: plan.plan_id, title: "JWT middleware", status: "todo", estimated_days: 0.5})
+task2 = save_task({plan_id: plan.plan_id, title: "Login endpoint", status: "todo", estimated_days: 0.25, blocked_by: [task1.task_id]})
+task3 = save_task({plan_id: plan.plan_id, title: "Token refresh", status: "todo", estimated_days: 0.5, blocked_by: [task2.task_id]})
 
 // 4. Link document to all tasks
 link_document({
@@ -220,90 +221,327 @@ link_document({
   task_ids: [task1.task_id, task2.task_id, task3.task_id]
 })
 
-// 5. Check progress anytime
-get_plan({plan_id: plan.plan_id})
-```
-
-[ALTERNATIVE: Without MCP tools]
-```javascript
-EnterPlanMode()
-// Write plan to docs/plans/PLAN_{{FEATURE_ID}}.md
-// Create tasks using TaskCreate
-TaskCreate({subject: "Task 1", description: "...", activeForm: "Working on task 1"})
-TaskCreate({subject: "Task 2", description: "...", activeForm: "Working on task 2"})
-TaskCreate({subject: "Task 3", description: "...", activeForm: "Working on task 3"})
+// 5. VERIFY the wave structure — the killer view at this step
+get_plan({plan_id: plan.plan_id, detail: "ascii"})
+// Returns a server-rendered wave diagram + critical_path + estimated_remaining_days.
+// Read it like a smoke test: do the dependency edges produce the wave structure
+// you expected? Is the critical path the longest arm? Is anything you thought
+// would parallelize actually serial? Fix edges before writing code.
 ```
 
 ### Complex Work (Unclear Scope)
 
-Create a parent task FIRST, then plan, then create subtasks:
+**Old guidance: "Create a parent task FIRST, then plan, then create subtasks."**
+**New guidance: don't.** A parent "umbrella" task duplicates the plan's role and creates audit-trail noise. The plan IS the umbrella. Use it.
+
+**Canonical move: file a draft plan first, scope inside it, promote when ready.**
 
 ```javascript
-parent = create_task({title: "Add {{FEATURE}} to {{COMPONENT}}", status: "in_progress"})
-// Now plan — the parent task tracks the entire effort including planning
-EnterPlanMode()
-// After planning, create subtasks
+// 1. File the plan in draft state — the working surface for scoping
+plan = save_plan({
+  plan_id: "plan-feature-x",
+  title: "Feature X",
+  status: "draft",                  // signals "scoping in flight"
+  problem: "Brief framing — refine as you learn",
+  goal: "Best current understanding of the deliverable",
+  approach: "TBD"                   // OK to leave loose; you're scoping
+})
+
+// 2. Capture decisions / open questions in a linked document. The doc is
+//    where the structured thinking lives — risks, alternatives considered,
+//    open questions. The plan stays terse.
+doc = save_document({
+  document_id: "doc-feature-x-design",
+  project_id: "{{PROJECT_ID}}",
+  title: "Feature X — Design",
+  doc_type: "plan_details",
+  content: "# Open Questions\n- ..."
+})
+link_document({document_id: doc.document_id, plan_id: plan.plan_id})
+
+// 3. As decisions firm up, file tasks under the plan with proper blocked_by
+//    edges. You are NOT creating an umbrella task that wraps them — the plan
+//    is the wrapper.
+task1 = save_task({plan_id: plan.plan_id, title: "Concrete sub-step 1", status: "todo"})
+// ...
+
+// 4. Promote when ready
+update_task({plan_id: plan.plan_id})  // applied to plan
+save_plan({plan_id: plan.plan_id, status: "in_progress"})
+
+// 5. Verify wave structure (same as 3-Task Rule above)
+get_plan({plan_id: plan.plan_id, detail: "ascii"})
 ```
+
+**Why no umbrella task?** A parent task that "tracks the whole effort" duplicates what the plan already does: it has a status, an owner, dependencies, progress logs, and linked documents. Creating both means you maintain both — and they drift. When the plan ships, the parent task either gets closed redundantly or hangs around as cruft. Skip it.
 
 ---
 
-## [OPTIONAL] Code Intelligence
+## Verifying Wave Structure
 
-Remove this section if you don't have AST/LSP tools available.
+After creating a plan with tasks + dependencies, verify the structure before writing code. Two complementary views:
 
-**AST** (~100ms, single file) — structure, symbols, call graphs within a file:
 ```javascript
-parse_file_ast({file_path: "/path/to/file.{{EXT}}"})
-search_code_context({project_id: "{{PROJECT_ID}}", symbol_name: "HandleAuth"})
-read_symbol_lines({location: "file.{{EXT}}:57-130"})
+// Killer view: server-rendered ASCII wave diagram
+get_plan({plan_id: "plan-x", detail: "ascii"})
+// Returns: ascii string + waves[] + next_available + next_wave_blockers
+//          + components + critical_path + estimated_remaining_days
+//          + estimate_coverage
+//
+// Output looks like:
+//   Wave 0: ★T0(○ {{PROJECT_ID_UPPER}}-1)
+//   Wave 1: T1(○ {{PROJECT_ID_UPPER}}-2) T2(○ {{PROJECT_ID_UPPER}}-3)
+//   Wave 2: ★T3(○ {{PROJECT_ID_UPPER}}-4)
+//
+//   Next available: {{PROJECT_ID_UPPER}}-1
+//   Legend: ○ todo
+//   ★ = on critical path
+//
+// Read it like a smoke test:
+//   - Do the wave indices match your mental model of the dependency depth?
+//   - Is the critical path (★) the path you'd predict?
+//   - Are tasks you expected to parallelize actually in the same wave?
+//   - Are tasks you expected to serialize actually in different waves?
+// If anything's off, fix the edges with task_dependency() before writing code.
+
+// Structured view: same data without rendering
+get_execution_waves({plan_id: "plan-x"})
+// Use when you want to consume the wave structure programmatically (for
+// example: pick the highest-priority task in wave 0 to start).
+
+// Render knobs (passed to either tool)
+get_plan({plan_id: "plan-x", detail: "ascii", with_titles: true})  // titles inline
+get_plan({plan_id: "plan-x", detail: "ascii", style: "ascii"})     // [X] [/] [ ] glyphs (terminal/log safe)
+get_plan({plan_id: "plan-x", detail: "ascii", width: 120})         // wider rendering
 ```
 
-**LSP** (~300ms, cross-file) — find all usages, jump to definitions, get type info:
-```javascript
-lsp_workspace_symbols({query: "HandleAuth", language: "{{MAIN_LANGUAGE}}"})
-lsp({action: "definition", file_path: "file.{{EXT}}", line: 45, character: 10})
-lsp({action: "references", file_path: "file.{{EXT}}", line: 45, character: 10})
-lsp({action: "hover", file_path: "file.{{EXT}}", line: 45, character: 10})
-```
-
-**When to use which:** One file? AST. Multiple files? LSP. Understanding a feature? Both.
-
-**CSS analysis** (~5ms) — structure, specificity, unused selectors:
-```javascript
-analyze_file({analyzer: "css", file_path: "/path/to/styles.css"})  // Full structure: rules, variables, media queries, specificity
-find_css_rules({file_path: "styles.css", pattern: ".sidebar"})  // Find rules matching selector pattern
-find_unused_selectors({css_path: "styles.css", component_dir: "src/components/"})  // Find orphaned CSS
-```
-
-**Tailwind + CSS variable tools** — resolve utility classes, trace variable dependencies:
-```javascript
-resolve_tailwind_classes({classes: ["flex", "p-4", "bg-red-500", "hover:text-white"]})  // What CSS do these generate?
-resolve_tailwind_classes({classes: ["bg-kb-primary"], css_path: "src/index.css"})        // Resolve with custom @theme
-analyze_file({analyzer: "css_variables", file_path: "src/index.css"})  // Trace var() dependency chains, find cycles/undefined refs
-```
-
-**Why CSS tools over Grep/Read?** A 4500-line CSS file: `analyze_file(analyzer: "css")` = 1 call, ~2K tokens. Grep+Read = 8+ calls, ~120K tokens. `find_unused_selectors` checks hundreds of selectors across dozens of files in 1 call vs hundreds of Grep calls. `resolve_tailwind_classes` maps utility classes to CSS declarations in 1 call vs manual lookup. `analyze_file(analyzer: "css_variables")` traces all `var()` dependencies in 1 call vs reading and manually tracing references.
-
-**This is your default.** When investigating the codebase — understanding a feature, tracing a bug, checking what a function does, finding callers — reach for AST/LSP first, not Grep/Read. `parse_file_ast` gives you every symbol, call, and import in one call. `lsp(action: "references")` traces all usages across the entire codebase in one call. `lsp(action: "hover")` gives you the type signature without reading the file. Reading full files and grepping for strings is the slow, noisy fallback when code intelligence tools don't cover your case. Not the other way around.
-
-**Requires language server:** {{MAIN_LANGUAGE}} needs its language server installed (e.g., gopls for Go, tsserver for TypeScript, pyright for Python).
+`load_session_state(include_plan_context=true)` ALSO returns this rendering inline as `plan_ascii` for the session's `current_plan_id` — so a fresh instance gets the wave structure for free at boot. No extra call needed at session start.
 
 ---
 
-## [OPTIONAL] Batch Operations
+## Tags & Phase Labels
 
-Remove this section if you don't have MCP tools available.
+**Convention:** use task tags to mark logical phases of a multi-phase plan.
+
+When a plan splits into independent phases that ship at different times (e.g., a "renderer" track and a "metrics" track that don't depend on each other), tag tasks accordingly so you can filter / view per phase:
+
+```javascript
+// Phase 3a: ASCII renderer
+save_task({plan_id: "plan-viz", title: "Renderer foundation", tags: ["3a"]})
+
+// Phase 3b: Estimates + CPM
+save_task({plan_id: "plan-viz", title: "Migration for estimates", tags: ["3b"]})
+
+// Filter by phase later
+search_tasks({project_id: "{{PROJECT_ID}}", query: "tag:3a"})
+```
+
+Tags compose: `["3a", "frontend"]` is a frontend task in phase 3a. Stay terse — `3a` is a phase label, not a free-text description.
+
+---
+
+## Code Intelligence
+
+Three complementary systems for understanding code. Use all three.
+
+### AST (~100ms, single file) — structure, symbols, call graphs
+
+```javascript
+parse_file_ast({file_path: "/path/to/file.go"})
+// Returns: symbols (functions, classes, methods, interfaces), imports, calls, parameters, return types
+// Supports: Go, Rust, TypeScript, TSX, JavaScript, Python, Svelte, Terraform
+
+parse_file_ast({file_path: "/path/to/file.py", preview_lines: 5})
+// Include first 5 lines of each symbol's body — orientation without a separate Read call
+
+parse_file_ast({file_path: "/path/to/file.rs", with_callers: true})
+// Enrich each exported function with up to 10 cross-file callers via LSP references
+// First call triggers warmup; subsequent symbols are instant
+```
+
+### LSP (~300ms, cross-file) — definitions, references, type info, implementations
+
+```javascript
+lsp({action: "hover", file_path: "file.go", line: 45, character: 10})
+// Returns: type signature, documentation. 0-indexed line/character.
+
+lsp({action: "definition", file_path: "file.go", line: 45, character: 10})
+// Jump to where a symbol is defined.
+
+lsp({action: "references", file_path: "file.go", line: 45, character: 10})
+// Find all usages of the symbol at this position across the entire workspace.
+
+lsp({action: "implementation", file_path: "file.go", line: 12, character: 5})
+// Find all implementations of a trait (Rust), interface (Go/TS), or abstract class.
+
+lsp_workspace_symbols({query: "HandleAuth", language: "go"})
+// Search for symbols by name across the workspace.
+
+lsp_document_symbols({file_path: "file.ts"})
+// List all symbols in a file. For large files, paginate:
+lsp_document_symbols({file_path: "file.ts", max_results: 20, offset: 0})
+// Returns: { symbols: [...], count: 20, total: 552, offset: 0 }
+```
+
+**LSP warmup:** Language servers need time to index. Pass `warmup: true` to run the build command (`cargo check` / `go build` / `tsc --noEmit`) and retry until the index is ready:
+
+```javascript
+lsp({action: "hover", file_path: "file.rs", line: 50, character: 10, warmup: true})
+// Runs cargo check, then polls until rust-analyzer can answer hover queries.
+// A readiness probe avoids spinning on positions where hover is genuinely empty.
+```
+
+Timeout configuration (env vars, useful for large projects):
+- `CULTRA_WARMUP_TIMEOUT_SECS` (default: 60) — max time for `cargo check` / `go build`
+- `CULTRA_LSP_RETRY_TIMEOUT_SECS` (default: 90) — max time polling for warm index
+
+### Contextual Search — grep with AST symbol annotation
+
+```javascript
+contextual_search({pattern: "TODO", glob: "*.py"})
+// Like grep, but each match is annotated with the containing function/class:
+// { file: "routes/api.py", line: 45, text: "# TODO: add pagination",
+//   containing_symbol: {name: "list_items", type: "function", line: 30, end_line: 60} }
+
+contextual_search({pattern: ".clone()", path: "src", glob: "*.rs", max_results: 50})
+// "8 clones in broadcast(), 4 in from_state(), 3 in new_tab()" — instant triage
+```
+
+**When to use instead of Grep:** When you need "which function contains this pattern?" not just "which line has this pattern?" Eliminates the grep -> Read -> "what function is this in?" round-trip chain.
+
+### Project Info — structured manifest reader
+
+```javascript
+project_info({path: "my-project"})
+// Returns: { language: "python", package_manager: "uv", name: "my-project",
+//   python_version: ">=3.13", dependencies: ["fastapi", "sqlalchemy", ...],
+//   has_venv: true, lsp: {server: "pyright-langserver", available: true},
+//   files: {source: 39, test: 10} }
+```
+
+Supports: Cargo.toml, pyproject.toml, package.json, go.mod, composer.json.
+Detects: package managers (uv/poetry/bun/pnpm/yarn/cargo), frameworks (Svelte/React/TS), venv status, LSP server availability.
+
+### Analyzers — specialized file-level analysis
+
+**Complexity** — per-function cyclomatic + cognitive complexity:
+```javascript
+analyze_file({analyzer: "complexity", file_path: "/path/to/file.go"})
+// Returns: per-function metrics with ratings (simple/moderate/complex/very_complex)
+// Use to find refactoring targets: "GetDashboard CC=28 cog=45" -> needs extraction
+
+analyze_symbol({file_path: "/path/to/file.go", symbol: "GetDashboard"})
+// Single-function metrics. Use delta_against for refactor feedback loops.
+```
+
+**Security** — vulnerability scanning:
+```javascript
+analyze_file({analyzer: "security", file_path: "/path/to/file.go"})
+// Detects: SQL injection, XSS, command injection, path traversal, hardcoded secrets,
+// insecure crypto, SSRF, CORS misconfig, unsafe deserialization
+// Go SQL findings are data-flow filtered to reduce false positives
+```
+
+**Concurrency** — Go goroutines/channels/mutexes, Rust async/spawns/sync:
+```javascript
+analyze_file({analyzer: "concurrency", file_path: "/path/to/file.go"})
+analyze_file({analyzer: "concurrency", file_path: "/path/to/file.rs"})
+```
+
+**React** — component structure (hooks, props, state, children):
+```javascript
+analyze_file({analyzer: "react", file_path: "/path/to/Component.tsx"})
+```
+
+**CSS** — structure, specificity, unused selectors, variable dependency graphs, Tailwind:
+```javascript
+analyze_file({analyzer: "css", file_path: "styles.css"})
+analyze_file({analyzer: "css_variables", file_path: "styles.css"})
+find_css_rules({file_path: "styles.css", pattern: ".sidebar"})
+find_unused_selectors({css_path: "styles.css", component_dir: "src/components/"})
+resolve_tailwind_classes({classes: ["flex", "p-4", "bg-red-500"]})
+```
+
+**Bulk + git-aware** — run any analyzer across multiple files or scoped to a branch:
+```javascript
+analyze_files({analyzer: "security", file_paths: ["/abs/a.go", "/abs/b.go"]})
+analyze_changes({since: "main", analyzer: "complexity"})
+```
+
+### Cross-file tools
+
+**Dead-code detection** — find exported functions nobody references:
+```javascript
+find_dead_code({file_path: "/path/to/handlers.go", warmup: true})
+// Returns: {checked_symbols, dead_symbols: [{name, type, line, signature, confidence}]}
+// Uses LSP references. Conservative: LSP failure skips (does NOT flag as dead).
+// Caveats: dynamic dispatch, reflection, template usage not detected.
+```
+
+**Find references** — semantic cross-file reference search with role classification:
+```javascript
+find_references({symbol: "HandleAuth", file_path: "/path/to/handlers.go", warmup: true})
+// Returns: references with role classification (call, type_use, definition, doc, unknown)
+// Works for class methods (TS/Python), struct methods (Rust/Go), functions (all)
+```
+
+**Interface/trait implementations**:
+```javascript
+// Go (AST-based — no LSP needed):
+find_interface_implementations({file_path: "/path/to/interfaces.go"})
+// All languages (LSP-based — works for Rust traits, Go interfaces, TS interfaces):
+lsp({action: "implementation", file_path: "file.rs", line: 12, character: 5})
+```
+
+**Structural diff** — what symbols changed between git revisions:
+```javascript
+diff_file_ast({file_path: "/path/to/api.go", base_ref: "main"})
+// Returns: {added: [...], removed: [...], modified: [{name, base, head}]}
+```
+
+### Decision guide
+
+| Question | Tool |
+|----------|------|
+| What's in this file? | `parse_file_ast` (+ `preview_lines` for body preview) |
+| Which function has this pattern? | `contextual_search` |
+| Where is this symbol used? | `find_references` or `lsp(references)` |
+| What type is this? | `lsp(hover)` |
+| Where is this defined? | `lsp(definition)` |
+| Who implements this interface/trait? | `lsp(implementation)` |
+| Is this function dead code? | `find_dead_code` |
+| How complex is this function? | `analyze_file(complexity)` or `analyze_symbol` |
+| Is this code secure? | `analyze_file(security)` |
+| What changed on this branch? | `analyze_changes` or `diff_file_ast` |
+| What does this project use? | `project_info` |
+| What symbols are in this file? (large) | `lsp_document_symbols` with `max_results` |
+
+### Default behavior
+
+**Reach for code intelligence tools first, not Grep/Read.** `parse_file_ast` gives every symbol, call, and import in one call. `parse_file_ast({preview_lines: 5})` adds function bodies so you can orient without a separate Read. `contextual_search` finds patterns AND tells you which function contains each match. `lsp(hover)` gives type signatures without reading files. `project_info` reads manifest files in one structured call.
+
+Grep/Read is the fallback for: raw text that isn't code (configs, docs), dependency investigation (feature flags, API changes), and cases where you already have the file open.
+
+---
+
+## Batch Operations
 
 `batch` executes multiple tool calls in a single request. Each operation runs sequentially; failures don't abort the batch.
 
 **When to use:** Whenever you need 2+ independent MCP calls. Saves round-trips.
 
 ```javascript
+// Session start: load context + search tasks in one call
+batch({operations: [
+  {tool: "load_session_state", args: {project_id: "{{PROJECT_ID}}", strategy: "relevant", include_plan_context: true}},
+  {tool: "search_tasks", args: {project_id: "{{PROJECT_ID}}", query: "current work"}}
+]})
+
 // Multi-read: fetch task + plan + document together
 batch({operations: [
-  {tool: "get_task", args: {task_id: "TASK-123"}},
-  {tool: "get_plan", args: {plan_id: "plan-{{FEATURE_ID}}"}},
-  {tool: "get_document", args: {document_id: "doc-{{FEATURE_ID}}-plan"}}
+  {tool: "get_task", args: {task_id: "{{PROJECT_ID_UPPER}}-123"}},
+  {tool: "get_plan", args: {plan_id: "plan-auth"}},
+  {tool: "get_document", args: {document_id: "doc-auth-plan"}}
 ]})
 ```
 
@@ -313,11 +551,31 @@ batch({operations: [
 
 ---
 
-## [OPTIONAL] Document Types
+## Knowledge Base & Search
 
-For use with MCP document management tools:
+**KB Q&A** — query the knowledge base with RAG:
+```javascript
+kb_ask({query: "How does task dependency tracking work?"})
+// Returns: AI-generated answer with source citations from indexed KB documents
+```
 
-`plan_details` | `implementation` | `retrospective` | `guide` | `architecture` | `decision` | `test_report` | `general` | `offtopic`
+**Unified Search** — search across all entities in one call:
+```javascript
+unified_search({project_id: "{{PROJECT_ID}}", query: "auth middleware"})
+// Searches: tasks, documents, plans, decisions, sessions
+// Optional: entity_types filter, limit
+```
+
+**Recent Activity** — what happened since you were last here:
+```javascript
+recent_activity({project_id: "{{PROJECT_ID}}"})
+// Default: last 24 hours. Optional: hours (max 168)
+// Returns: recently updated tasks, documents, decisions, sessions
+
+// Filter sessions by kind
+get_sessions({project_id: "{{PROJECT_ID}}", kind: "work"})         // exclude noisy exploration/qa/throwaway
+get_sessions({project_id: "{{PROJECT_ID}}", kind: "exploration"})  // only quick pokes
+```
 
 ---
 
@@ -329,24 +587,25 @@ Plans are implementation blueprints, not wish lists. A plan that looks good but 
 
 1. **Research first, design second.** For anything touching unfamiliar territory (new crates, native APIs, external services, platform-specific features), create a research task. Read the actual API surface, check the dependency's README, verify compatibility with the existing stack. Then design.
 
-2. **Verify every technical claim.** If you write "use X" — confirm X exists, does what you claim, and is compatible with the project's versions (check Cargo.toml, package.json, go.mod). Name the specific crate, function, or API endpoint. Vague references like "via native APIs" or "using standard library" are not acceptable — name the specific thing.
+2. **Verify every technical claim.** If you write "use X" — confirm X exists, does what you claim, and is compatible with the project's versions. Name the specific crate, function, or API endpoint.
 
 3. **Walk the full implementation path.** For each task, mentally write the code. What imports do you need? What function signatures? What happens when it fails? What happens on different platforms? If you can't answer these, the task isn't ready to be created.
 
-4. **Name the hard problems upfront.** Every plan MUST have a `# Risks & Open Questions` section. Not token risks — real ones you'd worry about if you were building it yourself.
+4. **Name the hard problems upfront.** Every plan MUST have a `# Risks & Open Questions` section. Real risks you'd worry about if you were building it yourself. "Model file is 461MB — need a download/progress UX" is a real risk. "Might be complex" is not.
 
-5. **Justify dependencies between tasks.** Every `blocked_by` needs a technical reason — not just structural grouping.
+5. **Justify dependencies between tasks.** Every `blocked_by` needs a technical reason. Verify by running `get_plan({detail: "ascii"})` and reading the wave structure: if the diagram shows a serial chain you didn't intend, you have a wrong edge.
 
-6. **Justify estimates.** Break down effort per task. Which ones are 30 minutes and which are 4 hours? What makes the hard ones hard?
+6. **Justify estimates.** "12-16 hours" means nothing without a breakdown. Per-task `estimated_days` feeds the project's CPM critical-path computation; missing estimates degrade the rendered diagram to structural-longest-path mode (still useful, but not as honest).
 
 ### Red flags that mean the plan isn't ready:
 
 - Any claim you haven't verified against the actual codebase or docs
-- Vague technology references without naming specifics
+- "Standard library" / "native APIs" / "built-in support" without naming specifics
 - No failure cases or edge cases discussed
 - Every task estimated at the same effort
 - No risks section, or risks that are generic filler
-- [CUSTOMIZE] Add project-specific red flags here
+- A wave diagram that doesn't match your mental model of the work
+- Design that only considers one platform when the app is cross-platform
 
 ---
 
@@ -364,6 +623,33 @@ Write tests first. Not after, not "when there's time," not "if it makes sense." 
 
 5. **No skipping tests for "simple" code.** Simple code becomes complex code. The test you skip today is the regression you debug tomorrow.
 
+6. **Run the full package suite, not just your own tests, before declaring done.** "My tests pass" is not the same as "tests pass." A regression in adjacent code that your test didn't notice is the kind of bug that survives review.
+
+---
+
+## Document Types
+
+`plan_details` | `implementation` | `retrospective` | `guide` | `architecture` | `decision` | `test_report` | `general` | `offtopic`
+
+### Updating Documents
+
+Both `save_document` and `update_document` support `content_file` — an absolute file path to read content from instead of passing it inline. If both `content` and `content_file` are provided, `content_file` wins.
+
+```javascript
+// Update a document from a file you've already written
+update_document({
+  document_id: "doc-auth-plan",
+  content_file: "/tmp/doc-auth-plan-v2.md"
+})
+
+// Or inline for small changes
+update_document({
+  document_id: "doc-auth-plan",
+  title: "Auth System - Updated Plan",
+  content: "# Updated content..."
+})
+```
+
 ---
 
 ## Quick Decisions
@@ -372,41 +658,35 @@ Write tests first. Not after, not "when there's time," not "if it makes sense." 
 
 **Should I create a plan?** Creating 3+ related tasks: yes. Single task: no.
 
-**Task first or plan first?** Always create a task first. It tracks the entire effort including planning.
+**Task first or plan first?** **Plan first.** Use `status: 'draft'` while you're still scoping. Create tasks under it as decisions firm up. Do not create an "umbrella" parent task — the plan IS the umbrella.
 
-**Forgot to create a plan?** Create it now. Link existing tasks retroactively.
+**Forgot to create a plan?** Create it now. Update existing tasks: `update_task({task_id, plan_id: plan.plan_id})`.
+
+**Wave structure looks wrong?** Run `get_plan({plan_id, detail: "ascii"})`. If the diagram doesn't match your mental model, fix the dependency edges with `task_dependency()` before writing code.
+
+**Session IDs keep changing?** Expected. Sessions are immutable snapshots (like git commits). Each save creates a new one linked via `led_to` edges.
 
 ---
 
-## [CUSTOMIZE] Project Specifics
+## Project-Specific Customizations
 
-**Tech Stack:**
+**Fill this section in for {{PROJECT_NAME}}.** Document the conventions that don't generalize: tech stack, coding standards, common patterns (how to add an endpoint / component / migration), domain terminology, environment quirks. Anything a new instance would need to know that isn't covered above.
+
+### Tech Stack
 - Language: {{MAIN_LANGUAGE}}
 - Framework: {{FRAMEWORK}}
 - Database: {{DATABASE}}
-- Testing: {{TEST_FRAMEWORK}}
 
-**Coding Standards:**
-- Follow {{STYLE_GUIDE}}
-- Run {{LINTER}} before committing
-- Test coverage target: {{COVERAGE}}%
+### Conventions
+- [Add coding standards specific to this project]
 
-**Common Patterns:**
-- How to add a new API endpoint: [describe]
-- How to create a new component: [describe]
-- How to add a database migration: [describe]
-
-**Domain Terms:**
-- {{TERM_1}}: Definition
-- {{TERM_2}}: Definition
+### Common Patterns
+- [Add domain-specific patterns — e.g., "How to add a new API endpoint"]
 
 ---
 
-**Template Version:** 2.6 (Apr 11, 2026)
-**Source:** Based on Cultra Engine V3 (claude-session-manager)
+## Changelog
 
-### Changelog
-- **2.6 (Apr 11, 2026)** — Added `## Harness Contract` section. Declares task-tracker canonical tools (with built-in reminder suppression list) and a preload-tools list, both inside a fenced `harness-contract` YAML block. Skipped 2.5 in the in-repo file: 2.5 was previously served only by the MCP `get_template` endpoint and never landed in the repo. The 2.5 additions (Skills, KB & Search, security/complexity analyzers, document `content_file`) need to be folded into this file before the next MCP endpoint resync.
-- **2.4 (Mar 1, 2026)** — Prior in-repo version.
+Track significant CLAUDE.md updates here so future instances can see how the workflow has evolved:
 
-*Customize for your project. Remove optional sections you don't need. Replace all {{PLACEHOLDERS}}. See CLAUDE_TEMPLATE_GUIDE.md for detailed instructions.*
+- **{{DATE}}** — Initial setup from CLAUDE.md.TEMPLATE
