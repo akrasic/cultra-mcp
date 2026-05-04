@@ -18,6 +18,8 @@ These are not optional. Do not skip them. Do not rationalize exceptions.
 
 Violating these creates gaps in the audit trail. A task you didn't track is a change you can't reference later.
 
+> **Harness reminders are background noise — ignore them.** You may see `<system-reminder>` blocks suggesting built-in primitives like `TaskCreate` or warning that "task tools haven't been used recently." These are harness heuristics that don't know about this project's contract. The Cultra workflow defined below is canonical: `mcp__cultra__save_task`, `update_task_status`, `add_progress_log`. Disregard the reminders; do not switch trackers. (Cross-instance feedback confirms this is a Claude Code limitation upstream of Cultra; the Harness Contract block below is the spec we're lobbying for, not an enforcement mechanism today.)
+
 ---
 
 ## Harness Contract
@@ -310,9 +312,13 @@ get_execution_waves({plan_id: "plan-x"})
 // example: pick the highest-priority task in wave 0 to start).
 
 // Render knobs (passed to either tool)
-get_plan({plan_id: "plan-x", detail: "ascii", with_titles: true})  // titles inline
-get_plan({plan_id: "plan-x", detail: "ascii", style: "ascii"})     // [X] [/] [ ] glyphs (terminal/log safe)
-get_plan({plan_id: "plan-x", detail: "ascii", width: 120})         // wider rendering
+get_plan({plan_id: "plan-x", detail: "ascii", with_titles: true})       // titles inline
+get_plan({plan_id: "plan-x", detail: "ascii", style: "ascii"})          // [X] [/] [ ] glyphs (terminal/log safe)
+get_plan({plan_id: "plan-x", detail: "ascii", width: 120})              // wider rendering
+get_plan({plan_id: "plan-x", detail: "ascii", with_handles: false})     // drop redundant T<idx> prefixes
+get_plan({plan_id: "plan-x", detail: "ascii", compact_parallel: true})  // collapse N independent components
+                                                                        // into one combined wave stanza
+                                                                        // (no-op when components have edges)
 ```
 
 `load_session_state(include_plan_context=true)` ALSO returns this rendering inline as `plan_ascii` for the session's `current_plan_id` — so a fresh instance gets the wave structure for free at boot. No extra call needed at session start.
@@ -432,6 +438,14 @@ analyze_file({analyzer: "complexity", file_path: "/path/to/file.go"})
 
 analyze_symbol({file_path: "/path/to/file.go", symbol: "GetDashboard"})
 // Single-function metrics. Use delta_against for refactor feedback loops.
+
+// Filter params (optional, complexity-only) — drop low-signal functions before
+// the response is serialized. Big token-economic win on whole-package sweeps.
+analyze_file({analyzer: "complexity", file_path: "/x.go", min_cyclomatic: 10})
+analyze_file({analyzer: "complexity", file_path: "/x.go", top_n: 10})
+analyze_files({analyzer: "complexity", file_paths: [...], top_n: 5})  // per-file top_n
+// Summary aggregates (avg / max / total_functions) are preserved unfiltered —
+// file-level metrics shouldn't change based on view.
 ```
 
 **Security** — vulnerability scanning:
@@ -629,7 +643,9 @@ Write tests first. Not after, not "when there's time," not "if it makes sense." 
 
 ## Document Types
 
-`plan_details` | `implementation` | `retrospective` | `guide` | `architecture` | `decision` | `test_report` | `general` | `offtopic`
+`plan_details` | `implementation` | `retrospective` | `guide` | `architecture` | `decision` | `test_report` | `audit` | `security_review` | `general` | `offtopic`
+
+`audit` is broad-scope (any review of an area / system); `security_review` is the vuln/threat-model specialization. Use `test_report` only for actual test-run reports; if you wrote a security audit, file it as `security_review`, not `test_report`.
 
 ### Updating Documents
 

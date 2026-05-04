@@ -195,6 +195,9 @@ pub enum DocType {
     Retrospective,
     General,
     Offtopic,
+    // CULTRA-1068 — audit/review types
+    Audit,
+    SecurityReview,
     #[serde(other)]
     Other,
 }
@@ -213,6 +216,9 @@ impl fmt::Display for DocType {
             DocType::Retrospective => write!(f, "retrospective"),
             DocType::General => write!(f, "general"),
             DocType::Offtopic => write!(f, "offtopic"),
+            // CULTRA-1068 — audit/review types
+            DocType::Audit => write!(f, "audit"),
+            DocType::SecurityReview => write!(f, "security_review"),
             DocType::Other => write!(f, "other"),
         }
     }
@@ -230,6 +236,9 @@ impl EnumValues for DocType {
             "retrospective".to_string(),
             "general".to_string(),
             "offtopic".to_string(),
+            // CULTRA-1068
+            "audit".to_string(),
+            "security_review".to_string(),
         ]
     }
 }
@@ -646,6 +655,23 @@ mod tests {
         let json = "\"custom_type\"";
         let doc_type: DocType = serde_json::from_str(json).unwrap();
         assert_eq!(doc_type, DocType::Other);
+    }
+
+    #[test]
+    fn test_doc_type_audit_variants() {
+        // CULTRA-1068: audit and security_review must round-trip cleanly,
+        // not fall through to DocType::Other.
+        let audit: DocType = serde_json::from_str("\"audit\"").unwrap();
+        assert_eq!(audit, DocType::Audit);
+        assert_eq!(audit.to_string(), "audit");
+
+        let sec: DocType = serde_json::from_str("\"security_review\"").unwrap();
+        assert_eq!(sec, DocType::SecurityReview);
+        assert_eq!(sec.to_string(), "security_review");
+
+        let values = DocType::valid_values();
+        assert!(values.contains(&"audit".to_string()), "audit missing from valid_values");
+        assert!(values.contains(&"security_review".to_string()), "security_review missing from valid_values");
     }
 
     #[test]

@@ -115,6 +115,15 @@ fn build_waves_query_params(args: &Map<String, Value>) -> Result<Vec<(String, St
         }
     }
 
+    // CULTRA-1069: compact_parallel=true collapses N independent components
+    // into a single combined wave stanza. Default off preserves historical
+    // partitioned form. Only emit when explicitly true.
+    if let Some(flag) = args.get("compact_parallel").and_then(|v| v.as_bool()) {
+        if flag {
+            query_params.push(("compact_parallel".to_string(), "true".to_string()));
+        }
+    }
+
     Ok(query_params)
 }
 
@@ -344,5 +353,29 @@ mod tests {
         let params = build_waves_query_params(&args).expect("with_handles=true is valid");
         assert!(params.iter().all(|(k, _)| k != "with_handles"),
             "with_handles=true should be omitted (default), got: {:?}", params);
+    }
+
+    // CULTRA-1069: compact_parallel passthrough.
+
+    #[test]
+    fn test_build_waves_query_params_emits_compact_parallel_when_true() {
+        let mut args = Map::new();
+        args.insert("plan_id".to_string(), json!("plan-x"));
+        args.insert("compact_parallel".to_string(), json!(true));
+        let params = build_waves_query_params(&args).expect("compact_parallel=true is valid");
+        let cp = params.iter().find(|(k, _)| k == "compact_parallel")
+            .expect("compact_parallel=true should pass through");
+        assert_eq!(cp.1, "true");
+    }
+
+    #[test]
+    fn test_build_waves_query_params_drops_compact_parallel_when_false() {
+        // False is the historical default. Omit rather than send noise.
+        let mut args = Map::new();
+        args.insert("plan_id".to_string(), json!("plan-x"));
+        args.insert("compact_parallel".to_string(), json!(false));
+        let params = build_waves_query_params(&args).expect("compact_parallel=false is valid");
+        assert!(params.iter().all(|(k, _)| k != "compact_parallel"),
+            "compact_parallel=false should be omitted (default), got: {:?}", params);
     }
 }

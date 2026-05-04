@@ -15,6 +15,7 @@ use crate::ast::{
     find_interface_implementations,
     analyze_security,
     resolve_tailwind_classes,
+    ComplexityAnalysis,
 };
 use crate::lsp::tools::{
     lsp_query,
@@ -421,6 +422,10 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "with_handles": {
                         "type": "boolean",
                         "description": "When false, drops the T<idx> handle prefix from compact-mode tokens. Default true preserves historical output. (CULTRA-1059)"
+                    },
+                    "compact_parallel": {
+                        "type": "boolean",
+                        "description": "When true AND every component is single-wave (N independent tasks across N components — common for plans where tasks have no inter-task edges), collapses the per-component partitioning into a single combined wave stanza. Default false preserves historical per-component output. (CULTRA-1069)"
                     }
                 }
             }),
@@ -740,7 +745,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "link_document".to_string(),
-            description: "Link a document to one or more tasks".to_string(),
+            description: "Link a document to tasks and/or plans (CULTRA-1065). At least one of task_ids, plan_id, or plan_ids must be provided. Plan linking enables attaching design docs to draft plans before tasks are filed — closes the gap that breaks the research-first workflow.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -751,10 +756,19 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "task_ids": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Array of task IDs to link (required)"
+                        "description": "Task IDs to link (optional if plan_id/plan_ids provided)"
+                    },
+                    "plan_id": {
+                        "type": "string",
+                        "description": "Single plan ID to link (optional if task_ids/plan_ids provided). CULTRA-1065."
+                    },
+                    "plan_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Plan IDs to link (optional if task_ids/plan_id provided). CULTRA-1065."
                     }
                 },
-                "required": ["document_id", "task_ids"]
+                "required": ["document_id"]
             }),
         },
         Tool {
@@ -860,6 +874,10 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "with_handles": {
                         "type": "boolean",
                         "description": "When false, drops the T<idx> handle prefix from compact-mode tokens (e.g. '(○ CULTRA-1)' instead of 'T0(○ CULTRA-1)'). Default true preserves historical output. (CULTRA-1059)"
+                    },
+                    "compact_parallel": {
+                        "type": "boolean",
+                        "description": "When true AND every component is single-wave, collapses per-component partitioning into one combined stanza. Default false preserves historical output. Only valid with detail='ascii'. (CULTRA-1069)"
                     },
                     "group_by": {
                         "type": "string",
@@ -989,6 +1007,21 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "include_working_tree": {
                         "type": "boolean",
                         "description": "If true (CULTRA-956 default), uncommitted working-tree changes are included in the diff. Pass false to restrict to committed diffs only."
+                    },
+                    "min_cyclomatic": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "CULTRA-1066: complexity analyzer only. Forwarded to analyze_files."
+                    },
+                    "min_cognitive": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "CULTRA-1066: complexity analyzer only. Forwarded to analyze_files."
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "CULTRA-1066: complexity analyzer only. Per-file top-N. Forwarded to analyze_files."
                     }
                 },
                 "required": ["since", "analyzer"]
@@ -1081,7 +1114,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "analyze_files".to_string(),
-            description: "Bulk variant of analyze_file (CULTRA-905). Runs the same analyzer against many files in parallel and returns one entry per input file. Per-file failures are isolated — one bad path doesn't abort the batch. Use this instead of wrapping individual analyze_file calls in `batch` for whole-package or whole-repo audits.".to_string(),
+            description: "Bulk variant of analyze_file (CULTRA-905). Runs the same analyzer against many files in parallel and returns one entry per input file. Per-file failures are isolated — one bad path doesn't abort the batch. Use this instead of wrapping individual analyze_file calls in `batch` for whole-package or whole-repo audits. CULTRA-1066: complexity analyzer accepts min_cyclomatic / min_cognitive / top_n filters to drop low-signal functions before serialization (per file, not global) — large token-economic win on big sweeps.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1094,6 +1127,21 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Absolute paths to analyze. Capped at 500 entries per call. Order is preserved in the result."
+                    },
+                    "min_cyclomatic": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "CULTRA-1066: complexity analyzer only. Drop functions with cyclomatic complexity below N. Summary aggregates are preserved (file-level metrics shouldn't change with view)."
+                    },
+                    "min_cognitive": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "CULTRA-1066: complexity analyzer only. Drop functions with cognitive complexity below N."
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "CULTRA-1066: complexity analyzer only. Return only the top-N highest-cyclomatic functions per file (functions are pre-sorted, so this just truncates)."
                     }
                 },
                 "required": ["analyzer", "file_paths"]
@@ -1101,7 +1149,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "analyze_file".to_string(),
-            description: "Analyze a source file. analyzer=\"concurrency\": Go concurrency patterns (goroutines, channels, mutex, race conditions). analyzer=\"react\": React component structure (props, hooks, state, children). analyzer=\"css\": CSS structural metadata (selectors, specificity, variables, media queries). analyzer=\"css_variables\": CSS custom property dependency graph (var() chains, cycles, unresolved refs). analyzer=\"security\": Security vulnerability scan (SQL injection, XSS, command injection, hardcoded secrets, insecure crypto, SSRF, Terraform misconfigs — multi-language). analyzer=\"complexity\": Cyclomatic and cognitive complexity per function/resource block with ratings (multi-language incl. Terraform).".to_string(),
+            description: "Analyze a source file. analyzer=\"concurrency\": Go concurrency patterns (goroutines, channels, mutex, race conditions). analyzer=\"react\": React component structure (props, hooks, state, children). analyzer=\"css\": CSS structural metadata (selectors, specificity, variables, media queries). analyzer=\"css_variables\": CSS custom property dependency graph (var() chains, cycles, unresolved refs). analyzer=\"security\": Security vulnerability scan (SQL injection, XSS, command injection, hardcoded secrets, insecure crypto, SSRF, Terraform misconfigs — multi-language). analyzer=\"complexity\": Cyclomatic and cognitive complexity per function/resource block with ratings (multi-language incl. Terraform). CULTRA-1066: complexity analyzer accepts min_cyclomatic / min_cognitive / top_n filters to drop low-signal functions before serialization.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1113,6 +1161,21 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "file_path": {
                         "type": "string",
                         "description": "Absolute path to the file to analyze"
+                    },
+                    "min_cyclomatic": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "CULTRA-1066: complexity analyzer only. Drop functions with cyclomatic complexity below N. Summary aggregates preserved."
+                    },
+                    "min_cognitive": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "CULTRA-1066: complexity analyzer only. Drop functions with cognitive complexity below N."
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "CULTRA-1066: complexity analyzer only. Return only the top-N highest-cyclomatic functions (pre-sorted)."
                     }
                 },
                 "required": ["analyzer", "file_path"]
@@ -2790,7 +2853,7 @@ fn update_document(server: &Server, mut args: Map<String, Value>) -> Result<Valu
     api_put(server, &format!("/api/v2/documents/{}", document_id), args)
 }
 
-/// Tool implementation: link_document (consolidated from link_document + link_document_batch)
+/// Tool implementation: link_document (CULTRA-1065: now accepts task_ids, plan_id, and plan_ids).
 fn link_document(server: &Server, args: Map<String, Value>) -> Result<Value> {
     let _document_id = args.get("document_id")
         .and_then(|v| v.as_str())
@@ -2799,14 +2862,34 @@ fn link_document(server: &Server, args: Map<String, Value>) -> Result<Value> {
 
     let task_ids = args.get("task_ids")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("task_ids is required and must be an array"))?;
-    if task_ids.is_empty() {
-        return Err(anyhow!("task_ids must contain at least 1 task ID"));
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    let plan_ids = args.get("plan_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    let plan_id = args.get("plan_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    if task_ids.is_empty() && plan_ids.is_empty() && plan_id.is_none() {
+        return Err(anyhow!(
+            "at least one of task_ids, plan_id, or plan_ids must be provided"
+        ));
     }
+
     for (i, task_id_val) in task_ids.iter().enumerate() {
         if let Some(task_id) = task_id_val.as_str() {
             validate_id(&format!("task_ids[{}]", i), task_id)?;
         }
+    }
+    for (i, plan_id_val) in plan_ids.iter().enumerate() {
+        if let Some(pid) = plan_id_val.as_str() {
+            validate_id(&format!("plan_ids[{}]", i), pid)?;
+        }
+    }
+    if let Some(pid) = plan_id {
+        validate_id("plan_id", pid)?;
     }
 
     api_post(server, "/api/v2/documents/link-batch", args)
@@ -2927,11 +3010,12 @@ fn get_plan(server: &Server, args: Map<String, Value>) -> Result<Value> {
 fn build_plan_render_query(args: &Map<String, Value>, detail: &str) -> Result<Vec<(String, String)>> {
     let has_render_knob = args.contains_key("width")
         || args.contains_key("style")
-        || args.contains_key("with_titles");
+        || args.contains_key("with_titles")
+        || args.contains_key("compact_parallel");
 
     if has_render_knob && detail != "ascii" {
         return Err(anyhow!(
-            "width / style / with_titles only apply when detail='ascii' (got detail='{}')",
+            "width / style / with_titles / compact_parallel only apply when detail='ascii' (got detail='{}')",
             detail
         ));
     }
@@ -2977,6 +3061,15 @@ fn build_plan_render_query(args: &Map<String, Value>, detail: &str) -> Result<Ve
     if let Some(flag) = args.get("with_handles").and_then(|v| v.as_bool()) {
         if !flag {
             out.push(("with_handles".to_string(), "false".to_string()));
+        }
+    }
+
+    // CULTRA-1069: compact_parallel=true collapses N independent components
+    // into a single combined wave stanza. Default off preserves historical
+    // partitioned form. Only emit when explicitly true.
+    if let Some(flag) = args.get("compact_parallel").and_then(|v| v.as_bool()) {
+        if flag {
+            out.push(("compact_parallel".to_string(), "true".to_string()));
         }
     }
 
@@ -3427,10 +3520,16 @@ fn analyze_changes_tool(args: Map<String, Value>, workspace_root: &std::path::Pa
     }
 
     // Delegate to analyze_files. Build a fresh args map; analyze_files_tool
-    // does its own validation.
+    // does its own validation. CULTRA-1066: forward complexity filters so
+    // a git-scoped complexity sweep can also be filtered down.
     let mut delegate_args = Map::new();
     delegate_args.insert("analyzer".to_string(), json!(analyzer));
     delegate_args.insert("file_paths".to_string(), Value::Array(file_paths));
+    for key in &["min_cyclomatic", "min_cognitive", "top_n"] {
+        if let Some(v) = args.get(*key) {
+            delegate_args.insert((*key).to_string(), v.clone());
+        }
+    }
     let mut result = analyze_files_tool(delegate_args, workspace_root)?;
 
     // Annotate with the git ref used so the response is self-describing.
@@ -4110,10 +4209,63 @@ fn validate_analyzer(analyzer: &str) -> Result<()> {
     }
 }
 
+/// CULTRA-1066: filter knobs for the complexity analyzer. Each is optional
+/// and applied independently; combining them is intersect-style (AND).
+/// Summary aggregates are deliberately preserved (file-level metrics
+/// shouldn't change based on view); only the `functions` list is filtered.
+#[derive(Debug, Clone, Default)]
+struct ComplexityFilters {
+    min_cyclomatic: Option<u32>,
+    min_cognitive: Option<u32>,
+    top_n: Option<usize>,
+}
+
+impl ComplexityFilters {
+    fn parse_from_args(args: &Map<String, Value>) -> Result<Self> {
+        Ok(Self {
+            min_cyclomatic: parse_positive_int(args, "min_cyclomatic", None, None)?
+                .map(|n| n as u32),
+            min_cognitive: parse_positive_int(args, "min_cognitive", None, None)?
+                .map(|n| n as u32),
+            top_n: parse_positive_int(args, "top_n", Some(1), None)?
+                .map(|n| n as usize),
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        self.min_cyclomatic.is_some() || self.min_cognitive.is_some() || self.top_n.is_some()
+    }
+}
+
+/// Apply complexity filters to a single ComplexityAnalysis. Mutates and
+/// returns. Idempotent if no filters are active. Functions are already
+/// sorted by cyclomatic descending, so top_n just truncates.
+fn apply_complexity_filters(
+    mut analysis: ComplexityAnalysis,
+    filters: &ComplexityFilters,
+) -> ComplexityAnalysis {
+    if let Some(min) = filters.min_cyclomatic {
+        analysis.functions.retain(|f| f.cyclomatic >= min);
+    }
+    if let Some(min) = filters.min_cognitive {
+        analysis.functions.retain(|f| f.cognitive >= min);
+    }
+    if let Some(n) = filters.top_n {
+        analysis.functions.truncate(n);
+    }
+    analysis
+}
+
 /// Run a single analyzer against a single file. Pure helper used by both
 /// analyze_file_tool and analyze_files_tool. Caller is responsible for
 /// validating the analyzer name and the file path before calling.
-fn run_analyzer(analyzer: &str, file_path: &str) -> Result<Value> {
+/// CULTRA-1066: complexity_filters apply only to the "complexity" analyzer;
+/// other analyzers ignore the parameter.
+fn run_analyzer(
+    analyzer: &str,
+    file_path: &str,
+    complexity_filters: &ComplexityFilters,
+) -> Result<Value> {
     match analyzer {
         "concurrency" => {
             // CULTRA-910: dispatch by extension. .rs → Rust analyzer,
@@ -4156,6 +4308,11 @@ fn run_analyzer(analyzer: &str, file_path: &str) -> Result<Value> {
         "complexity" => {
             let analysis = analyze_complexity(file_path)
                 .map_err(|e| anyhow!("Failed to run complexity analysis: {}", e))?;
+            let analysis = if complexity_filters.is_active() {
+                apply_complexity_filters(analysis, complexity_filters)
+            } else {
+                analysis
+            };
             serde_json::to_value(analysis)
                 .map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
@@ -4176,7 +4333,10 @@ fn analyze_file_tool(args: Map<String, Value>, workspace_root: &std::path::Path)
         .ok_or_else(|| anyhow!("Missing required parameter: file_path"))?;
     validate_file_exists(file_path, workspace_root)?;
 
-    run_analyzer(analyzer, file_path)
+    // CULTRA-1066: complexity filters (no-op for non-complexity analyzers)
+    let complexity_filters = ComplexityFilters::parse_from_args(&args)?;
+
+    run_analyzer(analyzer, file_path, &complexity_filters)
 }
 
 /// CULTRA-949: analyze_symbol — filter analyze_file(complexity)'s output to a
@@ -4343,12 +4503,16 @@ fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path
         file_paths.push(s.to_string());
     }
 
+    // CULTRA-1066: complexity filters (no-op for non-complexity analyzers)
+    let complexity_filters = ComplexityFilters::parse_from_args(&args)?;
+
     // Cap concurrency so a 500-file batch doesn't spawn 500 threads.
     // 8 is a sensible default for CPU-bound tree-sitter parsing on most hosts.
     let max_workers = 8usize.min(file_paths.len());
     let chunk_size = (file_paths.len() + max_workers - 1) / max_workers;
     let analyzer_owned = analyzer.to_string();
     let workspace_root_owned: std::path::PathBuf = workspace_root.to_path_buf();
+    let filters_owned = complexity_filters.clone();
 
     // Each entry is (index, FileResult). Output is sorted back to input order.
     let mut results: Vec<(usize, Value)> = Vec::with_capacity(file_paths.len());
@@ -4366,6 +4530,7 @@ fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path
                 .collect();
             let analyzer_ref = &analyzer_owned;
             let workspace_ref = &workspace_root_owned;
+            let filters_ref = &filters_owned;
             handles.push(scope.spawn(move || {
                 let mut local: Vec<(usize, Value)> = Vec::with_capacity(chunk.len());
                 for (idx, path) in chunk {
@@ -4375,7 +4540,7 @@ fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path
                             "success": false,
                             "error": format!("{}", e),
                         }),
-                        Ok(_) => match run_analyzer(analyzer_ref, &path) {
+                        Ok(_) => match run_analyzer(analyzer_ref, &path, filters_ref) {
                             Ok(v) => json!({
                                 "file_path": path,
                                 "success": true,
@@ -4876,17 +5041,43 @@ fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing required parameter: pattern"))?;
 
-    // Default search path is the workspace root
-    let search_path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(|p| std::path::PathBuf::from(p))
-        .unwrap_or_else(|| workspace_root.to_path_buf());
+    // Resolve search path: relative paths join with workspace_root, absolute
+    // paths are used as-is. Default to workspace_root when no path is given.
+    // (CULTRA-1067: previously rejected relative paths with a misleading
+    // "must be within the workspace root" error.)
+    let provided = args.get("path").and_then(|v| v.as_str());
+    let resolved_path = match provided {
+        Some(p) => {
+            let pb = std::path::PathBuf::from(p);
+            if pb.is_absolute() {
+                pb
+            } else {
+                workspace_root.join(pb)
+            }
+        }
+        None => workspace_root.to_path_buf(),
+    };
 
-    // Validate path is within workspace
-    if !search_path.starts_with(workspace_root) {
-        return Err(anyhow!("Search path must be within the workspace root"));
+    // Canonicalize for the security check (defeats `..` traversal and symlink
+    // escapes). Mirror the validate_file_exists pattern.
+    let canonical_path = resolved_path.canonicalize().map_err(|e| {
+        anyhow!(
+            "path '{}' does not exist or cannot be accessed: {}",
+            resolved_path.display(),
+            e
+        )
+    })?;
+    let canonical_workspace = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    if !canonical_path.starts_with(&canonical_workspace) {
+        return Err(anyhow!(
+            "path must be within workspace; got '{}', workspace root is '{}'",
+            resolved_path.display(),
+            workspace_root.display()
+        ));
     }
+    let search_path = canonical_path;
 
     let file_glob = args.get("glob").and_then(|v| v.as_str());
     let max_matches = args
@@ -4978,10 +5169,16 @@ fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::
 
     // Step 4: annotate each hit with the containing symbol
     let mut matches: Vec<Value> = Vec::new();
+    // ripgrep results will be under the canonical search root, so strip
+    // against canonical_workspace; fall back to workspace_root for the case
+    // where the two are identical (no symlinks).
     let workspace_str = workspace_root.to_string_lossy();
+    let canonical_str = canonical_workspace.to_string_lossy();
 
     for hit in &hits {
-        let relative_file = hit.file.strip_prefix(workspace_str.as_ref())
+        let relative_file = hit.file
+            .strip_prefix(canonical_str.as_ref())
+            .or_else(|| hit.file.strip_prefix(workspace_str.as_ref()))
             .unwrap_or(&hit.file)
             .trim_start_matches('/');
 
@@ -5026,15 +5223,49 @@ fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::
 // ============================================================================
 
 fn project_info_tool(args: Map<String, Value>, server: &Server) -> Result<Value> {
-    let project_path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| server.workspace_root.clone());
+    project_info_tool_inner(args, &server.workspace_root)
+}
 
-    if !project_path.starts_with(&server.workspace_root) {
-        return Err(anyhow!("Path must be within the workspace root"));
+/// Inner impl of project_info_tool that takes the workspace_root directly so
+/// it's testable without a full Server. (CULTRA-1070)
+fn project_info_tool_inner(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+    // CULTRA-1070: same resolve+canonicalize pattern as contextual_search_tool
+    // (CULTRA-1067). Relative paths join with workspace_root; canonicalization
+    // defeats `..` traversal and symlink escapes; nonexistent paths get a clear
+    // error. Replaces lexical-only `starts_with` check that misclassified relative
+    // paths as workspace-escape and missed real escapes.
+    let provided = args.get("path").and_then(|v| v.as_str());
+    let resolved_path = match provided {
+        Some(p) => {
+            let pb = std::path::PathBuf::from(p);
+            if pb.is_absolute() {
+                pb
+            } else {
+                workspace_root.join(pb)
+            }
+        }
+        None => workspace_root.to_path_buf(),
+    };
+
+    let canonical_path = resolved_path.canonicalize().map_err(|e| {
+        anyhow!(
+            "path '{}' does not exist or cannot be accessed: {}",
+            resolved_path.display(),
+            e
+        )
+    })?;
+    let canonical_workspace = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    if !canonical_path.starts_with(&canonical_workspace) {
+        return Err(anyhow!(
+            "path must be within workspace; got '{}', workspace root is '{}'",
+            resolved_path.display(),
+            workspace_root.display()
+        ));
     }
+    let project_path = canonical_path;
+
     if !project_path.is_dir() {
         return Err(anyhow!("Path '{}' is not a directory", project_path.display()));
     }
@@ -5842,6 +6073,234 @@ mod tests {
         let workspace = std::path::PathBuf::from("/");
         let err = analyze_files_tool(args, &workspace).unwrap_err();
         assert!(err.to_string().contains("not a string"));
+    }
+
+    // ========================================================================
+    // CULTRA-1066: complexity analyzer filter params
+    // ========================================================================
+
+    fn fake_function(name: &str, cyc: u32, cog: u32) -> crate::ast::FunctionComplexity {
+        crate::ast::FunctionComplexity {
+            name: name.to_string(),
+            location: format!("/fake.go:1-10"),
+            line_start: 1,
+            line_end: 10,
+            lines: 10,
+            cyclomatic: cyc,
+            cognitive: cog,
+            receiver: None,
+            rating: "moderate".to_string(),
+        }
+    }
+
+    fn fake_analysis() -> ComplexityAnalysis {
+        ComplexityAnalysis {
+            file_path: "/fake.go".to_string(),
+            language: "go".to_string(),
+            // Sorted by cyclomatic descending (matches analyzer output convention)
+            functions: vec![
+                fake_function("very_complex", 25, 30),
+                fake_function("complex", 12, 15),
+                fake_function("moderate", 5, 6),
+                fake_function("trivial", 1, 1),
+            ],
+            summary: crate::ast::ComplexitySummary {
+                total_functions: 4,
+                avg_cyclomatic: 10.75,
+                max_cyclomatic: 25,
+                avg_cognitive: 13.0,
+                max_cognitive: 30,
+                complex_functions: 2,
+                very_complex_functions: 1,
+                total_lines: 40,
+                hotspot: Some("very_complex".to_string()),
+            },
+        }
+    }
+
+    #[test]
+    fn test_apply_complexity_filters_no_op_when_inactive() {
+        let analysis = fake_analysis();
+        let filters = ComplexityFilters::default();
+        assert!(!filters.is_active());
+        let out = apply_complexity_filters(analysis, &filters);
+        assert_eq!(out.functions.len(), 4, "default filters should not drop anything");
+    }
+
+    #[test]
+    fn test_apply_complexity_filters_min_cyclomatic_drops_below_threshold() {
+        let filters = ComplexityFilters { min_cyclomatic: Some(10), ..Default::default() };
+        assert!(filters.is_active());
+        let out = apply_complexity_filters(fake_analysis(), &filters);
+        assert_eq!(out.functions.len(), 2, "expected 2 funcs >= CC 10");
+        assert!(out.functions.iter().all(|f| f.cyclomatic >= 10));
+    }
+
+    #[test]
+    fn test_apply_complexity_filters_min_cognitive_drops_below_threshold() {
+        let filters = ComplexityFilters { min_cognitive: Some(15), ..Default::default() };
+        let out = apply_complexity_filters(fake_analysis(), &filters);
+        assert_eq!(out.functions.len(), 2, "expected 2 funcs >= cognitive 15");
+        assert!(out.functions.iter().all(|f| f.cognitive >= 15));
+    }
+
+    #[test]
+    fn test_apply_complexity_filters_top_n_truncates() {
+        let filters = ComplexityFilters { top_n: Some(2), ..Default::default() };
+        let out = apply_complexity_filters(fake_analysis(), &filters);
+        assert_eq!(out.functions.len(), 2);
+        // Pre-sorted by cyclomatic desc, so top 2 are very_complex + complex
+        assert_eq!(out.functions[0].name, "very_complex");
+        assert_eq!(out.functions[1].name, "complex");
+    }
+
+    #[test]
+    fn test_apply_complexity_filters_combined_intersect() {
+        // min_cyclomatic=5 keeps {very_complex, complex, moderate}; top_n=2 truncates to {very_complex, complex}
+        let filters = ComplexityFilters {
+            min_cyclomatic: Some(5),
+            top_n: Some(2),
+            ..Default::default()
+        };
+        let out = apply_complexity_filters(fake_analysis(), &filters);
+        assert_eq!(out.functions.len(), 2);
+        assert_eq!(out.functions[0].name, "very_complex");
+        assert_eq!(out.functions[1].name, "complex");
+    }
+
+    #[test]
+    fn test_apply_complexity_filters_preserves_summary() {
+        // File-level summary aggregates should NOT change when functions are filtered
+        // (otherwise avg_cyclomatic etc. become "avg of the top N" — meaningless).
+        let filters = ComplexityFilters { top_n: Some(1), ..Default::default() };
+        let out = apply_complexity_filters(fake_analysis(), &filters);
+        assert_eq!(out.summary.total_functions, 4, "summary preserves unfiltered count");
+        assert_eq!(out.summary.max_cyclomatic, 25);
+        assert_eq!(out.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_complexity_filters_parse_from_args() {
+        let mut args = Map::new();
+        args.insert("min_cyclomatic".to_string(), json!(5));
+        args.insert("top_n".to_string(), json!(10));
+        let f = ComplexityFilters::parse_from_args(&args).unwrap();
+        assert_eq!(f.min_cyclomatic, Some(5));
+        assert_eq!(f.min_cognitive, None);
+        assert_eq!(f.top_n, Some(10));
+        assert!(f.is_active());
+    }
+
+    #[test]
+    fn test_complexity_filters_parse_from_args_empty() {
+        let args = Map::new();
+        let f = ComplexityFilters::parse_from_args(&args).unwrap();
+        assert!(!f.is_active());
+    }
+
+    #[test]
+    fn test_complexity_filters_parse_top_n_rejects_zero() {
+        let mut args = Map::new();
+        args.insert("top_n".to_string(), json!(0));
+        let err = ComplexityFilters::parse_from_args(&args).unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "got: {}", err.to_string());
+    }
+
+    #[test]
+    fn test_analyze_file_complexity_top_n_truncates_in_response() {
+        // End-to-end: analyze a Go file with multiple functions and verify
+        // top_n=1 returns exactly one function in the JSON response.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "multi.go", concat!(
+            "package main\n",
+            "func a() {}\n",
+            "func b(x int) int { if x > 0 { return 1 } else { return 0 } }\n",
+            "func c(x int) int { if x > 0 { return 1 }; if x < 0 { return -1 }; return 0 }\n",
+        ));
+
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("complexity"));
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("top_n".to_string(), json!(1));
+
+        let workspace = std::path::PathBuf::from("/");
+        let result = analyze_file_tool(args, &workspace).unwrap();
+        let funcs = result["functions"].as_array().expect("functions array");
+        assert_eq!(funcs.len(), 1, "top_n=1 should return exactly 1 function");
+        // Summary aggregates preserved
+        assert_eq!(result["summary"]["total_functions"].as_u64().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_analyze_file_complexity_min_cyclomatic_drops_simple() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "multi.go", concat!(
+            "package main\n",
+            "func a() {}\n",  // CC=1
+            "func b(x int) int { if x > 0 { return 1 } else { return 0 } }\n", // CC=2
+        ));
+
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("complexity"));
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("min_cyclomatic".to_string(), json!(2));
+
+        let workspace = std::path::PathBuf::from("/");
+        let result = analyze_file_tool(args, &workspace).unwrap();
+        let funcs = result["functions"].as_array().unwrap();
+        assert!(funcs.iter().all(|f| f["cyclomatic"].as_u64().unwrap() >= 2),
+            "expected all functions to have CC>=2, got: {:?}",
+            funcs.iter().map(|f| (f["name"].as_str(), f["cyclomatic"].as_u64())).collect::<Vec<_>>());
+        // function 'a' (CC=1) should be filtered out, leaving 'b' (CC>=2)
+        assert!(funcs.iter().any(|f| f["name"].as_str() == Some("b")));
+        assert!(!funcs.iter().any(|f| f["name"].as_str() == Some("a")));
+    }
+
+    #[test]
+    fn test_analyze_files_complexity_filters_apply_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = write_go_file(&dir, "a.go", concat!(
+            "package main\n",
+            "func a1() {}\n",
+            "func a2(x int) int { if x > 0 { return 1 } else { return 0 } }\n",
+        ));
+        let p2 = write_go_file(&dir, "b.go", concat!(
+            "package main\n",
+            "func b1() {}\n",
+            "func b2(x int) int { if x > 0 { return 1 }; if x < 0 { return -1 }; return 0 }\n",
+        ));
+
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("complexity"));
+        args.insert("file_paths".to_string(), json!([p1.to_str().unwrap(), p2.to_str().unwrap()]));
+        args.insert("top_n".to_string(), json!(1));
+
+        let workspace = std::path::PathBuf::from("/");
+        let result = analyze_files_tool(args, &workspace).unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        // Each file should report exactly 1 function (top_n applied per-file)
+        for entry in results {
+            let funcs = entry["result"]["functions"].as_array().unwrap();
+            assert_eq!(funcs.len(), 1,
+                "expected per-file top_n=1; entry: {}", entry["file_path"]);
+        }
+    }
+
+    #[test]
+    fn test_analyze_file_filters_ignored_for_non_complexity_analyzer() {
+        // Filters should be silently ignored when analyzer != complexity.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_go_file(&dir, "x.go", "package main\nfunc main() {}\n");
+
+        let mut args = Map::new();
+        args.insert("analyzer".to_string(), json!("security"));
+        args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
+        args.insert("top_n".to_string(), json!(1));
+
+        let workspace = std::path::PathBuf::from("/");
+        // Should not error — filters are no-op for non-complexity analyzers
+        let _result = analyze_file_tool(args, &workspace).expect("filters should be ignored, not errored");
     }
 
     // CULTRA-906: caller enrichment tests (LSP graceful degradation).
@@ -7423,6 +7882,38 @@ pub async fn run() {
             "with_titles=false should be omitted, got {:?}", q);
     }
 
+    // CULTRA-1069: compact_parallel passthrough on get_plan(detail='ascii').
+
+    #[test]
+    fn test_build_plan_render_query_passes_compact_parallel_when_true() {
+        let mut args = Map::new();
+        args.insert("compact_parallel".to_string(), json!(true));
+        let q = build_plan_render_query(&args, "ascii").unwrap();
+        let cp = q.iter().find(|(k, _)| k == "compact_parallel")
+            .expect("compact_parallel=true should pass through");
+        assert_eq!(cp.1, "true");
+    }
+
+    #[test]
+    fn test_build_plan_render_query_drops_compact_parallel_when_false() {
+        let mut args = Map::new();
+        args.insert("compact_parallel".to_string(), json!(false));
+        let q = build_plan_render_query(&args, "ascii").unwrap();
+        assert!(q.iter().all(|(k, _)| k != "compact_parallel"),
+            "compact_parallel=false should be omitted (default), got {:?}", q);
+    }
+
+    #[test]
+    fn test_build_plan_render_query_rejects_compact_parallel_with_non_ascii_detail() {
+        // compact_parallel only matters when detail='ascii'. Loud failure
+        // beats silent drop, mirrors the gate on width/style/with_titles.
+        let mut args = Map::new();
+        args.insert("compact_parallel".to_string(), json!(true));
+        let err = build_plan_render_query(&args, "status").unwrap_err();
+        assert!(err.to_string().contains("compact_parallel") || err.to_string().contains("only apply when detail='ascii'"),
+            "expected detail-mismatch error mentioning compact_parallel, got: {}", err);
+    }
+
     // CULTRA-1057: get_project_estimate_accuracy shim. We can't test the HTTP
     // call without a live server; what we can test cheaply is the
     // missing-arg / invalid-arg validation paths the impl runs before the
@@ -7483,5 +7974,199 @@ pub async fn run() {
         let err = build_plan_render_query(&args, "ascii").unwrap_err();
         assert!(err.to_string().contains("only applies when detail='status'"),
             "expected detail-mismatch error, got: {}", err);
+    }
+
+    // ========================================================================
+    // contextual_search path resolution (CULTRA-1067)
+    // ========================================================================
+
+    fn write_file(path: &std::path::Path, content: &str) {
+        let mut f = File::create(path).expect("create test file");
+        f.write_all(content.as_bytes()).expect("write test file");
+    }
+
+    #[test]
+    fn test_contextual_search_resolves_relative_path() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let subdir = workspace.join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+        write_file(&subdir.join("hello.txt"), "the quick brown fox\n");
+
+        let mut args = Map::new();
+        args.insert("pattern".to_string(), json!("fox"));
+        args.insert("path".to_string(), json!("sub"));
+
+        let result = contextual_search_tool(args, &workspace)
+            .expect("relative path should resolve under workspace_root");
+        let total = result.get("total").and_then(|v| v.as_u64()).unwrap();
+        assert_eq!(total, 1, "expected 1 match for relative path 'sub'");
+    }
+
+    #[test]
+    fn test_contextual_search_default_path_is_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        write_file(&workspace.join("hello.txt"), "the quick brown fox\n");
+
+        let mut args = Map::new();
+        args.insert("pattern".to_string(), json!("fox"));
+        // no path arg
+
+        let result = contextual_search_tool(args, &workspace)
+            .expect("default path should be workspace_root");
+        let total = result.get("total").and_then(|v| v.as_u64()).unwrap();
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn test_contextual_search_accepts_absolute_inside_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let subdir = workspace.join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+        write_file(&subdir.join("hello.txt"), "the quick brown fox\n");
+
+        let mut args = Map::new();
+        args.insert("pattern".to_string(), json!("fox"));
+        args.insert("path".to_string(), json!(subdir.to_string_lossy().to_string()));
+
+        let result = contextual_search_tool(args, &workspace)
+            .expect("absolute path inside workspace should work");
+        let total = result.get("total").and_then(|v| v.as_u64()).unwrap();
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn test_contextual_search_rejects_traversal_via_relative() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let mut args = Map::new();
+        args.insert("pattern".to_string(), json!("anything"));
+        args.insert("path".to_string(), json!(".."));
+
+        let err = contextual_search_tool(args, &workspace)
+            .expect_err("relative `..` traversal must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be within workspace"),
+            "expected workspace-membership error, got: {}", msg
+        );
+    }
+
+    #[test]
+    fn test_contextual_search_rejects_absolute_outside_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+
+        let mut args = Map::new();
+        args.insert("pattern".to_string(), json!("anything"));
+        args.insert("path".to_string(), json!(outside.to_string_lossy().to_string()));
+
+        let err = contextual_search_tool(args, &workspace)
+            .expect_err("absolute path outside workspace must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be within workspace"),
+            "expected workspace-membership error, got: {}", msg
+        );
+    }
+
+    #[test]
+    fn test_contextual_search_rejects_nonexistent_path() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+
+        let mut args = Map::new();
+        args.insert("pattern".to_string(), json!("anything"));
+        args.insert("path".to_string(), json!("does-not-exist"));
+
+        let err = contextual_search_tool(args, &workspace)
+            .expect_err("nonexistent path must error explicitly, not silently return zero hits");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist") || msg.contains("cannot be accessed"),
+            "expected nonexistent-path error, got: {}", msg
+        );
+    }
+
+    // ========================================================================
+    // CULTRA-1070: project_info path resolution (sibling fix to CULTRA-1067)
+    // ========================================================================
+
+    #[test]
+    fn test_project_info_resolves_relative_path() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let subdir = workspace.join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+        write_file(&subdir.join("Cargo.toml"), "[package]\nname=\"sub\"\nversion=\"0.1.0\"\n");
+
+        let mut args = Map::new();
+        args.insert("path".to_string(), json!("sub"));
+
+        let result = project_info_tool_inner(args, &workspace)
+            .expect("relative path should resolve under workspace_root");
+        assert_eq!(result["language"], "rust");
+    }
+
+    #[test]
+    fn test_project_info_rejects_traversal_via_relative() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let mut args = Map::new();
+        args.insert("path".to_string(), json!(".."));
+
+        let err = project_info_tool_inner(args, &workspace)
+            .expect_err("relative `..` traversal must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be within workspace"),
+            "expected workspace-membership error, got: {}", msg
+        );
+    }
+
+    #[test]
+    fn test_project_info_rejects_absolute_outside_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+
+        let mut args = Map::new();
+        args.insert("path".to_string(), json!(outside.to_string_lossy().to_string()));
+
+        let err = project_info_tool_inner(args, &workspace)
+            .expect_err("absolute path outside workspace must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must be within workspace"),
+            "expected workspace-membership error, got: {}", msg
+        );
+    }
+
+    #[test]
+    fn test_project_info_rejects_nonexistent_path() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+
+        let mut args = Map::new();
+        args.insert("path".to_string(), json!("does-not-exist"));
+
+        let err = project_info_tool_inner(args, &workspace)
+            .expect_err("nonexistent path must error explicitly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist") || msg.contains("cannot be accessed"),
+            "expected nonexistent-path error, got: {}", msg
+        );
     }
 }
