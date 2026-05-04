@@ -17,6 +17,9 @@ pub enum TaskType {
     Bug,
     Chore,
     Research,
+    Refactor,
+    Docs,
+    Test,
 }
 
 impl fmt::Display for TaskType {
@@ -26,6 +29,9 @@ impl fmt::Display for TaskType {
             TaskType::Bug => write!(f, "bug"),
             TaskType::Chore => write!(f, "chore"),
             TaskType::Research => write!(f, "research"),
+            TaskType::Refactor => write!(f, "refactor"),
+            TaskType::Docs => write!(f, "docs"),
+            TaskType::Test => write!(f, "test"),
         }
     }
 }
@@ -37,6 +43,9 @@ impl EnumValues for TaskType {
             "bug".to_string(),
             "chore".to_string(),
             "research".to_string(),
+            "refactor".to_string(),
+            "docs".to_string(),
+            "test".to_string(),
         ]
     }
 }

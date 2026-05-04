@@ -757,14 +757,6 @@ export const MyComponent = ({ name }: MyProps) => {
     }
 
     #[test]
-    fn test_hook_dependencies() {
-        let deps = vec!["name".to_string(), "age".to_string()];
-        assert_eq!(deps.len(), 2);
-        assert_eq!(deps[0], "name");
-        assert_eq!(deps[1], "age");
-    }
-
-    #[test]
     fn test_interface_ast_structure() {
         let code = r#"
 interface TaskCardProps {

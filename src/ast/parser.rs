@@ -445,12 +445,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parser_creation() {
-        let _parser = Parser::new();
-        // Parser created successfully
-    }
-
-    #[test]
     fn test_get_tree_sitter_language() {
         let parser = Parser::new();
 
@@ -501,19 +495,20 @@ fn main() {
         assert!(result.is_ok(), "Failed to parse Rust file");
         let file_context = result.unwrap();
 
-        // Verify results
         assert_eq!(file_context.language, LangEnum::Rust);
         assert!(file_context.symbols.len() >= 3, "Should extract at least 3 symbols (struct, trait, impl)");
-        assert!(file_context.imports.len() >= 1, "Should extract at least 1 import");
 
-        // Check for specific symbols
         let has_struct = file_context.symbols.iter().any(|s| s.name == "Calculator" && s.symbol_type == SymbolType::Struct);
         let has_trait = file_context.symbols.iter().any(|s| s.name == "Compute" && s.symbol_type == SymbolType::Interface);
+        let has_main = file_context.symbols.iter().any(|s| s.name == "main" && s.symbol_type == SymbolType::Function);
 
         assert!(has_struct, "Should find Calculator struct");
         assert!(has_trait, "Should find Compute trait");
+        assert!(has_main, "Should find main function");
 
-        // Clean up
+        let has_std_fmt = file_context.imports.iter().any(|i| i.contains("std::fmt"));
+        assert!(has_std_fmt, "Should find `use std::fmt` import, got: {:?}", file_context.imports);
+
         let _ = std::fs::remove_file(test_file);
     }
 

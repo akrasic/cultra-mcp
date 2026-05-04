@@ -123,6 +123,20 @@ pub fn get_tool_definitions() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "get_project_estimate_accuracy".to_string(),
+            description: "Aggregate the actual_days / estimated_days ratio across all tasks in the project where both values are set. Returns {avg_actual_to_estimate_ratio: number|null, sample_size: int}. ratio is null when sample_size is 0 (distinguishes 'no data' from 'perfect estimates' which is 1.0). Useful for scaling future estimates: a ratio of 2.0 means the project's tasks have historically taken twice as long as estimated. Tasks with estimated_days = 0 are excluded (avoid division by zero). No status filter — cancelled tasks with set values still count. (CULTRA-1056)".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project_id": {
+                        "type": "string",
+                        "description": "Project identifier (required)"
+                    }
+                },
+                "required": ["project_id"]
+            }),
+        },
+        Tool {
             name: "get_sessions".to_string(),
             description: "Query sessions for a project with filtering and sorting options".to_string(),
             input_schema: json!({
@@ -247,7 +261,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "save_task".to_string(),
-            description: "Create or update a task. Task ID is auto-generated in PROJECT-NUMBER format (e.g., CULTRA-47). Do not provide task_id.".to_string(),
+            description: "Create or update a task. Task ID is auto-generated in PROJECT-NUMBER format (e.g., CULTRA-47). Do not provide task_id. Optional estimated_days (CULTRA-1054) feeds the project's CPM critical-path computation; in_progress_started_at is auto-stamped on creation when status='in_progress'.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -269,7 +283,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "type": {
                         "type": "string",
-                        "description": "Task type (feature, bug, chore, research)"
+                        "description": "Task type (feature, bug, chore, research, refactor, docs, test)"
                     },
                     "status": {
                         "type": "string",
@@ -304,6 +318,18 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                             "what": {"type": "string"}
                         },
                         "required": ["who", "what"]
+                    },
+                    "estimated_days": {
+                        "type": "number",
+                        "description": "Forward-looking effort estimate in days. Feeds CPM (critical path) and estimate-accuracy aggregates. Optional. Must be >= 0. (CULTRA-1054)"
+                    },
+                    "actual_days": {
+                        "type": "number",
+                        "description": "Realized effort in days. Normally auto-computed when status flips to 'done'; provide explicitly to override (e.g., backfilling historical data). Must be >= 0. (CULTRA-1054)"
+                    },
+                    "in_progress_started_at": {
+                        "type": "string",
+                        "description": "RFC3339 timestamp marking when work began. Normally auto-stamped on the →in_progress transition; provide explicitly when backfilling historical data. (CULTRA-1054)"
                     }
                 },
                 "required": ["project_id", "title"]
@@ -353,7 +379,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "get_execution_waves".to_string(),
-            description: "Return tasks grouped into dependency waves via topological sort (Kahn's algorithm). Wave 0 contains tasks with no in-scope blockers and can run first in parallel; wave 1 depends on wave 0, etc. Exactly one of plan_id or project_id is required. Each task carries has_external_blockers (non-task blockers from CULTRA-903) and has_external_task_deps (blockers in another plan/project or filtered out by status) summary bools — the wave represents readiness within the requested scope. If the graph contains cycles, cycle_detected=true and cycle_members lists the implicated task IDs; repair via task_dependency({action:'remove', ...}). Superseded tasks (superseded_by non-empty) are always excluded. Default status filter includes todo/in_progress/blocked/review; override via include_statuses. Pass include_excluded=true to additionally get a map of done/cancelled/superseded task IDs that were filtered out.".to_string(),
+            description: "Return tasks grouped into dependency waves via topological sort (Kahn's algorithm). Wave 0 contains tasks with no in-scope blockers and can run first in parallel; wave 1 depends on wave 0, etc. Exactly one of plan_id or project_id is required. Each task carries has_external_blockers (non-task blockers from CULTRA-903) and has_external_task_deps (blockers in another plan/project or filtered out by status) summary bools — the wave represents readiness within the requested scope. If the graph contains cycles, cycle_detected=true and cycle_members lists the implicated task IDs; repair via task_dependency({action:'remove', ...}). Superseded tasks (superseded_by non-empty) are always excluded. Default status filter includes todo/in_progress/blocked/review; override via include_statuses. Pass include_excluded=true to additionally get a map of done/cancelled/superseded task IDs that were filtered out. Response always includes next_available (wave[0] task_ids), next_wave_blockers (in-progress wave[0] tasks whose completion unlocks wave 1), and components (connected components of the dependency graph; len>1 means parallel disconnected tracks). Pass format='ascii' to additionally get a server-rendered ASCII wave diagram in the `ascii` field — useful for inlining a plan view in chat or boot context.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -373,13 +399,35 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "include_excluded": {
                         "type": "boolean",
                         "description": "When true, the response includes excluded.{done,cancelled,superseded} arrays of task IDs that were filtered out. Default: false (lean response)."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["ascii"],
+                        "description": "When 'ascii', the response gains an `ascii` field with a server-rendered wave diagram. Omit for the default structured response (back-compatible). (CULTRA-1049/1050)"
+                    },
+                    "width": {
+                        "type": "integer",
+                        "description": "ASCII renderer width in columns. Default: 80. Only used when format='ascii'."
+                    },
+                    "style": {
+                        "type": "string",
+                        "enum": ["unicode", "ascii"],
+                        "description": "ASCII renderer glyph set. 'unicode' (default) uses ✓ ◐ ○ ⊝; 'ascii' uses [X] [/] [ ] [!] for terminals/log files where unicode mojibake is a risk."
+                    },
+                    "with_titles": {
+                        "type": "boolean",
+                        "description": "When true, the ASCII renderer includes task titles inline (one task per line). Default: false (compact wave-per-line format that fits boot context)."
+                    },
+                    "with_handles": {
+                        "type": "boolean",
+                        "description": "When false, drops the T<idx> handle prefix from compact-mode tokens. Default true preserves historical output. (CULTRA-1059)"
                     }
                 }
             }),
         },
         Tool {
             name: "update_task_status".to_string(),
-            description: "Quickly update task status without requiring all parameters".to_string(),
+            description: "Quickly update task status without requiring all parameters. On →in_progress, in_progress_started_at is auto-stamped (preserves existing on re-entry). On →done, actual_days is auto-computed from elapsed in-progress time; pass actual_days to override. (CULTRA-1054)".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -407,6 +455,18 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "if_version": {
                         "type": "integer",
                         "description": "Optimistic concurrency token (CULTRA-904)."
+                    },
+                    "estimated_days": {
+                        "type": "number",
+                        "description": "Set / update the forward-looking estimate alongside the status change. Must be >= 0. (CULTRA-1054)"
+                    },
+                    "actual_days": {
+                        "type": "number",
+                        "description": "Override the auto-computed actual_days. Use when the elapsed in-progress time is wrong (e.g., the task was paused outside the system). Must be >= 0. (CULTRA-1054)"
+                    },
+                    "in_progress_started_at": {
+                        "type": "string",
+                        "description": "RFC3339 timestamp. Override the auto-stamped start time, e.g., when backfilling 'I started this yesterday'. (CULTRA-1054)"
                     }
                 },
                 "required": ["task_id", "status"]
@@ -414,7 +474,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "update_task".to_string(),
-            description: "Update an existing task's content or metadata without requiring all fields".to_string(),
+            description: "Update an existing task's content or metadata without requiring all fields. estimated_days / actual_days / in_progress_started_at follow the same auto-side-effect rules as update_task_status when status flips. (CULTRA-1054)".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -436,7 +496,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "type": {
                         "type": "string",
-                        "description": "New type: feature, bug, chore, research (optional)"
+                        "description": "New type: feature, bug, chore, research, refactor, docs, test (optional)"
                     },
                     "status": {
                         "type": "string",
@@ -484,6 +544,18 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     "if_version": {
                         "type": "integer",
                         "description": "Optimistic concurrency token (CULTRA-904). Include the version you read; if the row has changed since, the update fails with a version conflict and the response includes the current version for retry."
+                    },
+                    "estimated_days": {
+                        "type": "number",
+                        "description": "Set / update the forward-looking estimate. Must be >= 0. (CULTRA-1054)"
+                    },
+                    "actual_days": {
+                        "type": "number",
+                        "description": "Override the auto-computed actual_days. Use when the elapsed in-progress time is wrong (e.g., the task was paused outside the system). Must be >= 0. (CULTRA-1054)"
+                    },
+                    "in_progress_started_at": {
+                        "type": "string",
+                        "description": "RFC3339 timestamp. Override the auto-stamped start time, e.g., when backfilling historical data. (CULTRA-1054)"
                     }
                 },
                 "required": ["task_id"]
@@ -759,7 +831,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         },
         Tool {
             name: "get_plan".to_string(),
-            description: "Get plan overview or full details. Default (detail=\"status\"): tasks with dependencies, progress summary, next available tasks. detail=\"full\": Engine V3 content (problem, goal, approach), all tasks with progress logs, linked documents.".to_string(),
+            description: "Get plan overview, full details, or a rendered ASCII wave diagram. Default (detail=\"status\"): tasks with dependencies, progress summary, next available tasks. detail=\"full\": Engine V3 content (problem, goal, approach), all tasks with progress logs, linked documents. detail=\"ascii\" (CULTRA-1049): server-rendered wave diagram of the plan's execution structure (waves + next_available + next_wave_blockers + components + ascii string) — useful for orienting on plan progress at a glance, especially at session boot. group_by=\"tag\" (CULTRA-1062, only valid with detail=\"status\"): adds a task_groups field to the response — a tag → [task_ids] map for phase-grouped views (multi-tag tasks appear in each group; untagged tasks land in an 'untagged' bucket).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -769,8 +841,30 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "detail": {
                         "type": "string",
-                        "enum": ["status", "full"],
-                        "description": "Detail level: 'status' (default) for overview, 'full' for Engine V3 details with progress logs and linked documents"
+                        "enum": ["status", "full", "ascii"],
+                        "description": "Detail level: 'status' (default) for overview, 'full' for Engine V3 details with progress logs and linked documents, 'ascii' for a rendered wave diagram (CULTRA-1049)."
+                    },
+                    "width": {
+                        "type": "integer",
+                        "description": "ASCII renderer width in columns. Default: 80. Only used when detail='ascii'."
+                    },
+                    "style": {
+                        "type": "string",
+                        "enum": ["unicode", "ascii"],
+                        "description": "ASCII renderer glyph set. 'unicode' (default) uses ✓ ◐ ○ ⊝; 'ascii' uses [X] [/] [ ] [!]."
+                    },
+                    "with_titles": {
+                        "type": "boolean",
+                        "description": "When true, ASCII renderer includes task titles inline. Default: false."
+                    },
+                    "with_handles": {
+                        "type": "boolean",
+                        "description": "When false, drops the T<idx> handle prefix from compact-mode tokens (e.g. '(○ CULTRA-1)' instead of 'T0(○ CULTRA-1)'). Default true preserves historical output. (CULTRA-1059)"
+                    },
+                    "group_by": {
+                        "type": "string",
+                        "enum": ["tag"],
+                        "description": "Group plan tasks by a category. Currently only 'tag' is supported — adds task_groups: {tag: [task_ids]} to the response (multi-tag tasks appear in each of their groups; untagged tasks land in an 'untagged' sentinel). Only valid with detail='status'. (CULTRA-1062)"
                     }
                 },
                 "required": ["plan_id"]
@@ -1879,6 +1973,7 @@ pub fn call_tool(
                 "get_tasks", "search_tasks", "save_task",
                 "get_documents", "save_document", "update_document", "get_plan",
                 "save_plan", "get_plans", "save_decision", "get_decisions",
+                "get_project_estimate_accuracy",
                 "add_graph_edge", "query_graph", "get_graph_neighbors",
                 "query_context", "search_code_context", "unified_search",
                 "recent_activity",
@@ -1916,6 +2011,7 @@ pub fn call_tool(
         "get_plan" => get_plan(server, args),
         "save_decision" => save_decision(server, args),
         "get_decisions" => get_decisions(server, args),
+        "get_project_estimate_accuracy" => get_project_estimate_accuracy(server, args),
         // AST Tools
         "parse_file_ast" => parse_file_ast(server, args),
         "analyze_file" => analyze_file_tool(args, &server.workspace_root),
@@ -2394,6 +2490,20 @@ fn create_project(server: &Server, args: Map<String, Value>) -> Result<Value> {
     api_post(server, "/api/v2/projects", args)
 }
 
+/// Tool implementation: get_project_estimate_accuracy (CULTRA-1056/1057).
+/// Pure passthrough — the Go endpoint does the aggregation. We validate
+/// project_id at the shim layer so the agent gets a fast, clear error
+/// rather than a 400 from the API.
+fn get_project_estimate_accuracy(server: &Server, args: Map<String, Value>) -> Result<Value> {
+    let project_id = args
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Missing required parameter: project_id"))?;
+    validate_id("project_id", project_id)?;
+
+    server.api.get(&format!("/api/v2/projects/{}/estimate-accuracy", project_id), None)
+}
+
 /// Tool implementation: get_tasks
 fn get_tasks(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
     // CULTRA-939: status now accepts either a single string (legacy, normalized
@@ -2773,7 +2883,9 @@ fn get_plans(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
     )
 }
 
-/// Tool implementation: get_plan (consolidated from get_plan_status + get_plan_details)
+/// Tool implementation: get_plan (consolidated from get_plan_status + get_plan_details).
+/// CULTRA-1049/1050 added detail="ascii" → /plans/:id/ascii with optional
+/// width / style / with_titles render-knob passthrough.
 fn get_plan(server: &Server, args: Map<String, Value>) -> Result<Value> {
     let plan_id = args
         .get("plan_id")
@@ -2785,10 +2897,99 @@ fn get_plan(server: &Server, args: Map<String, Value>) -> Result<Value> {
     let endpoint = match detail {
         "status" => format!("/api/v2/plans/{}/status", plan_id),
         "full" => format!("/api/v2/plans/{}/details", plan_id),
-        other => return Err(anyhow!("Invalid detail value '{}'. Must be 'status' or 'full'", other)),
+        "ascii" => format!("/api/v2/plans/{}/ascii", plan_id),
+        other => return Err(anyhow!(
+            "Invalid detail value '{}'. Must be 'status', 'full', or 'ascii'", other
+        )),
     };
 
-    server.api.get(&endpoint, None)
+    // Render knobs are only meaningful for detail='ascii'. We could silently
+    // drop them when detail!='ascii', but failing loudly catches a broader
+    // class of mistakes (e.g. agent typed detail='status' when it meant
+    // 'ascii' but supplied with_titles=true). Cheap insurance.
+    let render_query = build_plan_render_query(&args, detail)?;
+    let query = if render_query.is_empty() { None } else { Some(render_query) };
+    server.api.get(&endpoint, query)
+}
+
+/// Validate and collect query-string params for the /plans/:id/* endpoints.
+/// Two clusters of params are gated by `detail`:
+///
+///   - Render knobs (width/style/with_titles): only valid when detail='ascii'
+///   - group_by: only valid when detail='status' (CULTRA-1062)
+///
+/// The function name dates to when it only handled render knobs; left as-is
+/// to keep the existing test surface stable.
+///
+/// Returns an empty vec when the caller supplied no extra params. Mirrors
+/// the validation used by execution_waves.rs::build_waves_query_params so
+/// the two entry points reject the same shape of bad inputs.
+fn build_plan_render_query(args: &Map<String, Value>, detail: &str) -> Result<Vec<(String, String)>> {
+    let has_render_knob = args.contains_key("width")
+        || args.contains_key("style")
+        || args.contains_key("with_titles");
+
+    if has_render_knob && detail != "ascii" {
+        return Err(anyhow!(
+            "width / style / with_titles only apply when detail='ascii' (got detail='{}')",
+            detail
+        ));
+    }
+
+    let has_group_by = args.contains_key("group_by");
+    if has_group_by && detail != "status" {
+        return Err(anyhow!(
+            "group_by only applies when detail='status' (got detail='{}')",
+            detail
+        ));
+    }
+
+    let mut out: Vec<(String, String)> = vec![];
+
+    if let Some(w) = args.get("width") {
+        let n = w
+            .as_u64()
+            .ok_or_else(|| anyhow!("width must be a positive integer"))?;
+        if n == 0 {
+            return Err(anyhow!("width must be > 0"));
+        }
+        out.push(("width".to_string(), n.to_string()));
+    }
+
+    if let Some(s) = args.get("style").and_then(|v| v.as_str()) {
+        if s != "unicode" && s != "ascii" {
+            return Err(anyhow!(
+                "invalid style '{}'. Must be 'unicode' or 'ascii'", s
+            ));
+        }
+        out.push(("style".to_string(), s.to_string()));
+    }
+
+    if let Some(flag) = args.get("with_titles").and_then(|v| v.as_bool()) {
+        if flag {
+            out.push(("with_titles".to_string(), "true".to_string()));
+        }
+    }
+
+    // CULTRA-1059: with_handles=false drops T-handles. Default (absent or
+    // true) preserves historical output, so we only emit the param when
+    // explicitly false.
+    if let Some(flag) = args.get("with_handles").and_then(|v| v.as_bool()) {
+        if !flag {
+            out.push(("with_handles".to_string(), "false".to_string()));
+        }
+    }
+
+    if let Some(g) = args.get("group_by").and_then(|v| v.as_str()) {
+        if g != "tag" {
+            return Err(anyhow!(
+                "invalid group_by '{}'. Must be 'tag' (only supported value for v1)", g
+            ));
+        }
+        out.push(("group_by".to_string(), g.to_string()));
+    }
+
+    Ok(out)
 }
 
 /// Tool implementation: save_decision
@@ -7154,5 +7355,133 @@ pub async fn run() {
             let obj = entry.as_object().unwrap();
             assert!(!obj.contains_key("callers"));
         }
+    }
+
+    // CULTRA-1050: get_plan(detail='ascii') render-knob passthrough
+    // (build_plan_render_query is a pure function — testing it without
+    // spinning up the API client mirrors the execution_waves.rs pattern).
+
+    #[test]
+    fn test_build_plan_render_query_empty_when_no_knobs() {
+        let args = Map::new();
+        let q = build_plan_render_query(&args, "status").unwrap();
+        assert!(q.is_empty(), "no knobs + no detail=ascii should yield empty query, got {:?}", q);
+    }
+
+    #[test]
+    fn test_build_plan_render_query_passes_through_when_ascii() {
+        let mut args = Map::new();
+        args.insert("width".to_string(), json!(120));
+        args.insert("style".to_string(), json!("ascii"));
+        args.insert("with_titles".to_string(), json!(true));
+        let q = build_plan_render_query(&args, "ascii").unwrap();
+
+        let lookup = |key: &str| -> String {
+            q.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("expected {} in {:?}", key, q))
+        };
+        assert_eq!(lookup("width"), "120");
+        assert_eq!(lookup("style"), "ascii");
+        assert_eq!(lookup("with_titles"), "true");
+    }
+
+    #[test]
+    fn test_build_plan_render_query_rejects_render_knobs_with_non_ascii_detail() {
+        // Catches the agent typing detail='status' but supplying with_titles —
+        // the knobs would have been silently dropped. Loud failure is better.
+        let mut args = Map::new();
+        args.insert("with_titles".to_string(), json!(true));
+        let err = build_plan_render_query(&args, "status").unwrap_err();
+        assert!(err.to_string().contains("only apply when detail='ascii'"),
+            "expected detail-mismatch error, got: {}", err);
+    }
+
+    #[test]
+    fn test_build_plan_render_query_rejects_zero_width() {
+        let mut args = Map::new();
+        args.insert("width".to_string(), json!(0));
+        let err = build_plan_render_query(&args, "ascii").unwrap_err();
+        assert!(err.to_string().contains("width"),
+            "expected width error, got: {}", err);
+    }
+
+    #[test]
+    fn test_build_plan_render_query_rejects_unknown_style() {
+        let mut args = Map::new();
+        args.insert("style".to_string(), json!("bold"));
+        let err = build_plan_render_query(&args, "ascii").unwrap_err();
+        assert!(err.to_string().contains("style"),
+            "expected style error, got: {}", err);
+    }
+
+    #[test]
+    fn test_build_plan_render_query_drops_with_titles_when_false() {
+        let mut args = Map::new();
+        args.insert("with_titles".to_string(), json!(false));
+        let q = build_plan_render_query(&args, "ascii").unwrap();
+        assert!(q.iter().all(|(k, _)| k != "with_titles"),
+            "with_titles=false should be omitted, got {:?}", q);
+    }
+
+    // CULTRA-1057: get_project_estimate_accuracy shim. We can't test the HTTP
+    // call without a live server; what we can test cheaply is the
+    // missing-arg / invalid-arg validation paths the impl runs before the
+    // network call.
+
+    #[test]
+    fn test_get_project_estimate_accuracy_rejects_missing_project_id() {
+        let server = test_server();
+        let err = get_project_estimate_accuracy(&server, Map::new()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("project_id"),
+            "expected error naming project_id, got: {}", msg);
+    }
+
+    #[test]
+    fn test_get_project_estimate_accuracy_rejects_invalid_project_id() {
+        // validate_id rejects non-id-shaped strings (e.g., spaces). The shim
+        // catches this before issuing the HTTP call so the agent sees a
+        // clearer error than a 400 from the API.
+        let server = test_server();
+        let mut args = Map::new();
+        args.insert("project_id".to_string(), json!("not a valid id"));
+        let err = get_project_estimate_accuracy(&server, args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("project_id"),
+            "expected error naming project_id, got: {}", msg);
+    }
+
+    // CULTRA-1063: get_plan(group_by) shim validation. Mirrors the
+    // build_plan_render_query test pattern.
+
+    #[test]
+    fn test_build_plan_render_query_passes_through_group_by_with_status() {
+        let mut args = Map::new();
+        args.insert("group_by".to_string(), json!("tag"));
+        let q = build_plan_render_query(&args, "status").unwrap();
+        let group_by = q.iter().find(|(k, _)| k == "group_by")
+            .expect("group_by should pass through");
+        assert_eq!(group_by.1, "tag");
+    }
+
+    #[test]
+    fn test_build_plan_render_query_rejects_unknown_group_by() {
+        let mut args = Map::new();
+        args.insert("group_by".to_string(), json!("status"));
+        let err = build_plan_render_query(&args, "status").unwrap_err();
+        assert!(err.to_string().contains("group_by"),
+            "expected error naming group_by, got: {}", err);
+    }
+
+    #[test]
+    fn test_build_plan_render_query_rejects_group_by_with_non_status_detail() {
+        // Catches the agent typing detail='ascii' but supplying group_by — the
+        // grouping would be silently dropped at the backend. Loud failure is
+        // better.
+        let mut args = Map::new();
+        args.insert("group_by".to_string(), json!("tag"));
+        let err = build_plan_render_query(&args, "ascii").unwrap_err();
+        assert!(err.to_string().contains("only applies when detail='status'"),
+            "expected detail-mismatch error, got: {}", err);
     }
 }
