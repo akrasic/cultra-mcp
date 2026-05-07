@@ -1,14 +1,7 @@
-mod ast;
-mod lsp;
-mod mcp;
-mod api_client;
-mod config;
-mod workspace;
-
 use anyhow::Result;
+use cultra_mcp::{api_client, config, lsp, mcp};
 use std::env;
 use std::io::{self, BufRead, BufReader, Write};
-use tracing_subscriber;
 
 #[derive(Debug, Clone, Copy)]
 enum TransportMode {
@@ -60,10 +53,7 @@ fn parse_transport_value(value: &str) -> TransportMode {
         "framed" => TransportMode::Framed,
         "line" => TransportMode::Line,
         other => {
-            tracing::warn!(
-                "Unknown transport mode '{}', defaulting to auto",
-                other
-            );
+            tracing::warn!("Unknown transport mode '{}', defaulting to auto", other);
             TransportMode::Auto
         }
     }
@@ -142,7 +132,10 @@ fn read_framed_message<R: BufRead>(reader: &mut R) -> io::Result<Option<String>>
     if len > MAX_MESSAGE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Content-Length {} exceeds maximum of {} bytes", len, MAX_MESSAGE_SIZE),
+            format!(
+                "Content-Length {} exceeds maximum of {} bytes",
+                len, MAX_MESSAGE_SIZE
+            ),
         ));
     }
 
@@ -184,16 +177,17 @@ fn main() -> Result<()> {
     tracing::info!("API URL: {}", config.api.base_url);
 
     // Initialize API client
-    let api_client = api_client::APIClient::new(
-        config.api.base_url.clone(),
-        config.api.key.clone(),
-    )?;
+    let api_client =
+        api_client::APIClient::new(config.api.base_url.clone(), config.api.key.clone())?;
     tracing::info!("API client initialized");
 
     // Initialize LSP manager with current working directory
     let workspace_root = std::env::current_dir()?;
     let lsp_manager = lsp::LSPManager::new(&workspace_root);
-    tracing::info!("LSP manager initialized for workspace: {:?}", workspace_root);
+    tracing::info!(
+        "LSP manager initialized for workspace: {:?}",
+        workspace_root
+    );
 
     // Detect default project_id from CLAUDE.md
     let default_project = config::detect_project_id(&workspace_root);
@@ -202,8 +196,8 @@ fn main() -> Result<()> {
     }
 
     // Create MCP server
-    let mut server = mcp::Server::new(api_client, lsp_manager)
-        .with_default_project(default_project);
+    let mut server =
+        mcp::Server::new(api_client, lsp_manager).with_default_project(default_project);
     let selected_transport = parse_transport_mode();
     tracing::info!("Transport mode: {:?}", selected_transport);
 

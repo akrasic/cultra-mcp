@@ -6,6 +6,11 @@ use tree_sitter::{Query, QueryCursor};
 
 use streaming_iterator::StreamingIterator;
 
+/// Map from receiver type name to its method names.
+type TypeMethodMap = HashMap<String, Vec<String>>;
+/// Map from receiver type name to a "line" or "start-end" location string.
+type TypeLocationMap = HashMap<String, String>;
+
 /// Complete interface implementation analysis for Go
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceAnalysis {
@@ -42,7 +47,7 @@ pub struct Param {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplementationInfo {
     pub type_name: String,
-    pub implements: Vec<String>,        // Fully implemented interfaces
+    pub implements: Vec<String>,         // Fully implemented interfaces
     pub partial_implements: Vec<String>, // Partially implemented interfaces
     pub methods: Vec<String>,            // Method names on this type
     pub missing_methods: HashMap<String, Vec<String>>, // Interface -> missing method names
@@ -60,7 +65,8 @@ pub fn find_interface_implementations(
 
     // Parse with tree-sitter
     let mut parser = tree_sitter::Parser::new();
-    let lang = tree_sitter_go::LANGUAGE.into(); parser.set_language(&lang)?;
+    let lang = tree_sitter_go::LANGUAGE.into();
+    parser.set_language(&lang)?;
 
     let tree = parser
         .parse(&content, None)
@@ -87,10 +93,7 @@ pub fn find_interface_implementations(
 }
 
 /// Extract all interface definitions
-fn extract_interfaces(
-    root_node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<InterfaceInfo>> {
+fn extract_interfaces(root_node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<InterfaceInfo>> {
     let mut interfaces = Vec::new();
 
     let query_source = r#"
@@ -125,19 +128,22 @@ fn extract_interfaces(
             }
         }
 
-        if !interface_name.is_empty() && interface_node.is_some() {
-            let methods = if let Some(type_node) = interface_type_node {
-                extract_interface_methods(&type_node, content)?
-            } else {
-                Vec::new()
-            };
-
-            interfaces.push(InterfaceInfo {
-                name: interface_name,
-                methods,
-                location: format_location(&interface_node.unwrap()),
-            });
+        if interface_name.is_empty() {
+            continue;
         }
+        let Some(node) = interface_node else { continue };
+
+        let methods = if let Some(type_node) = interface_type_node {
+            extract_interface_methods(&type_node, content)?
+        } else {
+            Vec::new()
+        };
+
+        interfaces.push(InterfaceInfo {
+            name: interface_name,
+            methods,
+            location: format_location(&node),
+        });
     }
 
     Ok(interfaces)
@@ -174,11 +180,9 @@ fn extract_interface_methods(
                                 returns = elem_child.utf8_text(content)?.to_string();
                             }
                         }
-                        "type_identifier" | "qualified_type" => {
+                        "type_identifier" | "qualified_type" if returns.is_empty() => {
                             // Single return type (no parens)
-                            if returns.is_empty() {
-                                returns = elem_child.utf8_text(content)?.to_string();
-                            }
+                            returns = elem_child.utf8_text(content)?.to_string();
                         }
                         _ => {}
                     }
@@ -199,10 +203,7 @@ fn extract_interface_methods(
 }
 
 /// Extract parameters from a parameter_list node
-fn extract_parameters(
-    param_list_node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<Param>> {
+fn extract_parameters(param_list_node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Param>> {
     let mut params = Vec::new();
 
     for i in 0..param_list_node.child_count() {
@@ -220,8 +221,8 @@ fn extract_parameters(
                         "identifier" => {
                             param_name = param_child.utf8_text(content)?.to_string();
                         }
-                        "type_identifier" | "pointer_type" | "slice_type"
-                        | "array_type" | "qualified_type" => {
+                        "type_identifier" | "pointer_type" | "slice_type" | "array_type"
+                        | "qualified_type" => {
                             param_type = param_child.utf8_text(content)?.to_string();
                         }
                         _ => {}
@@ -273,7 +274,9 @@ fn extract_implementations(
             } else if missing.len() < iface.methods.len() {
                 // Partially implements (has some methods but not all)
                 impl_info.partial_implements.push(iface.name.clone());
-                impl_info.missing_methods.insert(iface.name.clone(), missing);
+                impl_info
+                    .missing_methods
+                    .insert(iface.name.clone(), missing);
             }
         }
 
@@ -287,9 +290,9 @@ fn extract_implementations(
 fn extract_type_methods(
     root_node: &tree_sitter::Node,
     content: &[u8],
-) -> Result<(HashMap<String, Vec<String>>, HashMap<String, String>)> {
-    let mut type_method_map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut type_locations: HashMap<String, String> = HashMap::new();
+) -> Result<(TypeMethodMap, TypeLocationMap)> {
+    let mut type_method_map: TypeMethodMap = HashMap::new();
+    let mut type_locations: TypeLocationMap = HashMap::new();
 
     let query_source = r#"
     (method_declaration
@@ -329,13 +332,13 @@ fn extract_type_methods(
         if !receiver_type.is_empty() && !method_name.is_empty() {
             type_method_map
                 .entry(receiver_type.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(method_name);
 
-            if !type_locations.contains_key(&receiver_type) {
-                if let Some(node) = method_node {
-                    type_locations.insert(receiver_type, format_location(&node));
-                }
+            if let Some(node) = method_node {
+                type_locations
+                    .entry(receiver_type)
+                    .or_insert_with(|| format_location(&node));
             }
         }
     }
@@ -438,10 +441,7 @@ func (p *PartialStorage) Set(key string, value string) error {
         assert_eq!(analysis.interfaces.len(), 2, "Should find 2 interfaces");
 
         // Verify Storage interface
-        let storage_interface = analysis
-            .interfaces
-            .iter()
-            .find(|i| i.name == "Storage");
+        let storage_interface = analysis.interfaces.iter().find(|i| i.name == "Storage");
         assert!(storage_interface.is_some(), "Should find Storage interface");
 
         let storage = storage_interface.unwrap();
@@ -451,7 +451,10 @@ func (p *PartialStorage) Set(key string, value string) error {
         let method_names: Vec<_> = storage.methods.iter().map(|m| m.name.as_str()).collect();
         assert!(method_names.contains(&"Get"), "Should have Get method");
         assert!(method_names.contains(&"Set"), "Should have Set method");
-        assert!(method_names.contains(&"Delete"), "Should have Delete method");
+        assert!(
+            method_names.contains(&"Delete"),
+            "Should have Delete method"
+        );
 
         // Verify implementations
         let memory_storage = analysis
@@ -485,7 +488,10 @@ func (p *PartialStorage) Set(key string, value string) error {
 
         let missing_methods = missing.unwrap();
         assert_eq!(missing_methods.len(), 1, "Should be missing 1 method");
-        assert_eq!(missing_methods[0], "Delete", "Should be missing Delete method");
+        assert_eq!(
+            missing_methods[0], "Delete",
+            "Should be missing Delete method"
+        );
 
         // Clean up
         let _ = std::fs::remove_file(test_file);
@@ -524,7 +530,11 @@ func (f *File) Write(s string) {
         assert!(result.is_ok());
 
         let analysis = result.unwrap();
-        assert_eq!(analysis.interfaces.len(), 1, "Should find only Reader interface");
+        assert_eq!(
+            analysis.interfaces.len(),
+            1,
+            "Should find only Reader interface"
+        );
         assert_eq!(analysis.interfaces[0].name, "Reader");
 
         // File should fully implement Reader
@@ -533,7 +543,10 @@ func (f *File) Write(s string) {
             .iter()
             .find(|i| i.type_name == "File");
         assert!(file_impl.is_some());
-        assert!(file_impl.unwrap().implements.contains(&"Reader".to_string()));
+        assert!(file_impl
+            .unwrap()
+            .implements
+            .contains(&"Reader".to_string()));
 
         let _ = std::fs::remove_file(test_file);
     }
@@ -574,7 +587,8 @@ type Storage interface {
 }
 "#;
         let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_go::LANGUAGE.into(); parser.set_language(&lang).unwrap();
+        let lang = tree_sitter_go::LANGUAGE.into();
+        parser.set_language(&lang).unwrap();
         let tree = parser.parse(code, None).unwrap();
         let root = tree.root_node();
 

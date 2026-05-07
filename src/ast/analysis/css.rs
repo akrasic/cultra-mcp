@@ -104,7 +104,7 @@ pub struct UnusedSelector {
 #[derive(Debug, Clone, PartialEq)]
 enum BlockType {
     Rule,
-    Media(String),   // condition
+    Media(String),     // condition
     Keyframes(String), // name
     FontFace,
     Other,
@@ -166,7 +166,11 @@ pub fn analyze_css(file_path: &str) -> Result<CssAnalysis> {
     }
 
     let total_rules = state.rules.len()
-        + state.media_queries.iter().map(|m| m.rules.len()).sum::<usize>();
+        + state
+            .media_queries
+            .iter()
+            .map(|m| m.rules.len())
+            .sum::<usize>();
 
     let stats = CssStats {
         total_rules,
@@ -195,14 +199,22 @@ pub fn find_css_rules(file_path: &str, selector_pattern: &str) -> Result<Vec<Css
     let mut matches = Vec::new();
 
     for rule in &analysis.rules {
-        if rule.selectors.iter().any(|s| s.to_lowercase().contains(&pattern_lower)) {
+        if rule
+            .selectors
+            .iter()
+            .any(|s| s.to_lowercase().contains(&pattern_lower))
+        {
             matches.push(rule.clone());
         }
     }
 
     for mq in &analysis.media_queries {
         for rule in &mq.rules {
-            if rule.selectors.iter().any(|s| s.to_lowercase().contains(&pattern_lower)) {
+            if rule
+                .selectors
+                .iter()
+                .any(|s| s.to_lowercase().contains(&pattern_lower))
+            {
                 matches.push(rule.clone());
             }
         }
@@ -212,7 +224,10 @@ pub fn find_css_rules(file_path: &str, selector_pattern: &str) -> Result<Vec<Css
 }
 
 /// Find CSS selectors not referenced in component files
-pub fn find_unused_selectors(css_path: &str, component_paths: &[&str]) -> Result<Vec<UnusedSelector>> {
+pub fn find_unused_selectors(
+    css_path: &str,
+    component_paths: &[&str],
+) -> Result<Vec<UnusedSelector>> {
     let analysis = analyze_css(css_path)?;
 
     // Read all component files into one big string for searching
@@ -265,7 +280,9 @@ fn parse_line(state: &mut ParserState, line: &str, line_num: usize) {
                 state.in_comment = false;
                 let target = bp + end + 2;
                 while let Some(&(b, _)) = chars.peek() {
-                    if b >= target { break; }
+                    if b >= target {
+                        break;
+                    }
                     chars.next();
                 }
                 continue;
@@ -280,7 +297,9 @@ fn parse_line(state: &mut ParserState, line: &str, line_num: usize) {
                 // Single-line comment — skip past it
                 let target = bp + end + 4;
                 while let Some(&(b, _)) = chars.peek() {
-                    if b >= target { break; }
+                    if b >= target {
+                        break;
+                    }
                     chars.next();
                 }
                 continue;
@@ -309,11 +328,9 @@ fn parse_line(state: &mut ParserState, line: &str, line_num: usize) {
                 };
 
                 let block_type = classify_block(&selector_text);
-                let parent_ctx = state.block_stack.last().and_then(|b| {
-                    match &b.block_type {
-                        BlockType::Media(cond) => Some(format!("@media {}", cond)),
-                        _ => None,
-                    }
+                let parent_ctx = state.block_stack.last().and_then(|b| match &b.block_type {
+                    BlockType::Media(cond) => Some(format!("@media {}", cond)),
+                    _ => None,
                 });
 
                 let selectors = if matches!(block_type, BlockType::Rule) {
@@ -389,16 +406,22 @@ fn parse_line(state: &mut ParserState, line: &str, line_num: usize) {
     }
 
     // If we're not inside a block, add space between lines for multi-line selectors
-    if state.brace_depth == 0 && !state.selector_buf.is_empty() && !state.selector_buf.ends_with(' ') {
+    if state.brace_depth == 0
+        && !state.selector_buf.is_empty()
+        && !state.selector_buf.ends_with(' ')
+    {
         state.selector_buf.push(' ');
     }
-
 }
 
 fn classify_block(selector: &str) -> BlockType {
     let trimmed = selector.trim();
     if trimmed.starts_with("@media") {
-        let cond = trimmed.strip_prefix("@media").unwrap_or("").trim().to_string();
+        let cond = trimmed
+            .strip_prefix("@media")
+            .unwrap_or("")
+            .trim()
+            .to_string();
         BlockType::Media(cond)
     } else if trimmed.starts_with("@keyframes") || trimmed.starts_with("@-webkit-keyframes") {
         let name = trimmed
@@ -556,11 +579,9 @@ fn compute_specificity(selector: &str) -> Specificity {
             continue;
         }
         // Extract the base element name (before any class, id, attr, or pseudo)
-        let base = token
-            .split(|c: char| c == '.' || c == '#' || c == '[' || c == ':')
-            .next()
-            .unwrap_or("");
-        if !base.is_empty() && base != "*" && base.chars().next().map_or(false, |c| c.is_alphabetic()) {
+        let base = token.split(['.', '#', '[', ':']).next().unwrap_or("");
+        if !base.is_empty() && base != "*" && base.chars().next().is_some_and(|c| c.is_alphabetic())
+        {
             elements = elements.saturating_add(1);
         }
     }
@@ -679,11 +700,8 @@ pub fn css_variable_graph(file_path: &str) -> Result<CssVariableGraph> {
     let analysis = analyze_css(file_path)?;
 
     // Build a set of all defined variable names
-    let defined: std::collections::HashSet<String> = analysis
-        .variables
-        .iter()
-        .map(|v| v.name.clone())
-        .collect();
+    let defined: std::collections::HashSet<String> =
+        analysis.variables.iter().map(|v| v.name.clone()).collect();
 
     // Build nodes with dependency info
     let mut nodes: Vec<VariableNode> = Vec::new();
@@ -812,10 +830,7 @@ pub fn extract_var_references(value: &str) -> Vec<String> {
 }
 
 /// Detect cycles using DFS with 3-color marking (white=0, gray=1, black=2)
-fn detect_cycles(
-    nodes: &[VariableNode],
-    name_to_idx: &HashMap<String, usize>,
-) -> Vec<Vec<String>> {
+fn detect_cycles(nodes: &[VariableNode], name_to_idx: &HashMap<String, usize>) -> Vec<Vec<String>> {
     let n = nodes.len();
     let mut color = vec![0u8; n]; // 0=white, 1=gray, 2=black
     let mut path: Vec<usize> = Vec::new();
@@ -823,7 +838,14 @@ fn detect_cycles(
 
     for start in 0..n {
         if color[start] == 0 {
-            dfs_cycle(start, nodes, name_to_idx, &mut color, &mut path, &mut cycles);
+            dfs_cycle(
+                start,
+                nodes,
+                name_to_idx,
+                &mut color,
+                &mut path,
+                &mut cycles,
+            );
         }
     }
 
@@ -1260,9 +1282,8 @@ export function App() {
         assert!(graph.leaves.contains(&"--btn-bg".to_string()));
 
         // Check edges
-        let has_edge = |from: &str, to: &str| {
-            graph.edges.iter().any(|e| e.from == from && e.to == to)
-        };
+        let has_edge =
+            |from: &str, to: &str| graph.edges.iter().any(|e| e.from == from && e.to == to);
         assert!(has_edge("--primary", "--base"));
         assert!(has_edge("--btn-bg", "--primary"));
 
@@ -1396,7 +1417,11 @@ export function App() {
         let path = write_temp_css("test_vargraph_scoped.css", css);
         let graph = css_variable_graph(&path).unwrap();
 
-        let card_node = graph.variables.iter().find(|n| n.name == "--card-bg").unwrap();
+        let card_node = graph
+            .variables
+            .iter()
+            .find(|n| n.name == "--card-bg")
+            .unwrap();
         assert_eq!(card_node.scope, ".card");
         assert_eq!(card_node.depends_on, vec!["--global"]);
 

@@ -95,7 +95,8 @@ impl LSPClient {
     /// launch the language server.
     pub fn new(language: &str, workspace_root: &Path) -> Result<Self> {
         let (binary, args) = Self::get_server_command(language)?;
-        let (final_binary, final_args) = Self::maybe_wrap_with_runner(language, &binary, args, workspace_root);
+        let (final_binary, final_args) =
+            Self::maybe_wrap_with_runner(language, &binary, args, workspace_root);
         let resolved_binary = Self::resolve_binary(&final_binary, workspace_root);
 
         tracing::debug!(
@@ -112,16 +113,20 @@ impl LSPClient {
             .current_dir(workspace_root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())  // Suppress LSP server logs for now
+            .stderr(Stdio::null()) // Suppress LSP server logs for now
             .spawn()
             .map_err(|e| {
                 let mut msg = format!("{} {:?}: {}", resolved_binary, final_args, e);
                 // CULTRA-975: add install hints when the binary isn't found.
                 if e.kind() == std::io::ErrorKind::NotFound {
                     let hint = match language {
-                        "python" => "Install with: pip install pyright (or: npm install -g pyright)",
+                        "python" => {
+                            "Install with: pip install pyright (or: npm install -g pyright)"
+                        }
                         "svelte" => "Install with: npm install -g svelte-language-server",
-                        "typescript" | "javascript" => "Install with: npm install -g typescript-language-server typescript",
+                        "typescript" | "javascript" => {
+                            "Install with: npm install -g typescript-language-server typescript"
+                        }
                         "rust" => "Install with: rustup component add rust-analyzer",
                         "go" => "Install with: go install golang.org/x/tools/gopls@latest",
                         _ => "Ensure the language server binary is in your PATH",
@@ -175,7 +180,10 @@ impl LSPClient {
                 "typescript-language-server".to_string(),
                 vec!["--stdio".to_string()],
             )),
-            "python" => Ok(("pyright-langserver".to_string(), vec!["--stdio".to_string()])),
+            "python" => Ok((
+                "pyright-langserver".to_string(),
+                vec!["--stdio".to_string()],
+            )),
             // CULTRA-972: svelte-language-server exposes a `svelteserver` binary
             // that speaks LSP over stdio, same pattern as typescript-language-server.
             "svelte" => Ok(("svelteserver".to_string(), vec!["--stdio".to_string()])),
@@ -203,7 +211,10 @@ impl LSPClient {
             if workspace_root.join("uv.lock").exists() {
                 let mut runner_args = vec!["run".to_string(), binary.to_string()];
                 runner_args.extend(args);
-                tracing::info!("Detected uv.lock — using `uv run {}` for Python LSP", binary);
+                tracing::info!(
+                    "Detected uv.lock — using `uv run {}` for Python LSP",
+                    binary
+                );
                 return ("uv".to_string(), runner_args);
             }
 
@@ -211,7 +222,10 @@ impl LSPClient {
             if workspace_root.join("Pipfile.lock").exists() {
                 let mut runner_args = vec!["run".to_string(), binary.to_string()];
                 runner_args.extend(args);
-                tracing::info!("Detected Pipfile.lock — using `pipenv run {}` for Python LSP", binary);
+                tracing::info!(
+                    "Detected Pipfile.lock — using `pipenv run {}` for Python LSP",
+                    binary
+                );
                 return ("pipenv".to_string(), runner_args);
             }
         }
@@ -260,7 +274,10 @@ impl LSPClient {
         }
 
         // Check node_modules/.bin (for typescript-language-server, pyright, etc.)
-        let node_candidate = workspace_root.join("node_modules").join(".bin").join(binary);
+        let node_candidate = workspace_root
+            .join("node_modules")
+            .join(".bin")
+            .join(binary);
         if node_candidate.exists() {
             tracing::debug!("Found {} in node_modules: {:?}", binary, node_candidate);
             return node_candidate.to_string_lossy().into_owned();
@@ -297,13 +314,19 @@ impl LSPClient {
             params: Some(json!(params)),
         };
         let request_json = serde_json::to_string(&request)?;
-        write!(self.stdin, "Content-Length: {}\r\n\r\n{}", request_json.len(), request_json)?;
+        write!(
+            self.stdin,
+            "Content-Length: {}\r\n\r\n{}",
+            request_json.len(),
+            request_json
+        )?;
         self.stdin.flush()?;
 
         // Use longer timeout for initialization (pyright may index entire project)
         let response_value = self.read_response_with_timeout(id, INIT_TIMEOUT)?;
-        let result: InitializeResult = serde_json::from_value(response_value)
-            .map_err(|e| LSPError::InvalidResponse(format!("Failed to parse initialize result: {}", e)))?;
+        let result: InitializeResult = serde_json::from_value(response_value).map_err(|e| {
+            LSPError::InvalidResponse(format!("Failed to parse initialize result: {}", e))
+        })?;
 
         // Send initialized notification
         self.send_notification("initialized", Some(json!({})))?;
@@ -326,11 +349,10 @@ impl LSPClient {
             return Ok(());
         }
 
-        let content = std::fs::read_to_string(file_path)
-            .map_err(|e| LSPError::IoError(e))?;
+        let content = std::fs::read_to_string(file_path).map_err(LSPError::IoError)?;
 
-        let language_id = super::client::detect_language(file_path)
-            .unwrap_or_else(|_| "plaintext".to_string());
+        let language_id =
+            super::client::detect_language(file_path).unwrap_or_else(|_| "plaintext".to_string());
 
         self.send_notification(
             "textDocument/didOpen",
@@ -345,7 +367,11 @@ impl LSPClient {
         )?;
 
         self.opened_documents.insert(canonical_str.clone());
-        tracing::debug!("Sent didOpen for: {} (canonical: {})", file_path, canonical_str);
+        tracing::debug!(
+            "Sent didOpen for: {} (canonical: {})",
+            file_path,
+            canonical_str
+        );
         Ok(())
     }
 
@@ -405,7 +431,10 @@ impl LSPClient {
     /// The `alive` flag is set to `false` when the thread exits (server crash, EOF,
     /// or receiver dropped), allowing `read_response_with_timeout` to detect a dead
     /// reader immediately instead of blocking for the full timeout.
-    fn spawn_stdout_reader(stdout: ChildStdout, alive: Arc<AtomicBool>) -> mpsc::Receiver<StdoutMessage> {
+    fn spawn_stdout_reader(
+        stdout: ChildStdout,
+        alive: Arc<AtomicBool>,
+    ) -> mpsc::Receiver<StdoutMessage> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -428,10 +457,16 @@ impl LSPClient {
     }
 
     /// Read a single LSP message (Content-Length header + body) from a buffered reader.
-    fn read_one_message(reader: &mut BufReader<ChildStdout>) -> std::result::Result<String, String> {
+    fn read_one_message(
+        reader: &mut BufReader<ChildStdout>,
+    ) -> std::result::Result<String, String> {
         loop {
             let mut header = String::new();
-            if reader.read_line(&mut header).map_err(|e| format!("stdout read error: {}", e))? == 0 {
+            if reader
+                .read_line(&mut header)
+                .map_err(|e| format!("stdout read error: {}", e))?
+                == 0
+            {
                 return Err("LSP server closed stdout (EOF)".to_string());
             }
 
@@ -460,7 +495,9 @@ impl LSPClient {
             // Skip remaining headers until blank line separating headers from body
             loop {
                 let mut header_line = String::new();
-                reader.read_line(&mut header_line).map_err(|e| format!("stdout read error: {}", e))?;
+                reader
+                    .read_line(&mut header_line)
+                    .map_err(|e| format!("stdout read error: {}", e))?;
                 if header_line.trim().is_empty() {
                     break;
                 }
@@ -471,7 +508,8 @@ impl LSPClient {
             std::io::Read::read_exact(reader, &mut content)
                 .map_err(|e| format!("stdout read error: {}", e))?;
 
-            return String::from_utf8(content).map_err(|e| format!("Invalid UTF-8 in LSP response: {}", e));
+            return String::from_utf8(content)
+                .map_err(|e| format!("Invalid UTF-8 in LSP response: {}", e));
         }
     }
 
@@ -506,14 +544,15 @@ impl LSPClient {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(LSPError::InvalidResponse(
-                        "LSP server stdout reader disconnected (server may have crashed)".to_string(),
+                        "LSP server stdout reader disconnected (server may have crashed)"
+                            .to_string(),
                     ));
                 }
             };
 
             // Try to parse as response
             if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&content_str) {
-                if response.id == serde_json::Value::from(expected_id) {
+                if response.id.as_u64() == Some(expected_id) {
                     // Check for error
                     if let Some(error) = response.error {
                         return Err(LSPError::ServerError {
@@ -544,7 +583,12 @@ impl LSPClient {
             params: None,
         };
         let request_json = serde_json::to_string(&request)?;
-        write!(self.stdin, "Content-Length: {}\r\n\r\n{}", request_json.len(), request_json)?;
+        write!(
+            self.stdin,
+            "Content-Length: {}\r\n\r\n{}",
+            request_json.len(),
+            request_json
+        )?;
         self.stdin.flush()?;
         let _ = self.read_response_with_timeout(id, Duration::from_secs(2));
 
@@ -607,12 +651,9 @@ pub fn file_uri(path: &str) -> String {
 /// Detect programming language from file extension
 pub fn detect_language(file_path: &str) -> Result<String> {
     let path = Path::new(file_path);
-    let extension = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .ok_or_else(|| {
-            LSPError::InvalidResponse(format!("Cannot detect language for file: {}", file_path))
-        })?;
+    let extension = path.extension().and_then(|e| e.to_str()).ok_or_else(|| {
+        LSPError::InvalidResponse(format!("Cannot detect language for file: {}", file_path))
+    })?;
 
     match extension {
         "go" => Ok("go".to_string()),
@@ -774,12 +815,8 @@ mod tests {
         fs::write(tmp.join("uv.lock"), "").unwrap();
 
         // Go should not be wrapped even if uv.lock exists
-        let (binary, args) = LSPClient::maybe_wrap_with_runner(
-            "go",
-            "gopls",
-            vec!["serve".to_string()],
-            &tmp,
-        );
+        let (binary, args) =
+            LSPClient::maybe_wrap_with_runner("go", "gopls", vec!["serve".to_string()], &tmp);
         assert_eq!(binary, "gopls");
         assert_eq!(args, vec!["serve"]);
 

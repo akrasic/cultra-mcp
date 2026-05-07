@@ -25,12 +25,10 @@ fn build_waves_query_params(args: &Map<String, Value>) -> Result<Vec<(String, St
     // Exactly one scope must be provided. The API enforces this too, but
     // rejecting at the shim layer gives a faster, clearer error.
     match (plan_id, project_id) {
-        (None, None) => return Err(anyhow!(
-            "exactly one of plan_id or project_id is required"
-        )),
-        (Some(_), Some(_)) => return Err(anyhow!(
-            "pass only one of plan_id or project_id, not both"
-        )),
+        (None, None) => return Err(anyhow!("exactly one of plan_id or project_id is required")),
+        (Some(_), Some(_)) => {
+            return Err(anyhow!("pass only one of plan_id or project_id, not both"))
+        }
         _ => {}
     }
 
@@ -132,6 +130,7 @@ fn build_waves_query_params(args: &Map<String, Value>) -> Result<Vec<(String, St
 /// Arguments (exactly one scope required):
 ///   - `plan_id: string` — scope to a single plan's tasks
 ///   - `project_id: string` — scope to all tasks in a project
+///
 /// Optional:
 ///   - `include_statuses: [string]` — override default status filter
 ///   - `include_excluded: bool` — populate excluded.{done,cancelled,superseded}
@@ -155,8 +154,11 @@ mod tests {
     fn test_build_waves_query_params_rejects_missing_scope() {
         let err = build_waves_query_params(&Map::new()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("plan_id") && msg.contains("project_id"),
-            "expected error naming both scope params, got: {}", msg);
+        assert!(
+            msg.contains("plan_id") && msg.contains("project_id"),
+            "expected error naming both scope params, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -166,8 +168,11 @@ mod tests {
         args.insert("project_id".to_string(), json!("proj-x"));
         let err = build_waves_query_params(&args).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("only one"),
-            "expected 'only one' message when both scopes passed, got: {}", msg);
+        assert!(
+            msg.contains("only one"),
+            "expected 'only one' message when both scopes passed, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -176,8 +181,11 @@ mod tests {
         args.insert("plan_id".to_string(), json!("bad plan id"));
         let err = build_waves_query_params(&args).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("plan_id"),
-            "expected error naming plan_id, got: {}", msg);
+        assert!(
+            msg.contains("plan_id"),
+            "expected error naming plan_id, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -185,8 +193,11 @@ mod tests {
         let mut args = Map::new();
         args.insert("plan_id".to_string(), json!("plan-waves-demo"));
         let params = build_waves_query_params(&args).expect("valid plan_id should pass");
-        assert_eq!(params, vec![("plan_id".to_string(), "plan-waves-demo".to_string())],
-            "plan_id should appear in query params exactly once, with its original value");
+        assert_eq!(
+            params,
+            vec![("plan_id".to_string(), "plan-waves-demo".to_string())],
+            "plan_id should appear in query params exactly once, with its original value"
+        );
     }
 
     #[test]
@@ -194,20 +205,29 @@ mod tests {
         let mut args = Map::new();
         args.insert("project_id".to_string(), json!("proj-x"));
         let params = build_waves_query_params(&args).expect("valid project_id should pass");
-        assert_eq!(params, vec![("project_id".to_string(), "proj-x".to_string())]);
+        assert_eq!(
+            params,
+            vec![("project_id".to_string(), "proj-x".to_string())]
+        );
     }
 
     #[test]
     fn test_build_waves_query_params_joins_include_statuses_array() {
         let mut args = Map::new();
         args.insert("plan_id".to_string(), json!("plan-x"));
-        args.insert("include_statuses".to_string(), json!(["todo", "in_progress"]));
+        args.insert(
+            "include_statuses".to_string(),
+            json!(["todo", "in_progress"]),
+        );
         let params = build_waves_query_params(&args).expect("valid args should pass");
-        let include_statuses = params.iter()
+        let include_statuses = params
+            .iter()
             .find(|(k, _)| k == "include_statuses")
             .expect("include_statuses should be present in query params");
-        assert_eq!(include_statuses.1, "todo,in_progress",
-            "include_statuses should be comma-joined in the order given");
+        assert_eq!(
+            include_statuses.1, "todo,in_progress",
+            "include_statuses should be comma-joined in the order given"
+        );
     }
 
     #[test]
@@ -216,8 +236,10 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("include_statuses".to_string(), json!([]));
         let params = build_waves_query_params(&args).expect("empty array is valid");
-        assert!(params.iter().all(|(k, _)| k != "include_statuses"),
-            "empty include_statuses should be omitted, not sent as blank");
+        assert!(
+            params.iter().all(|(k, _)| k != "include_statuses"),
+            "empty include_statuses should be omitted, not sent as blank"
+        );
     }
 
     #[test]
@@ -226,7 +248,8 @@ mod tests {
         args.insert("project_id".to_string(), json!("proj-x"));
         args.insert("include_excluded".to_string(), json!(true));
         let params = build_waves_query_params(&args).expect("valid args should pass");
-        let include_excluded = params.iter()
+        let include_excluded = params
+            .iter()
             .find(|(k, _)| k == "include_excluded")
             .expect("include_excluded=true should be present in query params");
         assert_eq!(include_excluded.1, "true");
@@ -238,8 +261,10 @@ mod tests {
         args.insert("project_id".to_string(), json!("proj-x"));
         args.insert("include_excluded".to_string(), json!(false));
         let params = build_waves_query_params(&args).expect("valid args should pass");
-        assert!(params.iter().all(|(k, _)| k != "include_excluded"),
-            "include_excluded=false should be omitted (default), not sent explicitly");
+        assert!(
+            params.iter().all(|(k, _)| k != "include_excluded"),
+            "include_excluded=false should be omitted (default), not sent explicitly"
+        );
     }
 
     // CULTRA-1050: ASCII rendering passthrough.
@@ -250,7 +275,8 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("format".to_string(), json!("ascii"));
         let params = build_waves_query_params(&args).expect("format=ascii is valid");
-        let format = params.iter()
+        let format = params
+            .iter()
             .find(|(k, _)| k == "format")
             .expect("format=ascii should pass through");
         assert_eq!(format.1, "ascii");
@@ -264,8 +290,11 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("format".to_string(), json!("html"));
         let err = build_waves_query_params(&args).unwrap_err();
-        assert!(err.to_string().contains("invalid format"),
-            "expected error naming invalid format, got: {}", err);
+        assert!(
+            err.to_string().contains("invalid format"),
+            "expected error naming invalid format, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -279,8 +308,13 @@ mod tests {
         let params = build_waves_query_params(&args).expect("valid render args should pass");
 
         let lookup = |key: &str| -> String {
-            params.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-                .unwrap_or_else(|| panic!("expected query param {} to be present in {:?}", key, params))
+            params
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| {
+                    panic!("expected query param {} to be present in {:?}", key, params)
+                })
         };
         assert_eq!(lookup("width"), "120");
         assert_eq!(lookup("style"), "ascii");
@@ -293,8 +327,11 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("width".to_string(), json!(0));
         let err = build_waves_query_params(&args).unwrap_err();
-        assert!(err.to_string().contains("width"),
-            "expected error naming width, got: {}", err);
+        assert!(
+            err.to_string().contains("width"),
+            "expected error naming width, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -303,8 +340,11 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("width".to_string(), json!(-5));
         let err = build_waves_query_params(&args).unwrap_err();
-        assert!(err.to_string().contains("width"),
-            "expected error naming width, got: {}", err);
+        assert!(
+            err.to_string().contains("width"),
+            "expected error naming width, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -313,8 +353,11 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("style".to_string(), json!("emoji"));
         let err = build_waves_query_params(&args).unwrap_err();
-        assert!(err.to_string().contains("style"),
-            "expected error naming style, got: {}", err);
+        assert!(
+            err.to_string().contains("style"),
+            "expected error naming style, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -325,8 +368,11 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("with_titles".to_string(), json!(false));
         let params = build_waves_query_params(&args).expect("with_titles=false is valid");
-        assert!(params.iter().all(|(k, _)| k != "with_titles"),
-            "with_titles=false should be omitted, got: {:?}", params);
+        assert!(
+            params.iter().all(|(k, _)| k != "with_titles"),
+            "with_titles=false should be omitted, got: {:?}",
+            params
+        );
     }
 
     // CULTRA-1059: with_handles polish.
@@ -338,7 +384,9 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("with_handles".to_string(), json!(false));
         let params = build_waves_query_params(&args).expect("with_handles=false is valid");
-        let with_handles = params.iter().find(|(k, _)| k == "with_handles")
+        let with_handles = params
+            .iter()
+            .find(|(k, _)| k == "with_handles")
             .expect("with_handles=false should pass through");
         assert_eq!(with_handles.1, "false");
     }
@@ -351,8 +399,11 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("with_handles".to_string(), json!(true));
         let params = build_waves_query_params(&args).expect("with_handles=true is valid");
-        assert!(params.iter().all(|(k, _)| k != "with_handles"),
-            "with_handles=true should be omitted (default), got: {:?}", params);
+        assert!(
+            params.iter().all(|(k, _)| k != "with_handles"),
+            "with_handles=true should be omitted (default), got: {:?}",
+            params
+        );
     }
 
     // CULTRA-1069: compact_parallel passthrough.
@@ -363,7 +414,9 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("compact_parallel".to_string(), json!(true));
         let params = build_waves_query_params(&args).expect("compact_parallel=true is valid");
-        let cp = params.iter().find(|(k, _)| k == "compact_parallel")
+        let cp = params
+            .iter()
+            .find(|(k, _)| k == "compact_parallel")
             .expect("compact_parallel=true should pass through");
         assert_eq!(cp.1, "true");
     }
@@ -375,7 +428,10 @@ mod tests {
         args.insert("plan_id".to_string(), json!("plan-x"));
         args.insert("compact_parallel".to_string(), json!(false));
         let params = build_waves_query_params(&args).expect("compact_parallel=false is valid");
-        assert!(params.iter().all(|(k, _)| k != "compact_parallel"),
-            "compact_parallel=false should be omitted (default), got: {:?}", params);
+        assert!(
+            params.iter().all(|(k, _)| k != "compact_parallel"),
+            "compact_parallel=false should be omitted (default), got: {:?}",
+            params
+        );
     }
 }

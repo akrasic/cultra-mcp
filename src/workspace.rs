@@ -157,10 +157,12 @@ pub fn lsp_workspace_root_for_language(
     static RUST: WorkspaceAnchor = WorkspaceAnchor::Manifest(&["Cargo.toml"]);
     static GO: WorkspaceAnchor = WorkspaceAnchor::Manifest(&["go.mod"]);
     static TS_JS: WorkspaceAnchor = WorkspaceAnchor::Manifest(&["tsconfig.json", "package.json"]);
-    static PY: WorkspaceAnchor = WorkspaceAnchor::Manifest(&["pyproject.toml", "setup.py", "setup.cfg"]);
+    static PY: WorkspaceAnchor =
+        WorkspaceAnchor::Manifest(&["pyproject.toml", "setup.py", "setup.cfg"]);
     // CULTRA-972: Svelte projects anchor on svelte.config.js first (project root),
     // with package.json as fallback for simpler setups.
-    static SVELTE: WorkspaceAnchor = WorkspaceAnchor::Manifest(&["svelte.config.js", "package.json"]);
+    static SVELTE: WorkspaceAnchor =
+        WorkspaceAnchor::Manifest(&["svelte.config.js", "package.json"]);
 
     let anchor: &WorkspaceAnchor = match language {
         "rust" => &RUST,
@@ -223,7 +225,11 @@ mod tests {
         let sandbox = outer.path().join("sandbox");
         let src_dir = sandbox.join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(outer.path().join("Cargo.toml"), "[package]\nname=\"escape\"\n").unwrap();
+        std::fs::write(
+            outer.path().join("Cargo.toml"),
+            "[package]\nname=\"escape\"\n",
+        )
+        .unwrap();
         let src = src_dir.join("a.rs");
         std::fs::write(&src, "fn x() {}\n").unwrap();
 
@@ -269,7 +275,11 @@ mod tests {
         let outer = tempfile::tempdir().unwrap();
         let worktree = outer.path().join("worktree");
         std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(worktree.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/x\n",
+        )
+        .unwrap();
         let src = worktree.join("a.rs");
         std::fs::write(&src, "fn x() {}\n").unwrap();
 
@@ -288,8 +298,10 @@ mod tests {
         std::fs::write(&src, "export {};\n").unwrap();
 
         let result = lsp_workspace_root_for_language("typescript", &src, dir.path()).unwrap();
-        assert!(result.anchor.ends_with("tsconfig.json"),
-            "tsconfig.json should take priority over package.json");
+        assert!(
+            result.anchor.ends_with("tsconfig.json"),
+            "tsconfig.json should take priority over package.json"
+        );
     }
 
     #[test]

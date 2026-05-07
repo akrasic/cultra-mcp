@@ -163,7 +163,11 @@ pub fn warmup_command_for_target(target: &WarmupTarget) -> Option<(String, Vec<S
     let dir_str = target.manifest_dir.to_string_lossy().to_string();
     match target.language.as_str() {
         "rust" => {
-            let manifest = target.manifest_dir.join("Cargo.toml").to_string_lossy().to_string();
+            let manifest = target
+                .manifest_dir
+                .join("Cargo.toml")
+                .to_string_lossy()
+                .to_string();
             Some((
                 "cargo".to_string(),
                 vec![
@@ -176,7 +180,12 @@ pub fn warmup_command_for_target(target: &WarmupTarget) -> Option<(String, Vec<S
         }
         "go" => Some((
             "go".to_string(),
-            vec!["build".to_string(), "-C".to_string(), dir_str, "./...".to_string()],
+            vec![
+                "build".to_string(),
+                "-C".to_string(),
+                dir_str,
+                "./...".to_string(),
+            ],
         )),
         "typescript" | "tsx" | "javascript" | "jsx" => Some((
             "tsc".to_string(),
@@ -210,8 +219,15 @@ pub fn max_workspace_source_mtime(root: &Path, language: &str) -> Option<SystemT
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if matches!(
                     name,
-                    "node_modules" | ".git" | "dist" | "build" | "target"
-                    | ".next" | "__pycache__" | ".venv" | "vendor"
+                    "node_modules"
+                        | ".git"
+                        | "dist"
+                        | "build"
+                        | "target"
+                        | ".next"
+                        | "__pycache__"
+                        | ".venv"
+                        | "vendor"
                 ) {
                     return;
                 }
@@ -231,7 +247,9 @@ pub fn max_workspace_source_mtime(root: &Path, language: &str) -> Option<SystemT
             // ext-based check above already handles "toml"/"mod" extensions
             // but we double-check filename matches in case some workspace
             // uses non-standard naming.
-            let name_match = path.file_name().and_then(|n| n.to_str())
+            let name_match = path
+                .file_name()
+                .and_then(|n| n.to_str())
                 .map(|n| matches!(n, "Cargo.toml" | "go.mod" | "go.sum"))
                 .unwrap_or(false);
             if ext_match || name_match {
@@ -293,7 +311,10 @@ fn run_with_timeout(
                 return Err(format!(
                     "'{}' exited with status {}: {}",
                     cmd,
-                    status.code().map(|c| c.to_string()).unwrap_or_else(|| "<signal>".to_string()),
+                    status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "<signal>".to_string()),
                     snippet.trim()
                 ));
             }
@@ -409,7 +430,10 @@ impl LSPManager {
                     cached: false,
                     elapsed_ms: 0,
                     command: None,
-                    message: Some(format!("No warmup command builder for language '{}'", language)),
+                    message: Some(format!(
+                        "No warmup command builder for language '{}'",
+                        language
+                    )),
                     cached_status: None,
                     manifest_dir: Some(target.manifest_dir.display().to_string()),
                 };
@@ -481,13 +505,16 @@ impl LSPManager {
 
         {
             let mut warmup = self.warmup.lock().unwrap_or_else(|e| e.into_inner());
-            warmup.insert(cache_key, WarmupCacheEntry {
-                mtime_stamp: stamp,
-                elapsed_ms,
-                status: status.clone(),
-                command: Some(display_command.clone()),
-                message: message.clone(),
-            });
+            warmup.insert(
+                cache_key,
+                WarmupCacheEntry {
+                    mtime_stamp: stamp,
+                    elapsed_ms,
+                    status: status.clone(),
+                    command: Some(display_command.clone()),
+                    message: message.clone(),
+                },
+            );
         }
 
         WarmupReport {
@@ -505,7 +532,12 @@ impl LSPManager {
     /// CULTRA-950 / CULTRA-952 test-only helper: insert a cache entry
     /// directly so cache-hit tests don't have to invoke real subprocesses.
     #[cfg(test)]
-    pub fn inject_warmup_cache_entry(&self, language: &str, manifest_dir: &Path, entry: WarmupCacheEntry) {
+    pub fn inject_warmup_cache_entry(
+        &self,
+        language: &str,
+        manifest_dir: &Path,
+        entry: WarmupCacheEntry,
+    ) {
         let key = format!("{}:{}", language, manifest_dir.display());
         let mut warmup = self.warmup.lock().unwrap_or_else(|e| e.into_inner());
         warmup.insert(key, entry);
@@ -591,12 +623,20 @@ impl LSPManager {
 
     /// Check if a client exists for a given language
     pub fn has_client(&self, language: &str) -> bool {
-        self.clients.lock().unwrap_or_else(|e| e.into_inner()).contains_key(language)
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(language)
     }
 
     /// List all active languages
     pub fn active_languages(&self) -> Vec<String> {
-        self.clients.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+        self.clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 }
 
@@ -646,9 +686,15 @@ mod tests {
     fn test_manifest_filename_for_known_languages() {
         assert_eq!(manifest_filename_for_language("rust"), Some("Cargo.toml"));
         assert_eq!(manifest_filename_for_language("go"), Some("go.mod"));
-        assert_eq!(manifest_filename_for_language("typescript"), Some("tsconfig.json"));
+        assert_eq!(
+            manifest_filename_for_language("typescript"),
+            Some("tsconfig.json")
+        );
         assert_eq!(manifest_filename_for_language("tsx"), Some("tsconfig.json"));
-        assert_eq!(manifest_filename_for_language("javascript"), Some("tsconfig.json"));
+        assert_eq!(
+            manifest_filename_for_language("javascript"),
+            Some("tsconfig.json")
+        );
     }
 
     #[test]
@@ -669,10 +715,16 @@ mod tests {
         let (cmd, args) = warmup_command_for_target(&target).unwrap();
         assert_eq!(cmd, "cargo");
         assert!(args.iter().any(|a| a == "check"));
-        assert!(args.iter().any(|a| a == "--manifest-path"),
-            "rust warmup MUST use --manifest-path: {:?}", args);
-        assert!(args.iter().any(|a| a.ends_with("Cargo.toml")),
-            "args should include the resolved Cargo.toml path: {:?}", args);
+        assert!(
+            args.iter().any(|a| a == "--manifest-path"),
+            "rust warmup MUST use --manifest-path: {:?}",
+            args
+        );
+        assert!(
+            args.iter().any(|a| a.ends_with("Cargo.toml")),
+            "args should include the resolved Cargo.toml path: {:?}",
+            args
+        );
         assert!(args.iter().any(|a| a == "--quiet"));
     }
 
@@ -685,8 +737,11 @@ mod tests {
         };
         let (cmd, args) = warmup_command_for_target(&target).unwrap();
         assert_eq!(cmd, "go");
-        assert!(args.iter().any(|a| a == "-C"),
-            "go warmup MUST use -C: {:?}", args);
+        assert!(
+            args.iter().any(|a| a == "-C"),
+            "go warmup MUST use -C: {:?}",
+            args
+        );
         assert!(args.iter().any(|a| a == "/some/module"));
         assert!(args.iter().any(|a| a == "./..."));
     }
@@ -767,8 +822,10 @@ mod tests {
         let src = dir.path().join("orphan.rs");
         std::fs::write(&src, "fn x() {}\n").unwrap();
         let target = resolve_warmup_target("rust", &src, dir.path());
-        assert!(target.is_none(),
-            "should return None when no Cargo.toml is found below the sandbox root");
+        assert!(
+            target.is_none(),
+            "should return None when no Cargo.toml is found below the sandbox root"
+        );
     }
 
     #[test]
@@ -780,13 +837,20 @@ mod tests {
         let src_dir = sandbox.join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
         // Place a Cargo.toml ABOVE the sandbox — this must be ignored.
-        std::fs::write(outer.path().join("Cargo.toml"), "[package]\nname=\"escape\"\n").unwrap();
+        std::fs::write(
+            outer.path().join("Cargo.toml"),
+            "[package]\nname=\"escape\"\n",
+        )
+        .unwrap();
         let src = src_dir.join("a.rs");
         std::fs::write(&src, "fn x() {}\n").unwrap();
 
         let target = resolve_warmup_target("rust", &src, &sandbox);
-        assert!(target.is_none(),
-            "must NOT walk above sandbox root to find a manifest, got: {:?}", target);
+        assert!(
+            target.is_none(),
+            "must NOT walk above sandbox root to find a manifest, got: {:?}",
+            target
+        );
     }
 
     #[test]
@@ -818,8 +882,11 @@ mod tests {
         std::fs::write(target.join("buried.rs"), "fn x() {}").unwrap();
 
         let mtime = max_workspace_source_mtime(dir.path(), "rust");
-        assert!(mtime.is_none(),
-            "files under target/ should be skipped, got mtime: {:?}", mtime);
+        assert!(
+            mtime.is_none(),
+            "files under target/ should be skipped, got mtime: {:?}",
+            mtime
+        );
     }
 
     #[test]
@@ -840,9 +907,14 @@ mod tests {
         std::fs::write(dir.path().join("b.go"), "package main\n").unwrap();
 
         let mtime = max_workspace_source_mtime(dir.path(), "go").unwrap();
-        let b_mtime = std::fs::metadata(dir.path().join("b.go")).unwrap().modified().unwrap();
-        assert_eq!(mtime, b_mtime,
-            "max_workspace_source_mtime should return the latest mtime");
+        let b_mtime = std::fs::metadata(dir.path().join("b.go"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime, b_mtime,
+            "max_workspace_source_mtime should return the latest mtime"
+        );
     }
 
     #[test]
@@ -886,21 +958,30 @@ mod tests {
         let manager = LSPManager::new(dir.path());
 
         let future = SystemTime::now() + Duration::from_secs(3600);
-        manager.inject_warmup_cache_entry("go", &crate_dir.canonicalize().unwrap(), WarmupCacheEntry {
-            mtime_stamp: future,
-            elapsed_ms: 1234,
-            status: "warm".to_string(),
-            command: Some("go build -C /x ./...".to_string()),
-            message: None,
-        });
+        manager.inject_warmup_cache_entry(
+            "go",
+            &crate_dir.canonicalize().unwrap(),
+            WarmupCacheEntry {
+                mtime_stamp: future,
+                elapsed_ms: 1234,
+                status: "warm".to_string(),
+                command: Some("go build -C /x ./...".to_string()),
+                message: None,
+            },
+        );
 
         let report = manager.ensure_warm("go", &src);
         assert_eq!(report.status, "cached");
         assert!(report.cached);
-        assert_eq!(report.elapsed_ms, 1234,
-            "cached report should echo the elapsed_ms from the original warmup");
-        assert_eq!(report.cached_status.as_deref(), Some("warm"),
-            "cached_status should reflect the original outcome");
+        assert_eq!(
+            report.elapsed_ms, 1234,
+            "cached report should echo the elapsed_ms from the original warmup"
+        );
+        assert_eq!(
+            report.cached_status.as_deref(),
+            Some("warm"),
+            "cached_status should reflect the original outcome"
+        );
     }
 
     #[test]
@@ -915,18 +996,28 @@ mod tests {
         let manager = LSPManager::new(dir.path());
 
         let future = SystemTime::now() + Duration::from_secs(3600);
-        manager.inject_warmup_cache_entry("go", &crate_dir.canonicalize().unwrap(), WarmupCacheEntry {
-            mtime_stamp: future,
-            elapsed_ms: 27_000,
-            status: "failed".to_string(),
-            command: Some("go build -C /x ./...".to_string()),
-            message: Some("simulated 27s failure".to_string()),
-        });
+        manager.inject_warmup_cache_entry(
+            "go",
+            &crate_dir.canonicalize().unwrap(),
+            WarmupCacheEntry {
+                mtime_stamp: future,
+                elapsed_ms: 27_000,
+                status: "failed".to_string(),
+                command: Some("go build -C /x ./...".to_string()),
+                message: Some("simulated 27s failure".to_string()),
+            },
+        );
 
         let report = manager.ensure_warm("go", &src);
-        assert_eq!(report.status, "cached", "cached failures must be replayed as status=cached");
-        assert_eq!(report.cached_status.as_deref(), Some("failed"),
-            "cached_status must indicate the original outcome was a failure");
+        assert_eq!(
+            report.status, "cached",
+            "cached failures must be replayed as status=cached"
+        );
+        assert_eq!(
+            report.cached_status.as_deref(),
+            Some("failed"),
+            "cached_status must indicate the original outcome was a failure"
+        );
         assert_eq!(report.elapsed_ms, 27_000);
         assert_eq!(report.message.as_deref(), Some("simulated 27s failure"));
     }
@@ -944,19 +1035,27 @@ mod tests {
         let manager = LSPManager::new(dir.path());
 
         let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
-        manager.inject_warmup_cache_entry("go", &crate_dir.canonicalize().unwrap(), WarmupCacheEntry {
-            mtime_stamp: past,
-            elapsed_ms: 9999,
-            status: "warm".to_string(),
-            command: None,
-            message: None,
-        });
+        manager.inject_warmup_cache_entry(
+            "go",
+            &crate_dir.canonicalize().unwrap(),
+            WarmupCacheEntry {
+                mtime_stamp: past,
+                elapsed_ms: 9999,
+                status: "warm".to_string(),
+                command: None,
+                message: None,
+            },
+        );
 
         let report = manager.ensure_warm("go", &src);
-        assert_ne!(report.status, "cached",
-            "should NOT hit cache when workspace mtime > stamp");
-        assert_ne!(report.elapsed_ms, 9999,
-            "should not be the cached elapsed_ms");
+        assert_ne!(
+            report.status, "cached",
+            "should NOT hit cache when workspace mtime > stamp"
+        );
+        assert_ne!(
+            report.elapsed_ms, 9999,
+            "should not be the cached elapsed_ms"
+        );
     }
 
     #[test]
@@ -979,20 +1078,26 @@ mod tests {
 
         // Inject a cached "warm" for crate_a only.
         let future = SystemTime::now() + Duration::from_secs(3600);
-        manager.inject_warmup_cache_entry("rust", &crate_a.canonicalize().unwrap(), WarmupCacheEntry {
-            mtime_stamp: future,
-            elapsed_ms: 1234,
-            status: "warm".to_string(),
-            command: None,
-            message: None,
-        });
+        manager.inject_warmup_cache_entry(
+            "rust",
+            &crate_a.canonicalize().unwrap(),
+            WarmupCacheEntry {
+                mtime_stamp: future,
+                elapsed_ms: 1234,
+                status: "warm".to_string(),
+                command: None,
+                message: None,
+            },
+        );
 
         let a_report = manager.ensure_warm("rust", &src_a);
         assert_eq!(a_report.status, "cached", "crate_a is cached");
 
         let b_report = manager.ensure_warm("rust", &src_b);
-        assert_ne!(b_report.status, "cached",
-            "crate_b must NOT inherit crate_a's cache entry");
+        assert_ne!(
+            b_report.status, "cached",
+            "crate_b must NOT inherit crate_a's cache entry"
+        );
     }
 
     #[test]
@@ -1010,7 +1115,11 @@ mod tests {
         let result = run_with_timeout("false", &[], dir.path(), Duration::from_secs(5));
         assert!(result.is_err(), "expected failure for `false`");
         let err = result.unwrap_err();
-        assert!(err.contains("false"), "error should mention the command: {}", err);
+        assert!(
+            err.contains("false"),
+            "error should mention the command: {}",
+            err
+        );
     }
 
     #[test]
@@ -1024,18 +1133,28 @@ mod tests {
         let result = run_with_timeout("sleep", &["10"], dir.path(), Duration::from_secs(1));
         let elapsed = start.elapsed();
         assert!(result.is_err(), "expected timeout error");
-        assert!(elapsed < Duration::from_secs(3),
-            "should return within ~timeout + grace period, took {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "should return within ~timeout + grace period, took {:?}",
+            elapsed
+        );
         let err = result.unwrap_err();
-        assert!(err.contains("timeout") || err.contains("exceeded"),
-            "error should mention timeout: {}", err);
+        assert!(
+            err.contains("timeout") || err.contains("exceeded"),
+            "error should mention timeout: {}",
+            err
+        );
     }
 
     #[test]
     fn test_run_with_timeout_handles_missing_command() {
         let dir = tempfile::tempdir().unwrap();
-        let result = run_with_timeout("this-command-does-not-exist-xyzzy", &[], dir.path(),
-            Duration::from_secs(5));
+        let result = run_with_timeout(
+            "this-command-does-not-exist-xyzzy",
+            &[],
+            dir.path(),
+            Duration::from_secs(5),
+        );
         assert!(result.is_err(), "expected spawn failure");
     }
 }

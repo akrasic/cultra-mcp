@@ -36,7 +36,7 @@ pub struct ComplexitySummary {
     pub max_cyclomatic: u32,
     pub avg_cognitive: f64,
     pub max_cognitive: u32,
-    pub complex_functions: usize,   // cyclomatic > 10
+    pub complex_functions: usize,      // cyclomatic > 10
     pub very_complex_functions: usize, // cyclomatic > 20
     pub total_lines: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,9 +46,7 @@ pub struct ComplexitySummary {
 /// Analyze complexity of all functions in a file
 pub fn analyze_complexity(file_path: &str) -> Result<ComplexityAnalysis> {
     let content = fs::read_to_string(file_path)?;
-    let language = detect_language(file_path)
-        .unwrap_or("unknown")
-        .to_string();
+    let language = detect_language(file_path).unwrap_or("unknown").to_string();
 
     let mut parser = tree_sitter::Parser::new();
 
@@ -77,27 +75,32 @@ pub fn analyze_complexity(file_path: &str) -> Result<ComplexityAnalysis> {
         "python" => tree_sitter_python::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
         "terraform" => tree_sitter_hcl::LANGUAGE.into(),
-        _ => return Ok(ComplexityAnalysis {
-            file_path: file_path.to_string(),
-            language,
-            functions: Vec::new(),
-            summary: empty_summary(),
-        }),
+        _ => {
+            return Ok(ComplexityAnalysis {
+                file_path: file_path.to_string(),
+                language,
+                functions: Vec::new(),
+                summary: empty_summary(),
+            })
+        }
     };
 
     parser.set_language(&lang)?;
     let tree = match parser.parse(&effective_content, None) {
         Some(t) => t,
-        None => return Ok(ComplexityAnalysis {
-            file_path: file_path.to_string(),
-            language,
-            functions: Vec::new(),
-            summary: empty_summary(),
-        }),
+        None => {
+            return Ok(ComplexityAnalysis {
+                file_path: file_path.to_string(),
+                language,
+                functions: Vec::new(),
+                summary: empty_summary(),
+            })
+        }
     };
 
     let root = tree.root_node();
-    let mut functions = extract_functions_with_complexity(&root, content_bytes, file_path, &effective_language);
+    let mut functions =
+        extract_functions_with_complexity(&root, content_bytes, file_path, &effective_language);
 
     // Svelte: offset line numbers to match the original file
     if line_offset > 0 {
@@ -195,10 +198,17 @@ fn extract_functions_with_complexity(
     let mut functions = Vec::new();
     let mut cursor = root.walk();
 
-    collect_functions(root, &mut cursor, content, file_path, language, &mut functions);
+    collect_functions(
+        root,
+        &mut cursor,
+        content,
+        file_path,
+        language,
+        &mut functions,
+    );
 
     // Sort by cyclomatic complexity descending
-    functions.sort_by(|a, b| b.cyclomatic.cmp(&a.cyclomatic));
+    functions.sort_by_key(|f| std::cmp::Reverse(f.cyclomatic));
     functions
 }
 
@@ -261,34 +271,27 @@ fn collect_functions(
     }
 }
 
-/// Find the first child matching a given kind using cursor
-fn find_child_by_kind<'a>(node: &'a tree_sitter::Node<'a>, kinds: &[&str]) -> Option<tree_sitter::Node<'a>> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if kinds.contains(&child.kind()) {
-            return Some(child);
-        }
-    }
-    None
+/// Find the first child matching a given kind.
+fn find_child_by_kind<'a>(
+    node: &'a tree_sitter::Node<'a>,
+    kinds: &[&str],
+) -> Option<tree_sitter::Node<'a>> {
+    (0..node.child_count() as u32)
+        .filter_map(|i| node.child(i))
+        .find(|child| kinds.contains(&child.kind()))
 }
 
 fn extract_function_name(node: &tree_sitter::Node, content: &[u8], language: &str) -> String {
     match language {
-        "go" => {
-            find_child_by_kind(node, &["identifier", "field_identifier"])
-                .map(|n| node_text(&n, content).to_string())
-                .unwrap_or_else(|| "<anonymous>".to_string())
-        }
-        "rust" => {
-            find_child_by_kind(node, &["identifier"])
-                .map(|n| node_text(&n, content).to_string())
-                .unwrap_or_else(|| "<anonymous>".to_string())
-        }
-        "python" => {
-            find_child_by_kind(node, &["identifier"])
-                .map(|n| node_text(&n, content).to_string())
-                .unwrap_or_else(|| "<anonymous>".to_string())
-        }
+        "go" => find_child_by_kind(node, &["identifier", "field_identifier"])
+            .map(|n| node_text(&n, content).to_string())
+            .unwrap_or_else(|| "<anonymous>".to_string()),
+        "rust" => find_child_by_kind(node, &["identifier"])
+            .map(|n| node_text(&n, content).to_string())
+            .unwrap_or_else(|| "<anonymous>".to_string()),
+        "python" => find_child_by_kind(node, &["identifier"])
+            .map(|n| node_text(&n, content).to_string())
+            .unwrap_or_else(|| "<anonymous>".to_string()),
         "typescript" | "tsx" | "javascript" => {
             if node.kind() == "arrow_function" {
                 if let Some(parent) = node.parent() {
@@ -308,11 +311,13 @@ fn extract_function_name(node: &tree_sitter::Node, content: &[u8], language: &st
             // Block name: "resource aws_instance.web" or "module vpc"
             let mut cursor = node.walk();
             let children: Vec<_> = node.children(&mut cursor).collect();
-            let block_type = children.first()
+            let block_type = children
+                .first()
                 .filter(|c| c.kind() == "identifier")
                 .map(|c| node_text(c, content).to_string())
                 .unwrap_or_default();
-            let labels: Vec<String> = children.iter()
+            let labels: Vec<String> = children
+                .iter()
                 .filter(|c| c.kind() == "string_lit")
                 .map(|c| node_text(c, content).trim_matches('"').to_string())
                 .collect();
@@ -331,8 +336,7 @@ fn extract_receiver(node: &tree_sitter::Node, content: &[u8], language: &str) ->
         return None;
     }
 
-    find_child_by_kind(node, &["parameter_list"])
-        .map(|n| node_text(&n, content).to_string())
+    find_child_by_kind(node, &["parameter_list"]).map(|n| node_text(&n, content).to_string())
 }
 
 /// Calculate cyclomatic complexity (McCabe, 1976)
@@ -397,9 +401,12 @@ fn count_decision_points(
         "terraform" => {
             // Nested blocks (dynamic, provisioner, lifecycle, connection) add complexity
             // Conditional expressions (?:) also count
-            kind == "block" && node.parent().map_or(false, |p| p.kind() == "body" && p.parent().map_or(false, |pp| pp.kind() == "block"))
+            kind == "block"
+                && node.parent().is_some_and(|p| {
+                    p.kind() == "body" && p.parent().is_some_and(|pp| pp.kind() == "block")
+                })
                 || kind == "conditional"
-        },
+        }
         _ => false,
     };
 
@@ -497,7 +504,7 @@ fn calculate_cognitive(
             .unwrap_or("");
         if op == "&&" || op == "||" {
             // Check if parent is same operator type
-            let parent_is_same = node.parent().map_or(false, |p| {
+            let parent_is_same = node.parent().is_some_and(|p| {
                 p.kind() == "binary_expression"
                     && p.child_by_field_name("operator")
                         .map(|n| node_text(&n, content))
@@ -570,9 +577,9 @@ mod tests {
         // CULTRA-943: high CC + low cog = flat dispatch / data table.
         // Should downgrade to "complex" rather than "very_complex".
         assert_eq!(rate_complexity(222, 1), "complex"); // tailwind static_map pattern
-        assert_eq!(rate_complexity(56, 7), "complex");  // tools.rs call_tool dispatch
-        assert_eq!(rate_complexity(60, 3), "complex");  // resolve_arbitrary match
-        assert_eq!(rate_complexity(28, 1), "complex");  // serde deserialize
+        assert_eq!(rate_complexity(56, 7), "complex"); // tools.rs call_tool dispatch
+        assert_eq!(rate_complexity(60, 3), "complex"); // resolve_arbitrary match
+        assert_eq!(rate_complexity(28, 1), "complex"); // serde deserialize
         assert_eq!(rate_complexity(37, 14), "complex"); // sizing_value
 
         // But cog at the threshold (20) should NOT downgrade
@@ -610,13 +617,25 @@ func moderate(x int) int {{
         assert_eq!(result.summary.total_functions, 2);
 
         // Find the simple function
-        let simple = result.functions.iter().find(|f| f.name == "simple").unwrap();
+        let simple = result
+            .functions
+            .iter()
+            .find(|f| f.name == "simple")
+            .unwrap();
         assert_eq!(simple.cyclomatic, 1);
         assert_eq!(simple.rating, "simple");
 
         // Find the moderate function
-        let moderate = result.functions.iter().find(|f| f.name == "moderate").unwrap();
-        assert!(moderate.cyclomatic >= 3, "Expected CC >= 3 for nested ifs, got {}", moderate.cyclomatic);
+        let moderate = result
+            .functions
+            .iter()
+            .find(|f| f.name == "moderate")
+            .unwrap();
+        assert!(
+            moderate.cyclomatic >= 3,
+            "Expected CC >= 3 for nested ifs, got {}",
+            moderate.cyclomatic
+        );
     }
 
     #[test]
@@ -638,7 +657,10 @@ func moderate(x int) int {{
         .unwrap();
 
         let result = analyze_complexity(path.to_str().unwrap()).unwrap();
-        assert!(!result.functions.is_empty(), "Expected at least one function");
+        assert!(
+            !result.functions.is_empty(),
+            "Expected at least one function"
+        );
     }
 
     #[test]
@@ -664,8 +686,15 @@ func moderate(x int) int {{
         assert_eq!(result.functions.len(), 1);
         let func = &result.functions[0];
         assert_eq!(func.name, "process");
-        assert!(func.cyclomatic >= 4, "Expected CC >= 4, got {}", func.cyclomatic);
-        assert!(func.cognitive > func.cyclomatic, "Cognitive should be higher than cyclomatic due to nesting");
+        assert!(
+            func.cyclomatic >= 4,
+            "Expected CC >= 4, got {}",
+            func.cyclomatic
+        );
+        assert!(
+            func.cognitive > func.cyclomatic,
+            "Cognitive should be higher than cyclomatic due to nesting"
+        );
     }
 
     #[test]
@@ -673,7 +702,7 @@ func moderate(x int) int {{
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.go");
         let mut f = fs::File::create(&path).unwrap();
-        write!(f, "package main\n").unwrap();
+        writeln!(f, "package main").unwrap();
 
         let result = analyze_complexity(path.to_str().unwrap()).unwrap();
         assert_eq!(result.functions.len(), 0);
@@ -708,6 +737,10 @@ func moderate(x int) int {{
         assert_eq!(result.functions.len(), 1);
         let func = &result.functions[0];
         assert_eq!(func.name, "handle_request");
-        assert!(func.cyclomatic >= 4, "Expected CC >= 4 for match + if, got {}", func.cyclomatic);
+        assert!(
+            func.cyclomatic >= 4,
+            "Expected CC >= 4 for match + if, got {}",
+            func.cyclomatic
+        );
     }
 }

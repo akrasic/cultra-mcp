@@ -26,8 +26,9 @@ impl APIClient {
         // ureq v3: Use Agent::config_builder() instead of AgentBuilder
         // Set http_status_as_error(false) so we can parse error response bodies
         let agent = ureq::Agent::config_builder()
+            .user_agent(format!("Cultra-MCP/{}", env!("CARGO_PKG_VERSION")))
             .timeout_global(Some(Duration::from_secs(30)))
-            .http_status_as_error(false)  // Allow us to parse error response bodies
+            .http_status_as_error(false) // Allow us to parse error response bodies
             .build()
             .into();
 
@@ -57,7 +58,8 @@ impl APIClient {
             }
         }
 
-        let response = self.agent
+        let response = self
+            .agent
             .get(&url)
             .header("Authorization", &self.get_auth_header())
             .call()?;
@@ -69,7 +71,8 @@ impl APIClient {
     pub fn post(&self, path: &str, body: Value) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);
 
-        let response = self.agent
+        let response = self
+            .agent
             .post(&url)
             .header("Authorization", &self.get_auth_header())
             .header("Content-Type", "application/json")
@@ -82,7 +85,8 @@ impl APIClient {
     pub fn put(&self, path: &str, body: Value) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);
 
-        let response = self.agent
+        let response = self
+            .agent
             .put(&url)
             .header("Authorization", &self.get_auth_header())
             .header("Content-Type", "application/json")
@@ -95,7 +99,8 @@ impl APIClient {
     pub fn delete(&self, path: &str) -> Result<Value> {
         let url = format!("{}{}", self.base_url, path);
 
-        let response = self.agent
+        let response = self
+            .agent
             .delete(&url)
             .header("Authorization", &self.get_auth_header())
             .call()?;
@@ -118,15 +123,19 @@ impl APIClient {
     fn parse_response(&self, mut response: http::Response<ureq::Body>) -> Result<Value> {
         let status = response.status().as_u16();
 
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             // Success: parse JSON response
-            let body: Value = response.body_mut().read_json()
+            let body: Value = response
+                .body_mut()
+                .read_json()
                 .context("Failed to parse JSON response")?;
             return Ok(body);
         }
 
         // Error: parse error response body
-        let body_text = response.body_mut().read_to_string()
+        let body_text = response
+            .body_mut()
+            .read_to_string()
             .unwrap_or_else(|_| "{}".to_string());
 
         // Try to parse structured error response
@@ -140,8 +149,15 @@ impl APIClient {
                 _ => "Request failed",
             };
 
-            // Build detailed error message
-            let mut msg = format!("{}: {}", context, err_resp.message);
+            // Build detailed error message. Include the server's structured
+            // error code when present so callers can grep / programmatically
+            // recognize specific failure modes (e.g., VERSION_CONFLICT).
+            let prefix = if err_resp.code.is_empty() {
+                context.to_string()
+            } else {
+                format!("{} [{}]", context, err_resp.code)
+            };
+            let mut msg = format!("{}: {}", prefix, err_resp.message);
             if let Some(details) = err_resp.details {
                 if !details.is_empty() {
                     msg.push_str(&format!(" - {}", details));

@@ -99,7 +99,8 @@ pub fn analyze_react_component(file_path: &str) -> Result<ReactComponentInfo> {
 
     // Parse with tree-sitter TSX (handles JSX)
     let mut parser = tree_sitter::Parser::new();
-    let lang = tree_sitter_typescript::LANGUAGE_TSX.into(); parser.set_language(&lang)?;
+    let lang = tree_sitter_typescript::LANGUAGE_TSX.into();
+    parser.set_language(&lang)?;
 
     let tree = parser
         .parse(&content, None)
@@ -230,30 +231,24 @@ fn extract_props_interface(
         }
 
         // Check if this looks like a props interface (ends with "Props")
-        if interface_name.ends_with("Props") && interface_node.is_some() {
-            let node = interface_node.unwrap();
-
-            // Find the body child (interface_body)
-            let mut interface_body: Option<tree_sitter::Node> = None;
-            for i in 0..node.child_count() {
-                if let Some(child) = node.child(i as u32) {
-                    if child.kind() == "interface_body" {
-                        interface_body = Some(child);
-                        break;
-                    }
-                }
-            }
-
-            if let Some(body) = interface_body {
-                let properties = extract_interface_properties(&body, content)?;
-
-                return Ok(Some(PropsInfo {
-                    type_name: interface_name,
-                    properties,
-                    location: format_location(&node),
-                }));
-            }
+        if !interface_name.ends_with("Props") {
+            continue;
         }
+        let Some(node) = interface_node else { continue };
+
+        // Find the body child (interface_body)
+        let interface_body = (0..node.child_count() as u32)
+            .filter_map(|i| node.child(i))
+            .find(|child| child.kind() == "interface_body");
+
+        let Some(body) = interface_body else { continue };
+        let properties = extract_interface_properties(&body, content)?;
+
+        return Ok(Some(PropsInfo {
+            type_name: interface_name,
+            properties,
+            location: format_location(&node),
+        }));
     }
 
     Ok(None)
@@ -302,7 +297,7 @@ fn extract_interface_properties(
             if !prop_name.is_empty() {
                 properties.push(PropProperty {
                     name: prop_name,
-                    prop_type: prop_type,
+                    prop_type,
                     required: !optional,
                     optional,
                 });
@@ -349,29 +344,31 @@ fn extract_hooks(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<HookUsa
         }
 
         // Check if it's a hook (starts with "use")
-        if hook_name.starts_with("use") && hook_call.is_some() {
-            let call_node = hook_call.unwrap();
-            let mut hook = HookUsage {
-                name: hook_name.clone(),
-                line: call_node.start_position().row as u32 + 1,
-                state_var: None,
-                setter_var: None,
-                dependencies: Vec::new(),
-                has_cleanup: None,
-            };
+        if !hook_name.starts_with("use") {
+            continue;
+        }
+        let Some(call_node) = hook_call else { continue };
 
-            // Extract dependencies for useEffect, useMemo, useCallback
-            if hook_name == "useEffect" || hook_name == "useMemo" || hook_name == "useCallback" {
-                if let Some(args) = hook_args {
-                    hook.dependencies = extract_hook_dependencies(&args, content)?;
-                    if hook_name == "useEffect" {
-                        hook.has_cleanup = Some(check_effect_cleanup(&args, content)?);
-                    }
+        let mut hook = HookUsage {
+            name: hook_name.clone(),
+            line: call_node.start_position().row as u32 + 1,
+            state_var: None,
+            setter_var: None,
+            dependencies: Vec::new(),
+            has_cleanup: None,
+        };
+
+        // Extract dependencies for useEffect, useMemo, useCallback
+        if hook_name == "useEffect" || hook_name == "useMemo" || hook_name == "useCallback" {
+            if let Some(args) = hook_args {
+                hook.dependencies = extract_hook_dependencies(&args, content)?;
+                if hook_name == "useEffect" {
+                    hook.has_cleanup = Some(check_effect_cleanup(&args, content)?);
                 }
             }
-
-            hooks.push(hook);
         }
+
+        hooks.push(hook);
     }
 
     Ok(hooks)
@@ -414,7 +411,10 @@ fn check_effect_cleanup(args_node: &tree_sitter::Node, content: &[u8]) -> Result
             if child.kind() == "arrow_function" || child.kind() == "function" {
                 let arg_content = child.utf8_text(content)?;
                 // Look for return statement (cleanup function)
-                if arg_content.contains("return ") || arg_content.contains("return()") || arg_content.contains("return(") {
+                if arg_content.contains("return ")
+                    || arg_content.contains("return()")
+                    || arg_content.contains("return(")
+                {
                     return Ok(true);
                 }
                 break;
@@ -659,7 +659,10 @@ function helperFunction() {
         let component = result.unwrap();
 
         // Verify component basics
-        assert_eq!(component.name, "TaskCard", "Component name should be TaskCard");
+        assert_eq!(
+            component.name, "TaskCard",
+            "Component name should be TaskCard"
+        );
         assert_eq!(
             component.component_type, "function_component",
             "Should be function component"
@@ -681,22 +684,43 @@ function helperFunction() {
 
         let priority_prop = props.properties.iter().find(|p| p.name == "priority");
         assert!(priority_prop.is_some(), "Should have priority prop");
-        assert!(priority_prop.unwrap().optional, "priority should be optional");
+        assert!(
+            priority_prop.unwrap().optional,
+            "priority should be optional"
+        );
 
         // Verify hooks
         assert!(!component.hooks.is_empty(), "Should have hooks");
-        assert_eq!(component.hooks.len(), 3, "Should have 3 hooks (2 useState, 1 useEffect)");
+        assert_eq!(
+            component.hooks.len(),
+            3,
+            "Should have 3 hooks (2 useState, 1 useEffect)"
+        );
 
         let use_effect = component.hooks.iter().find(|h| h.name == "useEffect");
         assert!(use_effect.is_some(), "Should have useEffect");
         let effect = use_effect.unwrap();
-        assert_eq!(effect.dependencies.len(), 1, "useEffect should have 1 dependency");
-        assert_eq!(effect.dependencies[0], "task", "Dependency should be 'task'");
-        assert_eq!(effect.has_cleanup, Some(true), "useEffect should have cleanup");
+        assert_eq!(
+            effect.dependencies.len(),
+            1,
+            "useEffect should have 1 dependency"
+        );
+        assert_eq!(
+            effect.dependencies[0], "task",
+            "Dependency should be 'task'"
+        );
+        assert_eq!(
+            effect.has_cleanup,
+            Some(true),
+            "useEffect should have cleanup"
+        );
 
         // Verify child components
         eprintln!("Child components found: {:?}", component.child_components);
-        assert!(!component.child_components.is_empty(), "Should have child components");
+        assert!(
+            !component.child_components.is_empty(),
+            "Should have child components"
+        );
         assert!(
             component.child_components.contains(&"Button".to_string()),
             "Should have Button component"
@@ -711,9 +735,14 @@ function helperFunction() {
         assert_eq!(component.api_calls[0].function, "fetch");
 
         // Verify helper functions
-        assert!(!component.helper_functions.is_empty(), "Should have helper functions");
         assert!(
-            component.helper_functions.contains(&"helperFunction".to_string()),
+            !component.helper_functions.is_empty(),
+            "Should have helper functions"
+        );
+        assert!(
+            component
+                .helper_functions
+                .contains(&"helperFunction".to_string()),
             "Should have helperFunction"
         );
 
@@ -765,7 +794,8 @@ interface TaskCardProps {
 }
 "#;
         let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_typescript::LANGUAGE_TSX.into(); parser.set_language(&lang).unwrap();
+        let lang = tree_sitter_typescript::LANGUAGE_TSX.into();
+        parser.set_language(&lang).unwrap();
         let tree = parser.parse(code, None).unwrap();
         let root = tree.root_node();
 

@@ -25,10 +25,7 @@ pub fn extract_rust_symbols(root_node: &tree_sitter::Node, content: &[u8]) -> Re
 }
 
 /// Extract Rust function definitions
-fn extract_rust_functions(
-    node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<Symbol>> {
+fn extract_rust_functions(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
     let query_source = r#"
@@ -84,7 +81,7 @@ fn extract_rust_functions(
                 name: func_name,
                 line: node.start_position().row as u32 + 1,
                 end_line: node.end_position().row as u32 + 1,
-                scope: Scope::from_str(&scope),
+                scope: scope.parse::<Scope>().unwrap(),
                 signature,
                 parent: None,
                 receiver: None,
@@ -104,10 +101,7 @@ fn extract_rust_functions(
 }
 
 /// Extract Rust struct definitions
-fn extract_rust_structs(
-    node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<Symbol>> {
+fn extract_rust_structs(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
     let query_source = r#"
@@ -145,7 +139,7 @@ fn extract_rust_structs(
                 name: struct_name,
                 line: node.start_position().row as u32 + 1,
                 end_line: node.end_position().row as u32 + 1,
-                scope: Scope::from_str(&scope),
+                scope: scope.parse::<Scope>().unwrap(),
                 signature,
                 parent: None,
                 receiver: None,
@@ -161,10 +155,7 @@ fn extract_rust_structs(
 }
 
 /// Extract Rust trait definitions
-fn extract_rust_traits(
-    node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<Symbol>> {
+fn extract_rust_traits(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
     let query_source = r#"
@@ -202,7 +193,7 @@ fn extract_rust_traits(
                 name: trait_name,
                 line: node.start_position().row as u32 + 1,
                 end_line: node.end_position().row as u32 + 1,
-                scope: Scope::from_str(&scope),
+                scope: scope.parse::<Scope>().unwrap(),
                 signature,
                 parent: None,
                 receiver: None,
@@ -218,10 +209,7 @@ fn extract_rust_traits(
 }
 
 /// Extract Rust impl blocks
-fn extract_rust_impls(
-    node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<Symbol>> {
+fn extract_rust_impls(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
     let query_source = r#"
@@ -323,7 +311,7 @@ fn extract_rust_calls(
         ])
     "#;
 
-    let query = Query::new(&language, query_source)?;
+    let query = Query::new(language, query_source)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *func_node, content);
     while let Some(match_) = matches.next() {
@@ -340,10 +328,7 @@ fn extract_rust_calls(
 }
 
 /// Extract Rust imports (use statements)
-pub fn extract_rust_imports(
-    root_node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<String>> {
+pub fn extract_rust_imports(root_node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<String>> {
     let mut imports = Vec::new();
 
     let query_source = r#"
@@ -407,9 +392,7 @@ fn main() {
 
         let mut parser = tree_sitter::Parser::new();
         let lang = tree_sitter_rust::LANGUAGE.into();
-        parser
-            .set_language(&lang)
-            .expect("Failed to set language");
+        parser.set_language(&lang).expect("Failed to set language");
 
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
@@ -425,20 +408,25 @@ fn main() {
         );
 
         // Check struct
-        let greeter_struct = symbols.iter().find(|s| s.name == "Greeter" && s.symbol_type == SymbolType::Struct);
+        let greeter_struct = symbols
+            .iter()
+            .find(|s| s.name == "Greeter" && s.symbol_type == SymbolType::Struct);
         assert!(greeter_struct.is_some(), "Should find Greeter struct");
         let greeter_struct = greeter_struct.unwrap();
-        assert_eq!(greeter_struct.scope, Scope::from_str("pub"));
+        assert_eq!(greeter_struct.scope, "pub".parse::<Scope>().unwrap());
 
         // Check trait
         let greetable_trait = symbols.iter().find(|s| s.name == "Greetable");
         assert!(greetable_trait.is_some(), "Should find Greetable trait");
         let greetable_trait = greetable_trait.unwrap();
         assert_eq!(greetable_trait.symbol_type, SymbolType::Interface);
-        assert_eq!(greetable_trait.scope, Scope::from_str("pub"));
+        assert_eq!(greetable_trait.scope, "pub".parse::<Scope>().unwrap());
 
         // Check impl blocks
-        let impl_blocks: Vec<_> = symbols.iter().filter(|s| s.symbol_type == SymbolType::Type).collect();
+        let impl_blocks: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.symbol_type == SymbolType::Type)
+            .collect();
         assert_eq!(impl_blocks.len(), 2, "Should find 2 impl blocks");
     }
 
@@ -453,9 +441,7 @@ fn main() {}
 
         let mut parser = tree_sitter::Parser::new();
         let lang = tree_sitter_rust::LANGUAGE.into();
-        parser
-            .set_language(&lang)
-            .expect("Failed to set language");
+        parser.set_language(&lang).expect("Failed to set language");
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
 

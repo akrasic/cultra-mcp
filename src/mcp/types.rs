@@ -198,6 +198,8 @@ pub enum DocType {
     // CULTRA-1068 — audit/review types
     Audit,
     SecurityReview,
+    // CULTRA-1075 — first-class capture for noticed-but-deferred items
+    Observation,
     #[serde(other)]
     Other,
 }
@@ -219,6 +221,8 @@ impl fmt::Display for DocType {
             // CULTRA-1068 — audit/review types
             DocType::Audit => write!(f, "audit"),
             DocType::SecurityReview => write!(f, "security_review"),
+            // CULTRA-1075
+            DocType::Observation => write!(f, "observation"),
             DocType::Other => write!(f, "other"),
         }
     }
@@ -239,151 +243,21 @@ impl EnumValues for DocType {
             // CULTRA-1068
             "audit".to_string(),
             "security_review".to_string(),
+            // CULTRA-1075
+            "observation".to_string(),
         ]
-    }
-}
-
-// ========== Background Job Enums ==========
-
-#[allow(dead_code)] // Not yet exposed via MCP tools
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobStatus {
-    Pending,
-    Processing,
-    Completed,
-    Failed,
-    Retrying,
-    Cancelled,
-}
-
-impl fmt::Display for JobStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            JobStatus::Pending => write!(f, "pending"),
-            JobStatus::Processing => write!(f, "processing"),
-            JobStatus::Completed => write!(f, "completed"),
-            JobStatus::Failed => write!(f, "failed"),
-            JobStatus::Retrying => write!(f, "retrying"),
-            JobStatus::Cancelled => write!(f, "cancelled"),
-        }
-    }
-}
-
-#[allow(dead_code)] // Not yet exposed via MCP tools
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobType {
-    EmbedDocument,
-    EmbedTask,
-    EmbedSession,
-    EmbedSymbol,
-    BatchIndex,
-    #[serde(other)]
-    Other,
-}
-
-impl fmt::Display for JobType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            JobType::EmbedDocument => write!(f, "embed_document"),
-            JobType::EmbedTask => write!(f, "embed_task"),
-            JobType::EmbedSession => write!(f, "embed_session"),
-            JobType::EmbedSymbol => write!(f, "embed_symbol"),
-            JobType::BatchIndex => write!(f, "batch_index"),
-            JobType::Other => write!(f, "other"),
-        }
-    }
-}
-
-// ========== Log Level Enum ==========
-
-#[allow(dead_code)] // Not yet exposed via MCP tools
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LogLevel {
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LogLevel::Debug => write!(f, "debug"),
-            LogLevel::Info => write!(f, "info"),
-            LogLevel::Warn => write!(f, "warn"),
-            LogLevel::Error => write!(f, "error"),
-        }
-    }
-}
-
-// ========== Graph Enums ==========
-
-#[allow(dead_code)] // Not yet exposed via MCP tools (future: graph operations)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum EdgeClass {
-    Structural,  // Strong, explicit relationships (dependencies, hierarchy)
-    Evidence,    // Medium strength, observed relationships (calls, uses)
-    Heuristic,   // Weak, inferred relationships (similarity, co-occurrence)
-}
-
-impl fmt::Display for EdgeClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EdgeClass::Structural => write!(f, "STRUCTURAL"),
-            EdgeClass::Evidence => write!(f, "EVIDENCE"),
-            EdgeClass::Heuristic => write!(f, "HEURISTIC"),
-        }
-    }
-}
-
-#[allow(dead_code)] // Not yet exposed via MCP tools (future: graph operations)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EntityType {
-    Session,
-    Task,
-    Plan,
-    Document,
-    Decision,
-    Project,
-    Symbol,
-    #[serde(other)]
-    Other,
-}
-
-impl fmt::Display for EntityType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            EntityType::Session => write!(f, "session"),
-            EntityType::Task => write!(f, "task"),
-            EntityType::Plan => write!(f, "plan"),
-            EntityType::Document => write!(f, "document"),
-            EntityType::Decision => write!(f, "decision"),
-            EntityType::Project => write!(f, "project"),
-            EntityType::Symbol => write!(f, "symbol"),
-            EntityType::Other => write!(f, "other"),
-        }
     }
 }
 
 // ========== Session Strategy Enum ==========
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionStrategy {
-    Latest,    // Most recently active session
-    Relevant,  // Highest retrievability score (recency + access patterns)
-    Merge,     // Combine multiple high-scoring sessions (future)
-}
-
-impl Default for SessionStrategy {
-    fn default() -> Self {
-        SessionStrategy::Latest
-    }
+    #[default]
+    Latest, // Most recently active session
+    Relevant, // Highest retrievability score (recency + access patterns)
+    Merge,    // Combine multiple high-scoring sessions (future)
 }
 
 impl fmt::Display for SessionStrategy {
@@ -453,20 +327,6 @@ impl Language {
             _ => Language::Other,
         }
     }
-
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "go" | "golang" => Language::Go,
-            "typescript" | "ts" => Language::Typescript,
-            "javascript" | "js" => Language::Javascript,
-            "python" | "py" => Language::Python,
-            "rust" | "rs" => Language::Rust,
-            "terraform" | "tf" | "hcl" => Language::Terraform,
-            "php" => Language::Php,
-            "svelte" => Language::Svelte,
-            _ => Language::Other,
-        }
-    }
 }
 
 impl std::str::FromStr for Language {
@@ -520,23 +380,6 @@ impl fmt::Display for SymbolType {
     }
 }
 
-impl SymbolType {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "function" | "func" => SymbolType::Function,
-            "method" => SymbolType::Method,
-            "type" => SymbolType::Type,
-            "interface" => SymbolType::Interface,
-            "class" => SymbolType::Class,
-            "struct" => SymbolType::Struct,
-            "enum" => SymbolType::Enum,
-            "constant" | "const" => SymbolType::Constant,
-            "variable" | "var" => SymbolType::Variable,
-            _ => SymbolType::Other,
-        }
-    }
-}
-
 impl std::str::FromStr for SymbolType {
     type Err = std::convert::Infallible;
 
@@ -583,20 +426,6 @@ impl fmt::Display for Scope {
     }
 }
 
-impl Scope {
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "public" | "pub" => Scope::Public,
-            "private" | "pub(crate)" | "pub(super)" => Scope::Private,
-            "exported" => Scope::Exported,
-            "unexported" => Scope::Unexported,
-            "protected" => Scope::Protected,
-            "internal" | "pub(in" => Scope::Internal,
-            _ => Scope::Other,
-        }
-    }
-}
-
 impl std::str::FromStr for Scope {
     type Err = std::convert::Infallible;
 
@@ -635,16 +464,6 @@ mod tests {
     }
 
     #[test]
-    fn test_edge_class_serialization() {
-        let edge_class = EdgeClass::Structural;
-        let json = serde_json::to_string(&edge_class).unwrap();
-        assert_eq!(json, "\"STRUCTURAL\"");
-
-        let deserialized: EdgeClass = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized, EdgeClass::Structural);
-    }
-
-    #[test]
     fn test_session_strategy_default() {
         let default_strategy = SessionStrategy::default();
         assert_eq!(default_strategy, SessionStrategy::Latest);
@@ -670,8 +489,29 @@ mod tests {
         assert_eq!(sec.to_string(), "security_review");
 
         let values = DocType::valid_values();
-        assert!(values.contains(&"audit".to_string()), "audit missing from valid_values");
-        assert!(values.contains(&"security_review".to_string()), "security_review missing from valid_values");
+        assert!(
+            values.contains(&"audit".to_string()),
+            "audit missing from valid_values"
+        );
+        assert!(
+            values.contains(&"security_review".to_string()),
+            "security_review missing from valid_values"
+        );
+    }
+
+    #[test]
+    fn test_doc_type_observation_variant() {
+        // CULTRA-1075: observation must round-trip cleanly, not fall through
+        // to DocType::Other. Sibling pattern to test_doc_type_audit_variants.
+        let obs: DocType = serde_json::from_str("\"observation\"").unwrap();
+        assert_eq!(obs, DocType::Observation);
+        assert_eq!(obs.to_string(), "observation");
+
+        let values = DocType::valid_values();
+        assert!(
+            values.contains(&"observation".to_string()),
+            "observation missing from valid_values"
+        );
     }
 
     #[test]

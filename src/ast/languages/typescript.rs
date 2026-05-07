@@ -180,9 +180,12 @@ fn extract_typescript_classes(
 
             // CULTRA-967: extract class methods as individual symbols so
             // find_references / find_dead_code can anchor on them.
-            symbols.extend(
-                extract_typescript_class_methods(&cls_node, content, &class_name, ts_lang)?
-            );
+            symbols.extend(extract_typescript_class_methods(
+                &cls_node,
+                content,
+                &class_name,
+                ts_lang,
+            )?);
         }
     }
 
@@ -423,7 +426,7 @@ fn extract_typescript_calls(
         ])
     "#;
 
-    let query = Query::new(&language, query_source)?;
+    let query = Query::new(language, query_source)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *func_node, content);
     while let Some(match_) = matches.next() {
@@ -509,9 +512,7 @@ export function main() {
 
         let mut parser = tree_sitter::Parser::new();
         let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-        parser
-            .set_language(&lang)
-            .expect("Failed to set language");
+        parser.set_language(&lang).expect("Failed to set language");
 
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
@@ -543,7 +544,10 @@ export function main() {
         assert!(create_server.is_some(), "Should find createServer function");
         let create_server = create_server.unwrap();
         assert_eq!(create_server.symbol_type, SymbolType::Function);
-        assert!(create_server.parameters.len() > 0, "Should have parameters");
+        assert!(
+            !create_server.parameters.is_empty(),
+            "Should have parameters"
+        );
     }
 
     #[test]
@@ -557,9 +561,7 @@ function main() {}
 
         let mut parser = tree_sitter::Parser::new();
         let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-        parser
-            .set_language(&lang)
-            .expect("Failed to set language");
+        parser.set_language(&lang).expect("Failed to set language");
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
 

@@ -28,6 +28,14 @@ pub struct SecurityFinding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
     pub cwe: String,
+    /// CULTRA-1088: stable fingerprint enabling doc-based security review workflow.
+    /// Format: `{rule_id}:{enclosing_symbol}:{content_hash}` for AST-emitted findings,
+    /// `{rule_id}:<line>:{content_hash}` for pattern-based findings, and
+    /// `{rule_id}:{tag}:{content_hash}` for synthetic-tag findings (e.g., resource names).
+    /// Deterministic across runs, stable across line drift, sensitive to meaningful
+    /// content change. File path is intentionally NOT in the fingerprint — file moves
+    /// are detected separately via the location field.
+    pub fingerprint: String,
 }
 
 /// Summary statistics
@@ -60,9 +68,7 @@ struct SecurityRule {
 /// Analyze a source file for security vulnerabilities
 pub fn analyze_security(file_path: &str) -> Result<SecurityAnalysis> {
     let content = fs::read_to_string(file_path)?;
-    let raw_language = detect_language(file_path)
-        .unwrap_or("unknown")
-        .to_string();
+    let raw_language = detect_language(file_path).unwrap_or("unknown").to_string();
     // Svelte scripts are TypeScript — match TypeScript security rules
     let language = if raw_language == "svelte" {
         "typescript".to_string()
@@ -107,6 +113,7 @@ pub fn analyze_security(file_path: &str) -> Result<SecurityAnalysis> {
                             Some(rule.fix.to_string())
                         },
                         cwe: rule.cwe.to_string(),
+                        fingerprint: fingerprint_from_line(rule.id, trimmed),
                     });
                     // Only report first occurrence per pattern per rule
                     break;
@@ -116,7 +123,7 @@ pub fn analyze_security(file_path: &str) -> Result<SecurityAnalysis> {
     }
 
     // Deduplicate findings by rule_id + line
-    findings.sort_by(|a, b| a.line.cmp(&b.line));
+    findings.sort_by_key(|a| a.line);
     findings.dedup_by(|a, b| a.rule_id == b.rule_id && a.line == b.line);
 
     // CULTRA-901: data-flow post-filter for SQL findings.
@@ -130,7 +137,7 @@ pub fn analyze_security(file_path: &str) -> Result<SecurityAnalysis> {
     findings.extend(structural_findings);
 
     // Sort by severity (critical first)
-    findings.sort_by(|a, b| severity_rank(&a.severity).cmp(&severity_rank(&b.severity)));
+    findings.sort_by_key(|a| severity_rank(&a.severity));
 
     let summary = build_summary(&findings);
 
@@ -154,10 +161,7 @@ fn severity_rank(s: &str) -> u8 {
 }
 
 fn build_summary(findings: &[SecurityFinding]) -> SecuritySummary {
-    let mut categories: Vec<String> = findings
-        .iter()
-        .map(|f| f.category.clone())
-        .collect();
+    let mut categories: Vec<String> = findings.iter().map(|f| f.category.clone()).collect();
     categories.sort();
     categories.dedup();
 
@@ -170,6 +174,120 @@ fn build_summary(findings: &[SecurityFinding]) -> SecuritySummary {
         info: findings.iter().filter(|f| f.severity == "info").count(),
         categories,
     }
+}
+
+// ===========================================================================
+// CULTRA-1088: stable fingerprints for security findings.
+//
+// Enables a doc-based security review workflow. Agent runs the scanner, looks
+// up matching fingerprints in an existing security_review document for the
+// project, and only re-evaluates findings that don't have a recorded
+// disposition.
+//
+// Fingerprint shape: `{rule_id}:{tag}:{content_hash:x}` where:
+//   - `tag` is the enclosing function/method name when an AST node is
+//     available, `<line>` for pattern-emitted findings (line-text matching
+//     without AST context), or a synthetic identifier (e.g., resource name
+//     for Terraform block-level findings).
+//   - `content_hash` is FNV-1a over the matched span text, normalized via
+//     whitespace collapse (trim + split_whitespace + join). FNV-1a is used
+//     instead of std::hash::DefaultHasher to guarantee cross-version
+//     determinism — DefaultHasher's algorithm is documented as
+//     "implementation-defined" and could change between Rust releases.
+// ===========================================================================
+
+/// FNV-1a 64-bit hash. Deterministic across Rust versions.
+fn fnv1a_64(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Normalize text for content hashing: trim, then collapse internal whitespace
+/// runs to a single space. Survives reformatting that doesn't change semantic
+/// content (re-indenting, line breaks inside expressions, etc.).
+fn normalize_for_hash(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Walk parents of `node` looking for an enclosing function/method/closure.
+/// Returns the symbol name when found; `<anonymous>` for nameless function
+/// expressions (closures, arrow functions); `<module>` if no enclosing function
+/// node is found in the parent chain.
+///
+/// Polyglot: covers tree-sitter node kinds across the languages security rules
+/// fire on (Go, Rust, Python, TypeScript, JavaScript, TSX). Terraform doesn't
+/// have an analogous concept; Terraform findings use the resource name as the
+/// fingerprint tag instead.
+fn find_enclosing_symbol(node: tree_sitter::Node, content: &[u8]) -> String {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        let kind = parent.kind();
+        let is_func_node = matches!(
+            kind,
+            // Go
+            "function_declaration" | "method_declaration"
+            // Rust
+            | "function_item"
+            // Python
+            | "function_definition"
+            // JS / TS shared (note: function_declaration also matches Go above
+            //   — same string, distinct grammars, harmless overlap)
+            | "method_definition"
+            | "function" | "function_expression" | "arrow_function"
+            // TS-specific
+            | "function_signature"
+        );
+        if is_func_node {
+            for i in 0..parent.child_count() {
+                if let Some(child) = parent.child(i as u32) {
+                    let child_kind = child.kind();
+                    if matches!(
+                        child_kind,
+                        "identifier" | "field_identifier" | "property_identifier"
+                    ) {
+                        if let Ok(name) = child.utf8_text(content) {
+                            return name.to_string();
+                        }
+                    }
+                }
+            }
+            return "<anonymous>".to_string();
+        }
+        current = parent.parent();
+    }
+    "<module>".to_string()
+}
+
+/// Compute a stable fingerprint for an AST-emitted finding. `node` is the
+/// tree-sitter node spanning the matched expression (e.g., the call_expression,
+/// the method identifier, the violating string literal).
+fn fingerprint_from_node(rule_id: &str, node: tree_sitter::Node, content_bytes: &[u8]) -> String {
+    let symbol = find_enclosing_symbol(node, content_bytes);
+    let span_bytes = &content_bytes[node.byte_range()];
+    let span_text = std::str::from_utf8(span_bytes).unwrap_or("");
+    let hash = fnv1a_64(&normalize_for_hash(span_text));
+    format!("{}:{}:{:x}", rule_id, symbol, hash)
+}
+
+/// Compute a stable fingerprint for a pattern-emitted finding (regex/text
+/// match without AST context). The tag is `<line>` because the only context
+/// we have is the matched line text itself.
+fn fingerprint_from_line(rule_id: &str, line_text: &str) -> String {
+    let hash = fnv1a_64(&normalize_for_hash(line_text));
+    format!("{}:<line>:{:x}", rule_id, hash)
+}
+
+/// Compute a stable fingerprint for a finding tagged with a synthetic
+/// identifier (e.g., a Terraform resource name). The hash is over `tag` to
+/// ensure two different resources with the same rule produce distinct
+/// fingerprints.
+fn fingerprint_from_tag(rule_id: &str, tag: &str) -> String {
+    let hash = fnv1a_64(tag);
+    format!("{}:{}:{:x}", rule_id, tag, hash)
 }
 
 fn is_comment(line: &str, language: &str) -> bool {
@@ -833,10 +951,8 @@ fn collect_rust_function_sinks(
 /// True if the subtree rooted at `node` contains any call_expression whose
 /// function path's final segment matches a known Rust SQL sink method.
 fn function_body_contains_rust_sql_sink(node: tree_sitter::Node, bytes: &[u8]) -> bool {
-    if node.kind() == "call_expression" {
-        if call_expr_is_rust_sql_sink(node, bytes) {
-            return true;
-        }
+    if node.kind() == "call_expression" && call_expr_is_rust_sql_sink(node, bytes) {
+        return true;
     }
     // Macro invocations can also be sinks: sqlx::query!, diesel::sql_query!, etc.
     if node.kind() == "macro_invocation" {
@@ -878,7 +994,9 @@ fn call_expr_is_rust_sql_sink(call: tree_sitter::Node, bytes: &[u8]) -> bool {
         "identifier" => Some(node_text_rust(func, bytes)),
         _ => None,
     };
-    final_name.map(|n| is_rust_sql_sink_method(&n)).unwrap_or(false)
+    final_name
+        .map(|n| is_rust_sql_sink_method(&n))
+        .unwrap_or(false)
 }
 
 fn is_rust_sql_sink_method(name: &str) -> bool {
@@ -967,11 +1085,7 @@ fn collect_sprintf_assignments_in_body(
 /// Recursively find `name := fmt.Sprintf(...)` patterns. Records (line, name).
 /// Only handles single-LHS short_var_declaration. Multi-LHS or
 /// long-form assignments are skipped (treated as unknown by the filter).
-fn collect_sprintf_assigns(
-    node: tree_sitter::Node,
-    bytes: &[u8],
-    out: &mut Vec<(u32, String)>,
-) {
+fn collect_sprintf_assigns(node: tree_sitter::Node, bytes: &[u8], out: &mut Vec<(u32, String)>) {
     if node.kind() == "short_var_declaration" {
         if let Some(var_name) = extract_single_lhs_name(node, bytes) {
             if let Some(rhs) = node.child_by_field_name("right") {
@@ -991,10 +1105,7 @@ fn collect_sprintf_assigns(
 
 /// Extract the LHS identifier of a `name := ...` short_var_declaration.
 /// Returns None for multi-LHS (`a, b := ...`) or non-identifier targets.
-fn extract_single_lhs_name(
-    decl: tree_sitter::Node,
-    bytes: &[u8],
-) -> Option<String> {
+fn extract_single_lhs_name(decl: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
     let lhs = decl.child_by_field_name("left")?;
     // expression_list with exactly one identifier child
     let mut named_count = 0;
@@ -1038,7 +1149,10 @@ fn rhs_is_fmt_sprintf(rhs: tree_sitter::Node, bytes: &[u8]) -> bool {
     let method = func
         .child_by_field_name("field")
         .map(|n| node_text(n, bytes));
-    matches!((pkg.as_deref(), method.as_deref()), (Some("fmt"), Some("Sprintf")))
+    matches!(
+        (pkg.as_deref(), method.as_deref()),
+        (Some("fmt"), Some("Sprintf"))
+    )
 }
 
 /// Recursively walks a function body collecting identifier names that
@@ -1048,13 +1162,11 @@ fn collect_sink_arg_idents(
     bytes: &[u8],
     out: &mut std::collections::HashSet<String>,
 ) {
-    if node.kind() == "call_expression" {
-        if call_is_sql_sink(node, bytes) {
-            if let Some(args) = node.child_by_field_name("arguments") {
-                let mut cursor = args.walk();
-                for arg in args.named_children(&mut cursor) {
-                    collect_identifiers(arg, bytes, out);
-                }
+    if node.kind() == "call_expression" && call_is_sql_sink(node, bytes) {
+        if let Some(args) = node.child_by_field_name("arguments") {
+            let mut cursor = args.walk();
+            for arg in args.named_children(&mut cursor) {
+                collect_identifiers(arg, bytes, out);
             }
         }
     }
@@ -1082,12 +1194,7 @@ fn call_is_sql_sink(call: tree_sitter::Node, bytes: &[u8]) -> bool {
     };
     matches!(
         method.as_str(),
-        "Exec"
-            | "ExecContext"
-            | "Query"
-            | "QueryContext"
-            | "QueryRow"
-            | "QueryRowContext"
+        "Exec" | "ExecContext" | "Query" | "QueryContext" | "QueryRow" | "QueryRowContext"
     )
 }
 
@@ -1193,6 +1300,7 @@ fn go_structural_analysis(file_path: &str, content: &str) -> Result<Vec<Security
                         ),
                         fix: Some("Use parameterized queries: db.Query(\"SELECT * FROM users WHERE id = $1\", id)".to_string()),
                         cwe: "CWE-89".to_string(),
+                        fingerprint: fingerprint_from_node("SEC-SQL-AST-001", cap.node, content_bytes),
                     });
                 }
             }
@@ -1254,6 +1362,7 @@ fn js_structural_analysis(file_path: &str, content: &str) -> Result<Vec<Security
                         snippet: None,
                         fix: Some("Replace eval() with safe alternatives like JSON.parse() for data or a sandboxed execution environment.".to_string()),
                         cwe: "CWE-94".to_string(),
+                        fingerprint: fingerprint_from_node("SEC-EVAL-001", cap.node, content_bytes),
                     });
                 }
             }
@@ -1280,12 +1389,18 @@ fn js_structural_analysis(file_path: &str, content: &str) -> Result<Vec<Security
                         category: "code-injection".to_string(),
                         severity: "high".to_string(),
                         title: "Use of Function constructor".to_string(),
-                        description: "new Function() is equivalent to eval() and can execute arbitrary code.".to_string(),
+                        description:
+                            "new Function() is equivalent to eval() and can execute arbitrary code."
+                                .to_string(),
                         location: format!("{}:{}", file_path, line),
                         line: line as u32,
                         snippet: None,
-                        fix: Some("Avoid dynamic code generation. Use static function definitions.".to_string()),
+                        fix: Some(
+                            "Avoid dynamic code generation. Use static function definitions."
+                                .to_string(),
+                        ),
                         cwe: "CWE-94".to_string(),
+                        fingerprint: fingerprint_from_node("SEC-EVAL-002", cap.node, content_bytes),
                     });
                 }
             }
@@ -1326,10 +1441,8 @@ fn python_structural_analysis(file_path: &str, content: &str) -> Result<Vec<Secu
             for cap in m.captures {
                 let name = &query.capture_names()[cap.index as usize];
                 if *name == "fn" {
-                    let fn_name = std::str::from_utf8(
-                        &content_bytes[cap.node.byte_range()],
-                    )
-                    .unwrap_or("eval");
+                    let fn_name = std::str::from_utf8(&content_bytes[cap.node.byte_range()])
+                        .unwrap_or("eval");
                     let line = cap.node.start_position().row + 1;
                     findings.push(SecurityFinding {
                         rule_id: "SEC-PYEVAL-001".to_string(),
@@ -1345,6 +1458,7 @@ fn python_structural_analysis(file_path: &str, content: &str) -> Result<Vec<Secu
                         snippet: None,
                         fix: Some("Use ast.literal_eval() for data parsing, or avoid dynamic code execution entirely.".to_string()),
                         cwe: "CWE-94".to_string(),
+                        fingerprint: fingerprint_from_node("SEC-PYEVAL-001", cap.node, content_bytes),
                     });
                 }
             }
@@ -1389,13 +1503,19 @@ fn rust_structural_analysis(file_path: &str, content: &str) -> Result<Vec<Securi
         while let Some(m) = matches.next() {
             // Find the @call capture (the whole call_expression node) so we
             // can ask its parent chain about test context.
-            let call_node = m.captures.iter()
+            let call_node = m
+                .captures
+                .iter()
                 .find(|cap| query.capture_names()[cap.index as usize] == "call")
                 .map(|cap| cap.node);
-            let method_node = m.captures.iter()
+            let method_node = m
+                .captures
+                .iter()
                 .find(|cap| query.capture_names()[cap.index as usize] == "method")
                 .map(|cap| cap.node);
-            let (Some(call), Some(method)) = (call_node, method_node) else { continue };
+            let (Some(call), Some(method)) = (call_node, method_node) else {
+                continue;
+            };
 
             if rust_node_is_in_test_context(call, content_bytes) {
                 continue;
@@ -1419,6 +1539,9 @@ fn rust_structural_analysis(file_path: &str, content: &str) -> Result<Vec<Securi
                 snippet: None,
                 fix: Some("Use proper error handling with ? operator or match. Reserve unwrap() for cases where failure is logically impossible.".to_string()),
                 cwe: "CWE-248".to_string(),
+                // Fingerprint over the broader call expression so the hash
+                // covers the receiver + method, not just the method ident.
+                fingerprint: fingerprint_from_node("SEC-RUST-002", call, content_bytes),
             });
         }
     }
@@ -1441,10 +1564,10 @@ fn rust_node_is_in_test_context(node: tree_sitter::Node, content_bytes: &[u8]) -
             Some(p) => p,
             None => return false,
         };
-        if parent.kind() == "function_item" || parent.kind() == "mod_item" {
-            if rust_item_has_test_attribute(parent, content_bytes) {
-                return true;
-            }
+        if (parent.kind() == "function_item" || parent.kind() == "mod_item")
+            && rust_item_has_test_attribute(parent, content_bytes)
+        {
+            return true;
         }
         current = parent;
     }
@@ -1504,22 +1627,26 @@ fn terraform_structural_analysis(file_path: &str, content: &str) -> Result<Vec<S
     let mut s3_buckets: Vec<(String, u32)> = Vec::new(); // (name, line)
     let mut has_versioning: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    collect_tf_blocks(&root, content.as_bytes(), &mut |block_type, labels, line| {
-        if block_type == "resource" {
-            if let Some(rtype) = labels.first() {
-                if rtype == "aws_s3_bucket" {
-                    if let Some(name) = labels.get(1) {
-                        s3_buckets.push((name.clone(), line));
+    collect_tf_blocks(
+        &root,
+        content.as_bytes(),
+        &mut |block_type, labels, line| {
+            if block_type == "resource" {
+                if let Some(rtype) = labels.first() {
+                    if rtype == "aws_s3_bucket" {
+                        if let Some(name) = labels.get(1) {
+                            s3_buckets.push((name.clone(), line));
+                        }
                     }
-                }
-                if rtype == "aws_s3_bucket_versioning" {
-                    if let Some(name) = labels.get(1) {
-                        has_versioning.insert(name.clone());
+                    if rtype == "aws_s3_bucket_versioning" {
+                        if let Some(name) = labels.get(1) {
+                            has_versioning.insert(name.clone());
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 
     for (bucket_name, line) in &s3_buckets {
         // Heuristic: versioning resource often named with the bucket name
@@ -1539,6 +1666,10 @@ fn terraform_structural_analysis(file_path: &str, content: &str) -> Result<Vec<S
                 snippet: None,
                 cwe: "CWE-693".to_string(),
                 fix: Some("Add an aws_s3_bucket_versioning resource with versioning_configuration { status = \"Enabled\" }.".to_string()),
+                // Block-level finding: tag with the bucket resource name so
+                // each bucket gets a distinct, stable fingerprint regardless
+                // of where in the file it's declared.
+                fingerprint: fingerprint_from_tag("SEC-TF-006", bucket_name),
             });
         }
     }
@@ -1565,7 +1696,11 @@ fn collect_tf_blocks(
                             let labels: Vec<String> = children
                                 .iter()
                                 .filter(|c| c.kind() == "string_lit")
-                                .filter_map(|c| c.utf8_text(content).ok().map(|s| s.trim_matches('"').to_string()))
+                                .filter_map(|c| {
+                                    c.utf8_text(content)
+                                        .ok()
+                                        .map(|s| s.trim_matches('"').to_string())
+                                })
                                 .collect();
                             let line = child.start_position().row as u32 + 1;
                             callback(block_type, labels, line);
@@ -1583,27 +1718,174 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    // ===========================================================================
+    // CULTRA-1088: fingerprint determinism + stability tests
+    // ===========================================================================
+
+    #[test]
+    fn test_fingerprint_from_line_is_deterministic() {
+        let a = fingerprint_from_line("SEC-X-001", "msg := fmt.Sprintf(\"DELETE FROM users\")");
+        let b = fingerprint_from_line("SEC-X-001", "msg := fmt.Sprintf(\"DELETE FROM users\")");
+        assert_eq!(a, b, "same input must produce identical fingerprints");
+    }
+
+    #[test]
+    fn test_fingerprint_from_line_survives_whitespace_drift() {
+        let a = fingerprint_from_line("SEC-X-001", "msg :=  fmt.Sprintf(\"DELETE\")");
+        let b = fingerprint_from_line("SEC-X-001", "msg := fmt.Sprintf(\"DELETE\")");
+        let c = fingerprint_from_line("SEC-X-001", "  msg := fmt.Sprintf(\"DELETE\")  ");
+        assert_eq!(
+            a, b,
+            "extra internal whitespace must not change the fingerprint"
+        );
+        assert_eq!(b, c, "leading/trailing whitespace must not change it");
+    }
+
+    #[test]
+    fn test_fingerprint_from_line_distinguishes_content() {
+        let a = fingerprint_from_line("SEC-X-001", "DELETE FROM users");
+        let b = fingerprint_from_line("SEC-X-001", "DELETE FROM accounts");
+        assert_ne!(
+            a, b,
+            "different content must produce different fingerprints"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_includes_rule_id() {
+        let a = fingerprint_from_line("SEC-X-001", "shared content");
+        let b = fingerprint_from_line("SEC-X-002", "shared content");
+        assert_ne!(
+            a, b,
+            "different rule_id must produce different fingerprints even with identical content"
+        );
+        assert!(
+            a.starts_with("SEC-X-001:"),
+            "rule_id must lead the fingerprint"
+        );
+        assert!(
+            b.starts_with("SEC-X-002:"),
+            "rule_id must lead the fingerprint"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_from_tag_distinguishes_tags() {
+        let a = fingerprint_from_tag("SEC-TF-006", "bucket_a");
+        let b = fingerprint_from_tag("SEC-TF-006", "bucket_b");
+        assert_ne!(
+            a, b,
+            "different tags (e.g. distinct resource names) must produce different fingerprints"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_round_trip_via_finding_field() {
+        // Smoke test: a real scanner run populates the fingerprint field with
+        // a non-empty rule-id-prefixed value on every emitted finding.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.go");
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "package main").unwrap();
+        writeln!(f, "import \"crypto/md5\"").unwrap();
+        writeln!(f, "func main() {{ _ = md5.New() }}").unwrap();
+        drop(f);
+
+        let analysis = analyze_security(path.to_str().unwrap()).unwrap();
+        assert!(
+            !analysis.findings.is_empty(),
+            "expected at least one md5-related finding"
+        );
+        for finding in &analysis.findings {
+            assert!(
+                !finding.fingerprint.is_empty(),
+                "every finding must carry a fingerprint, got empty for {}",
+                finding.rule_id
+            );
+            assert!(
+                finding
+                    .fingerprint
+                    .starts_with(finding.fingerprint.split(':').next().unwrap_or("")),
+                "fingerprint must lead with rule_id"
+            );
+            assert!(
+                finding.fingerprint.contains(':'),
+                "fingerprint must use the rule_id:tag:hash shape"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fingerprint_stable_across_two_runs_on_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dual.py");
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "def run(user_input):").unwrap();
+        writeln!(f, "    eval(user_input)").unwrap();
+        drop(f);
+
+        let run1 = analyze_security(path.to_str().unwrap()).unwrap();
+        let run2 = analyze_security(path.to_str().unwrap()).unwrap();
+
+        let fps1: Vec<String> = run1
+            .findings
+            .iter()
+            .map(|f| f.fingerprint.clone())
+            .collect();
+        let fps2: Vec<String> = run2
+            .findings
+            .iter()
+            .map(|f| f.fingerprint.clone())
+            .collect();
+        assert_eq!(
+            fps1, fps2,
+            "two runs over the same file must produce identical fingerprint sets"
+        );
+    }
+
+    // ===========================================================================
+    // existing pattern + structural tests
+    // ===========================================================================
+
     #[test]
     fn test_basic_pattern_detection() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.go");
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "import \"crypto/md5\"").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    query := fmt.Sprintf(\"SELECT * FROM users WHERE id = %s\", id)").unwrap();
+        writeln!(
+            f,
+            "    query := fmt.Sprintf(\"SELECT * FROM users WHERE id = %s\", id)"
+        )
+        .unwrap();
         writeln!(f, "    db.Query(query)").unwrap();
         writeln!(f, "    password = \"hunter2\"").unwrap();
         writeln!(f, "}}").unwrap();
 
         let result = analyze_security(path.to_str().unwrap()).unwrap();
-        assert!(result.findings.len() >= 2, "Expected at least 2 findings, got {}", result.findings.len());
+        assert!(
+            result.findings.len() >= 2,
+            "Expected at least 2 findings, got {}",
+            result.findings.len()
+        );
 
-        let categories: Vec<&str> = result.findings.iter().map(|f| f.category.as_str()).collect();
-        assert!(categories.contains(&"sql-injection"), "Expected sql-injection finding");
-        assert!(categories.contains(&"hardcoded-secrets"), "Expected hardcoded-secrets finding");
+        let categories: Vec<&str> = result
+            .findings
+            .iter()
+            .map(|f| f.category.as_str())
+            .collect();
+        assert!(
+            categories.contains(&"sql-injection"),
+            "Expected sql-injection finding"
+        );
+        assert!(
+            categories.contains(&"hardcoded-secrets"),
+            "Expected hardcoded-secrets finding"
+        );
     }
 
     #[test]
@@ -1620,7 +1902,10 @@ mod tests {
             .iter()
             .filter(|f| f.category == "hardcoded-secrets")
             .collect();
-        assert!(secret_findings.is_empty(), "Comments should not trigger findings");
+        assert!(
+            secret_findings.is_empty(),
+            "Comments should not trigger findings"
+        );
     }
 
     #[test]
@@ -1708,7 +1993,10 @@ resource "aws_security_group" "open" {
             .iter()
             .filter(|f| f.category == "network-exposure")
             .collect();
-        assert!(!net_findings.is_empty(), "Expected network-exposure finding for 0.0.0.0/0");
+        assert!(
+            !net_findings.is_empty(),
+            "Expected network-exposure finding for 0.0.0.0/0"
+        );
     }
 
     #[test]
@@ -1760,7 +2048,10 @@ resource "aws_s3_bucket" "data" {
             .iter()
             .filter(|f| f.rule_id == "SEC-TF-006")
             .collect();
-        assert!(!versioning_findings.is_empty(), "Expected missing versioning finding");
+        assert!(
+            !versioning_findings.is_empty(),
+            "Expected missing versioning finding"
+        );
     }
 
     fn sql_findings(path: &std::path::Path) -> Vec<SecurityFinding> {
@@ -1779,10 +2070,13 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    msg := fmt.Sprintf(\"Deleted client %{}s\", id)", "").unwrap();
+        writeln!(f, "    msg := fmt.Sprintf(\"Deleted client %s\", id)").unwrap();
         writeln!(f, "    _ = msg").unwrap();
         writeln!(f, "}}").unwrap();
-        assert!(sql_findings(&path).is_empty(), "English word 'Deleted' must not flag SQL injection");
+        assert!(
+            sql_findings(&path).is_empty(),
+            "English word 'Deleted' must not flag SQL injection"
+        );
     }
 
     #[test]
@@ -1792,10 +2086,13 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    msg := fmt.Sprintf(\"Updated record %{}s\", id)", "").unwrap();
+        writeln!(f, "    msg := fmt.Sprintf(\"Updated record %s\", id)").unwrap();
         writeln!(f, "    _ = msg").unwrap();
         writeln!(f, "}}").unwrap();
-        assert!(sql_findings(&path).is_empty(), "English word 'Updated' must not flag SQL injection");
+        assert!(
+            sql_findings(&path).is_empty(),
+            "English word 'Updated' must not flag SQL injection"
+        );
     }
 
     #[test]
@@ -1805,10 +2102,13 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    msg := fmt.Sprintf(\"Selected option %{}s\", id)", "").unwrap();
+        writeln!(f, "    msg := fmt.Sprintf(\"Selected option %s\", id)").unwrap();
         writeln!(f, "    _ = msg").unwrap();
         writeln!(f, "}}").unwrap();
-        assert!(sql_findings(&path).is_empty(), "English word 'Selected' must not flag SQL injection");
+        assert!(
+            sql_findings(&path).is_empty(),
+            "English word 'Selected' must not flag SQL injection"
+        );
     }
 
     #[test]
@@ -1818,10 +2118,13 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    msg := fmt.Sprintf(\"Inserted row %{}s\", id)", "").unwrap();
+        writeln!(f, "    msg := fmt.Sprintf(\"Inserted row %s\", id)").unwrap();
         writeln!(f, "    _ = msg").unwrap();
         writeln!(f, "}}").unwrap();
-        assert!(sql_findings(&path).is_empty(), "English word 'Inserted' must not flag SQL injection");
+        assert!(
+            sql_findings(&path).is_empty(),
+            "English word 'Inserted' must not flag SQL injection"
+        );
     }
 
     #[test]
@@ -1831,10 +2134,13 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    msg := fmt.Sprintf(\"Dropped packet %{}s\", id)", "").unwrap();
+        writeln!(f, "    msg := fmt.Sprintf(\"Dropped packet %s\", id)").unwrap();
         writeln!(f, "    _ = msg").unwrap();
         writeln!(f, "}}").unwrap();
-        assert!(sql_findings(&path).is_empty(), "English word 'Dropped' must not flag SQL injection");
+        assert!(
+            sql_findings(&path).is_empty(),
+            "English word 'Dropped' must not flag SQL injection"
+        );
     }
 
     #[test]
@@ -1844,10 +2150,17 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    q := fmt.Sprintf(\"DELETE FROM users WHERE id = %{}d\", id)", "").unwrap();
+        writeln!(
+            f,
+            "    q := fmt.Sprintf(\"DELETE FROM users WHERE id = %d\", id)"
+        )
+        .unwrap();
         writeln!(f, "    db.Exec(q)").unwrap();
         writeln!(f, "}}").unwrap();
-        assert!(!sql_findings(&path).is_empty(), "Real DELETE FROM must still flag");
+        assert!(
+            !sql_findings(&path).is_empty(),
+            "Real DELETE FROM must still flag"
+        );
     }
 
     #[test]
@@ -1857,10 +2170,17 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    q := fmt.Sprintf(\"INSERT INTO users VALUES (%{}s)\", v)", "").unwrap();
+        writeln!(
+            f,
+            "    q := fmt.Sprintf(\"INSERT INTO users VALUES (%s)\", v)"
+        )
+        .unwrap();
         writeln!(f, "    db.Exec(q)").unwrap();
         writeln!(f, "}}").unwrap();
-        assert!(!sql_findings(&path).is_empty(), "Real INSERT INTO must still flag");
+        assert!(
+            !sql_findings(&path).is_empty(),
+            "Real INSERT INTO must still flag"
+        );
     }
 
     #[test]
@@ -1870,10 +2190,13 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    q := fmt.Sprintf(\"UPDATE users SET name = %{}s\", v)", "").unwrap();
+        writeln!(f, "    q := fmt.Sprintf(\"UPDATE users SET name = %s\", v)").unwrap();
         writeln!(f, "    db.Exec(q)").unwrap();
         writeln!(f, "}}").unwrap();
-        assert!(!sql_findings(&path).is_empty(), "Real UPDATE must still flag");
+        assert!(
+            !sql_findings(&path).is_empty(),
+            "Real UPDATE must still flag"
+        );
     }
 
     #[test]
@@ -1883,10 +2206,17 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func main() {{").unwrap();
-        writeln!(f, "    q := fmt.Sprintf(\"SELECT * FROM users WHERE id = %{}s\", id)", "").unwrap();
+        writeln!(
+            f,
+            "    q := fmt.Sprintf(\"SELECT * FROM users WHERE id = %s\", id)"
+        )
+        .unwrap();
         writeln!(f, "    db.Query(q)").unwrap();
         writeln!(f, "}}").unwrap();
-        assert!(!sql_findings(&path).is_empty(), "Real SELECT must still flag");
+        assert!(
+            !sql_findings(&path).is_empty(),
+            "Real SELECT must still flag"
+        );
     }
 
     // CULTRA-901: data-flow post-filter tests.
@@ -1898,7 +2228,11 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func handler() {{").unwrap();
-        writeln!(f, "    msg := fmt.Sprintf(\"DELETE FROM ghost rows = %{}d\", id)", "").unwrap();
+        writeln!(
+            f,
+            "    msg := fmt.Sprintf(\"DELETE FROM ghost rows = %d\", id)"
+        )
+        .unwrap();
         writeln!(f, "    c.JSON(map[string]string{{\"message\": msg}})").unwrap();
         writeln!(f, "}}").unwrap();
         assert!(
@@ -1914,7 +2248,11 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func handler() {{").unwrap();
-        writeln!(f, "    line := fmt.Sprintf(\"INSERT INTO audit %{}s\", action)", "").unwrap();
+        writeln!(
+            f,
+            "    line := fmt.Sprintf(\"INSERT INTO audit %s\", action)"
+        )
+        .unwrap();
         writeln!(f, "    log.Printf(line)").unwrap();
         writeln!(f, "}}").unwrap();
         assert!(
@@ -1930,7 +2268,11 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func handler() {{").unwrap();
-        writeln!(f, "    q := fmt.Sprintf(\"DELETE FROM ghosts WHERE id = %{}d\", id)", "").unwrap();
+        writeln!(
+            f,
+            "    q := fmt.Sprintf(\"DELETE FROM ghosts WHERE id = %d\", id)"
+        )
+        .unwrap();
         writeln!(f, "    return").unwrap();
         writeln!(f, "}}").unwrap();
         // Variable q is never referenced anywhere in the body — proven safe.
@@ -1950,7 +2292,11 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func handler() {{").unwrap();
-        writeln!(f, "    q := fmt.Sprintf(\"DELETE FROM users WHERE id = %{}d\", id)", "").unwrap();
+        writeln!(
+            f,
+            "    q := fmt.Sprintf(\"DELETE FROM users WHERE id = %d\", id)"
+        )
+        .unwrap();
         writeln!(f, "    dbq.ExecContext(ctx, q)").unwrap();
         writeln!(f, "}}").unwrap();
         assert!(
@@ -1967,7 +2313,11 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func handler() {{").unwrap();
-        writeln!(f, "    return fmt.Sprintf(\"DELETE FROM x WHERE id = %{}d\", id)", "").unwrap();
+        writeln!(
+            f,
+            "    return fmt.Sprintf(\"DELETE FROM x WHERE id = %d\", id)"
+        )
+        .unwrap();
         writeln!(f, "}}").unwrap();
         assert!(
             !sql_findings(&path).is_empty(),
@@ -1987,12 +2337,12 @@ resource "aws_s3_bucket" "data" {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pats.rs");
         let mut f = fs::File::create(&path).unwrap();
-        write!(f, "pub fn get_patterns() -> &'static [&'static str] {{\n").unwrap();
-        write!(f, "    &[\n").unwrap();
-        write!(f, "        \"fmt.Sprintf(\"DELETE \",\n").unwrap();
-        write!(f, "        \"fmt.Sprintf(\"INSERT \",\n").unwrap();
-        write!(f, "    ]\n").unwrap();
-        write!(f, "}}\n").unwrap();
+        writeln!(f, "pub fn get_patterns() -> &'static [&'static str] {{").unwrap();
+        writeln!(f, "    &[").unwrap();
+        writeln!(f, "        \"fmt.Sprintf(\"DELETE \",").unwrap();
+        writeln!(f, "        \"fmt.Sprintf(\"INSERT \",").unwrap();
+        writeln!(f, "    ]").unwrap();
+        writeln!(f, "}}").unwrap();
         drop(f);
 
         let findings: Vec<_> = analyze_security(path.to_str().unwrap())
@@ -2014,7 +2364,7 @@ resource "aws_s3_bucket" "data" {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("constpat.rs");
         let mut f = fs::File::create(&path).unwrap();
-        write!(f, "const DANGEROUS: &str = \"fmt.Sprintf(\"DELETE \";\n").unwrap();
+        writeln!(f, "const DANGEROUS: &str = \"fmt.Sprintf(\"DELETE \";").unwrap();
         drop(f);
 
         let findings: Vec<_> = analyze_security(path.to_str().unwrap())
@@ -2023,7 +2373,10 @@ resource "aws_s3_bucket" "data" {
             .into_iter()
             .filter(|f| f.rule_id == "SEC-SQL-001")
             .collect();
-        assert!(findings.is_empty(), "module-level string literal must be dropped");
+        assert!(
+            findings.is_empty(),
+            "module-level string literal must be dropped"
+        );
     }
 
     #[test]
@@ -2033,10 +2386,10 @@ resource "aws_s3_bucket" "data" {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("risky.rs");
         let mut f = fs::File::create(&path).unwrap();
-        write!(f, "fn delete_user(tx: &mut Tx) {{\n").unwrap();
-        write!(f, "    let q = \"fmt.Sprintf(\"DELETE FROM users \";\n").unwrap();
-        write!(f, "    tx.execute(q, ()).unwrap();\n").unwrap();
-        write!(f, "}}\n").unwrap();
+        writeln!(f, "fn delete_user(tx: &mut Tx) {{").unwrap();
+        writeln!(f, "    let q = \"fmt.Sprintf(\"DELETE FROM users \";").unwrap();
+        writeln!(f, "    tx.execute(q, ()).unwrap();").unwrap();
+        writeln!(f, "}}").unwrap();
         drop(f);
 
         let findings: Vec<_> = analyze_security(path.to_str().unwrap())
@@ -2058,10 +2411,10 @@ resource "aws_s3_bucket" "data" {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("macro_sink.rs");
         let mut f = fs::File::create(&path).unwrap();
-        write!(f, "async fn danger(pool: &Pool) {{\n").unwrap();
-        write!(f, "    let q = \"fmt.Sprintf(\"DELETE FROM users \";\n").unwrap();
-        write!(f, "    sqlx::query(q).execute(pool).await.unwrap();\n").unwrap();
-        write!(f, "}}\n").unwrap();
+        writeln!(f, "async fn danger(pool: &Pool) {{").unwrap();
+        writeln!(f, "    let q = \"fmt.Sprintf(\"DELETE FROM users \";").unwrap();
+        writeln!(f, "    sqlx::query(q).execute(pool).await.unwrap();").unwrap();
+        writeln!(f, "}}").unwrap();
         drop(f);
 
         let findings: Vec<_> = analyze_security(path.to_str().unwrap())
@@ -2095,7 +2448,10 @@ resource "aws_s3_bucket" "data" {
             .into_iter()
             .filter(|f| f.rule_id == "SEC-SQL-001")
             .collect();
-        assert!(findings.is_empty(), "log-only function must drop SQL findings");
+        assert!(
+            findings.is_empty(),
+            "log-only function must drop SQL findings"
+        );
     }
 
     #[test]
@@ -2108,15 +2464,28 @@ resource "aws_s3_bucket" "data" {
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "package main").unwrap();
         writeln!(f, "func safe() {{").unwrap();
-        writeln!(f, "    msg := fmt.Sprintf(\"DELETE FROM logs WHERE id = %{}d\", id)", "").unwrap();
+        writeln!(
+            f,
+            "    msg := fmt.Sprintf(\"DELETE FROM logs WHERE id = %d\", id)"
+        )
+        .unwrap();
         writeln!(f, "    log.Println(msg)").unwrap();
         writeln!(f, "}}").unwrap();
         writeln!(f, "func dangerous() {{").unwrap();
-        writeln!(f, "    q := fmt.Sprintf(\"INSERT INTO users VALUES (%{}s)\", v)", "").unwrap();
+        writeln!(
+            f,
+            "    q := fmt.Sprintf(\"INSERT INTO users VALUES (%s)\", v)"
+        )
+        .unwrap();
         writeln!(f, "    db.Exec(q)").unwrap();
         writeln!(f, "}}").unwrap();
         let findings = sql_findings(&path);
-        assert_eq!(findings.len(), 1, "expected exactly 1 SQL finding (dangerous), got {:?}", findings);
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected exactly 1 SQL finding (dangerous), got {:?}",
+            findings
+        );
     }
 
     // CULTRA-957: SEC-RUST-002 (unwrap/expect) — test-context gating + per-location reporting.
@@ -2142,14 +2511,23 @@ resource "aws_s3_bucket" "data" {
         drop(f);
 
         let findings = unwrap_findings(&path);
-        assert_eq!(findings.len(), 2,
-            "expected 2 production unwrap findings, got: {:?}", findings);
+        assert_eq!(
+            findings.len(),
+            2,
+            "expected 2 production unwrap findings, got: {:?}",
+            findings
+        );
         // Per-location reporting: each finding has its OWN line, not all line 1.
         let lines: Vec<u32> = findings.iter().map(|f| f.line).collect();
-        assert!(lines.contains(&2) && lines.contains(&3),
-            "findings should be at lines 2 and 3, got: {:?}", lines);
-        assert!(findings.iter().all(|f| f.line != 1),
-            "no finding should default to line 1 (the old aggregate behavior)");
+        assert!(
+            lines.contains(&2) && lines.contains(&3),
+            "findings should be at lines 2 and 3, got: {:?}",
+            lines
+        );
+        assert!(
+            findings.iter().all(|f| f.line != 1),
+            "no finding should default to line 1 (the old aggregate behavior)"
+        );
     }
 
     #[test]
@@ -2161,7 +2539,7 @@ resource "aws_s3_bucket" "data" {
         let path = dir.path().join("withtests.rs");
         let mut f = fs::File::create(&path).unwrap();
         writeln!(f, "pub fn add(a: i32, b: i32) -> i32 {{ a + b }}").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "#[cfg(test)]").unwrap();
         writeln!(f, "mod tests {{").unwrap();
         writeln!(f, "    use super::*;").unwrap();
@@ -2175,8 +2553,11 @@ resource "aws_s3_bucket" "data" {
         drop(f);
 
         let findings = unwrap_findings(&path);
-        assert!(findings.is_empty(),
-            "all unwraps in #[cfg(test)] mod must be filtered out, got: {:?}", findings);
+        assert!(
+            findings.is_empty(),
+            "all unwraps in #[cfg(test)] mod must be filtered out, got: {:?}",
+            findings
+        );
     }
 
     #[test]
@@ -2192,8 +2573,11 @@ resource "aws_s3_bucket" "data" {
         drop(f);
 
         let findings = unwrap_findings(&path);
-        assert!(findings.is_empty(),
-            "unwrap in #[test] function must be filtered, got: {:?}", findings);
+        assert!(
+            findings.is_empty(),
+            "unwrap in #[test] function must be filtered, got: {:?}",
+            findings
+        );
     }
 
     #[test]
@@ -2206,7 +2590,7 @@ resource "aws_s3_bucket" "data" {
         writeln!(f, "pub fn live() {{").unwrap();
         writeln!(f, "    std::env::var(\"REAL\").unwrap();").unwrap();
         writeln!(f, "}}").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "#[cfg(test)]").unwrap();
         writeln!(f, "mod tests {{").unwrap();
         writeln!(f, "    #[test]").unwrap();
@@ -2218,10 +2602,13 @@ resource "aws_s3_bucket" "data" {
         drop(f);
 
         let findings = unwrap_findings(&path);
-        assert_eq!(findings.len(), 1,
-            "expected exactly 1 finding (the production unwrap on line 2), got: {:?}", findings);
-        assert_eq!(findings[0].line, 2,
-            "the production unwrap is on line 2");
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected exactly 1 finding (the production unwrap on line 2), got: {:?}",
+            findings
+        );
+        assert_eq!(findings[0].line, 2, "the production unwrap is on line 2");
     }
 
     #[test]
@@ -2237,8 +2624,11 @@ resource "aws_s3_bucket" "data" {
         drop(f);
 
         let findings = unwrap_findings(&path);
-        assert!(findings.is_empty(),
-            "unwrap in #[tokio::test] function must be filtered, got: {:?}", findings);
+        assert!(
+            findings.is_empty(),
+            "unwrap in #[tokio::test] function must be filtered, got: {:?}",
+            findings
+        );
     }
 
     #[test]
@@ -2254,8 +2644,11 @@ resource "aws_s3_bucket" "data" {
 
         let findings = unwrap_findings(&path);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].title.contains("expect"),
-            "title should mention the actual method name (expect), got: {}", findings[0].title);
+        assert!(
+            findings[0].title.contains("expect"),
+            "title should mention the actual method name (expect), got: {}",
+            findings[0].title
+        );
         assert_eq!(findings[0].line, 2);
     }
 
@@ -2272,7 +2665,11 @@ resource "aws_s3_bucket" "data" {
         drop(f);
 
         let findings = unwrap_findings(&path);
-        assert_eq!(findings.len(), 1, "single production unwrap must produce 1 finding");
+        assert_eq!(
+            findings.len(),
+            1,
+            "single production unwrap must produce 1 finding"
+        );
         assert_eq!(findings[0].severity, "low");
     }
 }

@@ -1,28 +1,18 @@
 use super::execution_waves::get_execution_waves;
 use super::project_map::{merge_project_map_into, scan_project_map_tool};
 use super::protocol::Tool;
-use super::Server;
 use super::types::{
-    SessionStrategy, TaskType, TaskStatus, Priority,
-    DocType, PlanStatus, DecisionStatus, EnumValues,
+    DecisionStatus, DocType, EnumValues, PlanStatus, Priority, SessionStrategy, TaskStatus,
+    TaskType,
 };
+use super::Server;
 use crate::ast::{
-    Parser,
-    analyze_complexity,
-    analyze_concurrency,
-    analyze_css, find_css_rules, find_unused_selectors, css_variable_graph,
-    analyze_react_component,
-    find_interface_implementations,
-    analyze_security,
-    resolve_tailwind_classes,
-    ComplexityAnalysis,
+    analyze_complexity, analyze_concurrency, analyze_css, analyze_react_component,
+    analyze_security, css_variable_graph, find_css_rules, find_interface_implementations,
+    find_unused_selectors, resolve_tailwind_classes, ComplexityAnalysis, Parser,
 };
-use crate::lsp::tools::{
-    lsp_query,
-    lsp_workspace_symbols,
-    lsp_document_symbols,
-};
-use anyhow::{anyhow, Result};
+use crate::lsp::tools::{lsp_document_symbols, lsp_query, lsp_workspace_symbols};
+use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Map, Value};
 use std::fmt;
 
@@ -313,12 +303,24 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "progress_log": {
                         "type": "object",
-                        "description": "Inline progress log entry written alongside the task in one call (CULTRA-900). Saves a round-trip vs. calling add_progress_log separately.",
+                        "description": "Inline progress log entry written alongside the task in one call (CULTRA-900). Saves a round-trip vs. calling add_progress_log separately. Mutually exclusive with progress_logs.",
                         "properties": {
                             "who": {"type": "string"},
                             "what": {"type": "string"}
                         },
                         "required": ["who", "what"]
+                    },
+                    "progress_logs": {
+                        "type": "array",
+                        "description": "Multiple inline progress log entries written alongside the task in one call (CULTRA-1073). Use this when work happened in distinct phases — each entry gets its own timestamp. Mutually exclusive with progress_log.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "who": {"type": "string"},
+                                "what": {"type": "string"}
+                            },
+                            "required": ["who", "what"]
+                        }
                     },
                     "estimated_days": {
                         "type": "number",
@@ -450,12 +452,24 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "progress_log": {
                         "type": "object",
-                        "description": "Inline progress log entry written alongside the status change in one call (CULTRA-900).",
+                        "description": "Inline progress log entry written alongside the status change in one call (CULTRA-900). Mutually exclusive with progress_logs.",
                         "properties": {
                             "who": {"type": "string"},
                             "what": {"type": "string"}
                         },
                         "required": ["who", "what"]
+                    },
+                    "progress_logs": {
+                        "type": "array",
+                        "description": "Multiple inline progress log entries written alongside the status change in one call (CULTRA-1073). Each entry gets its own timestamp. Mutually exclusive with progress_log.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "who": {"type": "string"},
+                                "what": {"type": "string"}
+                            },
+                            "required": ["who", "what"]
+                        }
                     },
                     "if_version": {
                         "type": "integer",
@@ -539,12 +553,24 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "progress_log": {
                         "type": "object",
-                        "description": "Inline progress log entry written alongside the update in one call (CULTRA-900).",
+                        "description": "Inline progress log entry written alongside the update in one call (CULTRA-900). Mutually exclusive with progress_logs.",
                         "properties": {
                             "who": {"type": "string"},
                             "what": {"type": "string"}
                         },
                         "required": ["who", "what"]
+                    },
+                    "progress_logs": {
+                        "type": "array",
+                        "description": "Multiple inline progress log entries written alongside the update in one call (CULTRA-1073). Each entry gets its own timestamp. Mutually exclusive with progress_log.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "who": {"type": "string"},
+                                "what": {"type": "string"}
+                            },
+                            "required": ["who", "what"]
+                        }
                     },
                     "if_version": {
                         "type": "integer",
@@ -1669,7 +1695,7 @@ pub fn get_tool_definitions() -> Vec<Tool> {
         // Activity feed
         Tool {
             name: "recent_activity".to_string(),
-            description: "Get recent activity across a project — tasks updated, documents changed, decisions made, sessions. Answers 'what happened since I was last here?' in one call.".to_string(),
+            description: "Get recent activity across a project — tasks updated, documents changed, decisions made, sessions. Answers 'what happened since I was last here?' in one call. Pass since_session_id to anchor the lookback to a specific session's last_active timestamp instead of a wall-clock window (CULTRA-1074).".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1679,7 +1705,11 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                     },
                     "hours": {
                         "type": "number",
-                        "description": "Look back N hours (default: 24, max: 168)"
+                        "description": "Look back N hours (default: 24, max: 168). Ignored if since_session_id is provided."
+                    },
+                    "since_session_id": {
+                        "type": "string",
+                        "description": "Anchor the lookback to a specific session — server resolves to that session's last_active timestamp and queries everything updated since (CULTRA-1074). Wins over hours when both provided. Cross-project session IDs are rejected."
                     }
                 }
             }),
@@ -1784,7 +1814,9 @@ fn resolve_project_id(server: &Server, args: &mut Map<String, Value>) -> Result<
         args.insert("project_id".to_string(), Value::String(default_pid.clone()));
         Ok(())
     } else {
-        Err(anyhow!("Missing required parameter: project_id (no default detected from CLAUDE.md)"))
+        Err(anyhow!(
+            "Missing required parameter: project_id (no default detected from CLAUDE.md)"
+        ))
     }
 }
 
@@ -1814,7 +1846,9 @@ fn validate_file_exists(file_path: &str, workspace_root: &std::path::Path) -> Re
         )
     })?;
 
-    let canonical_workspace = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_workspace = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
 
     if !canonical.starts_with(&canonical_workspace) {
         return Err(anyhow!(
@@ -1838,7 +1872,10 @@ pub(crate) fn validate_id(field: &str, value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(anyhow!("{} cannot be empty", field));
     }
-    if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(anyhow!("{} contains invalid characters: {}", field, value));
     }
     Ok(())
@@ -1853,13 +1890,9 @@ fn parse_positive_int(
 ) -> Result<Option<u64>> {
     match args.get(field) {
         Some(Value::Number(n)) => {
-            let val = n.as_u64().ok_or_else(|| {
-                anyhow!(
-                    "{} must be a positive integer (got: {})",
-                    field,
-                    n
-                )
-            })?;
+            let val = n
+                .as_u64()
+                .ok_or_else(|| anyhow!("{} must be a positive integer (got: {})", field, n))?;
 
             // Validate minimum
             if let Some(min_val) = min {
@@ -1915,8 +1948,12 @@ where
             })?;
             Ok(Some(value))
         }
-        Some(Value::Null) => Ok(None),  // Treat null as absent
-        Some(val) => Err(anyhow!("{} must be a string, but got: {}", field, get_value_type_name(val))),
+        Some(Value::Null) => Ok(None), // Treat null as absent
+        Some(val) => Err(anyhow!(
+            "{} must be a string, but got: {}",
+            field,
+            get_value_type_name(val)
+        )),
         None => Ok(None),
     }
 }
@@ -1924,28 +1961,20 @@ where
 // ========== Generic API Handlers ==========
 
 /// Generic POST handler - creates or updates a resource
-fn api_post(
-    server: &Server,
-    endpoint: &str,
-    args: Map<String, Value>,
-) -> Result<Value> {
+fn api_post(server: &Server, endpoint: &str, args: Map<String, Value>) -> Result<Value> {
     server.api.post(endpoint, Value::Object(args))
 }
 
 /// Generic PUT handler - updates a resource
-fn api_put(
-    server: &Server,
-    endpoint: &str,
-    args: Map<String, Value>,
-) -> Result<Value> {
+fn api_put(server: &Server, endpoint: &str, args: Map<String, Value>) -> Result<Value> {
     server.api.put(endpoint, Value::Object(args))
 }
 
 /// Generic GET by ID handler
 fn api_get_by_id(
     server: &Server,
-    endpoint_template: &str,  // e.g., "/api/tasks/{}"
-    id_field: &str,            // e.g., "task_id"
+    endpoint_template: &str, // e.g., "/api/tasks/{}"
+    id_field: &str,          // e.g., "task_id"
     args: &Map<String, Value>,
 ) -> Result<Value> {
     let id = args
@@ -1985,7 +2014,8 @@ fn api_get_with_filters(
         } else if let Some(value) = args.get(field).and_then(|v| v.as_u64()) {
             query.push((field.to_string(), value.to_string()));
         } else if let Some(arr) = args.get(field).and_then(|v| v.as_array()) {
-            let joined: Vec<String> = arr.iter()
+            let joined: Vec<String> = arr
+                .iter()
                 .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect();
             if !joined.is_empty() {
@@ -2000,8 +2030,8 @@ fn api_get_with_filters(
 /// Generic DELETE handler
 fn api_delete(
     server: &Server,
-    endpoint_template: &str,  // e.g., "/api/tasks/{}/dependencies/{}"
-    id_fields: &[&str],        // e.g., ["task_id", "depends_on"]
+    endpoint_template: &str, // e.g., "/api/tasks/{}/dependencies/{}"
+    id_fields: &[&str],      // e.g., ["task_id", "depends_on"]
     args: &Map<String, Value>,
 ) -> Result<Value> {
     let mut endpoint = endpoint_template.to_string();
@@ -2021,24 +2051,38 @@ fn api_delete(
 }
 
 /// Route tool calls to implementations
-pub fn call_tool(
-    server: &mut Server,
-    name: &str,
-    mut args: Map<String, Value>,
-) -> Result<Value> {
+pub fn call_tool(server: &mut Server, name: &str, mut args: Map<String, Value>) -> Result<Value> {
     // Auto-fill project_id from CLAUDE.md default if not provided
-    if args.get("project_id").map_or(true, |v| v.as_str().map_or(true, |s| s.is_empty())) {
+    if args
+        .get("project_id")
+        .is_none_or(|v| v.as_str().is_none_or(|s| s.is_empty()))
+    {
         if let Some(ref default_pid) = server.default_project_id {
             // Only inject if the tool's schema actually uses project_id
             let tools_with_project_id = [
-                "load_session_state", "save_session_state", "get_sessions",
-                "get_session_code_context", "create_project",
-                "get_tasks", "search_tasks", "save_task",
-                "get_documents", "save_document", "update_document", "get_plan",
-                "save_plan", "get_plans", "save_decision", "get_decisions",
+                "load_session_state",
+                "save_session_state",
+                "get_sessions",
+                "get_session_code_context",
+                "create_project",
+                "get_tasks",
+                "search_tasks",
+                "save_task",
+                "get_documents",
+                "save_document",
+                "update_document",
+                "get_plan",
+                "save_plan",
+                "get_plans",
+                "save_decision",
+                "get_decisions",
                 "get_project_estimate_accuracy",
-                "add_graph_edge", "query_graph", "get_graph_neighbors",
-                "query_context", "search_code_context", "unified_search",
+                "add_graph_edge",
+                "query_graph",
+                "get_graph_neighbors",
+                "query_context",
+                "search_code_context",
+                "unified_search",
                 "recent_activity",
             ];
             if tools_with_project_id.contains(&name) {
@@ -2084,7 +2128,9 @@ pub fn call_tool(
         "diff_file_ast" => diff_file_ast_tool(args, &server.workspace_root),
         "find_dead_code" => find_dead_code_tool(args, server),
         "find_references" => find_references_tool(args, server),
-        "find_interface_implementations" => find_interface_implementations_tool(args, &server.workspace_root),
+        "find_interface_implementations" => {
+            find_interface_implementations_tool(args, &server.workspace_root)
+        }
         "contextual_search" => contextual_search_tool(args, &server.workspace_root),
         "project_info" => project_info_tool(args, server),
         "get_project_map" => scan_project_map_tool(args, server),
@@ -2203,25 +2249,40 @@ fn recent_activity(server: &Server, args: Map<String, Value>) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing required parameter: project_id"))?;
 
+    // CULTRA-1074: optional since_session_id wins over hours when both passed.
+    // Resolve to that session's last_active timestamp; reject if the session
+    // belongs to a different project than the request.
+    let since_session_id = args.get("since_session_id").and_then(|v| v.as_str());
+
     let hours = args
         .get("hours")
         .and_then(|v| v.as_u64())
         .unwrap_or(24)
         .min(168) as i64;
 
-    // Calculate cutoff timestamp
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let cutoff_secs = now - (hours * 3600);
+    let cutoff_secs = if let Some(sid) = since_session_id {
+        let session = server
+            .api
+            .get(&format!("/api/v2/sessions/{}", sid), None)
+            .with_context(|| format!("recent_activity: failed to load session {}", sid))?;
+        resolve_session_cutoff(&session, project_id, sid)?
+    } else {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        now - (hours * 3600)
+    };
 
     // Fetch tasks, documents, decisions, and sessions in parallel isn't possible
     // with synchronous ureq, so we fetch sequentially but it's still fast
-    let tasks = server.api.get(
-        "/api/v2/tasks",
-        Some(vec![("project_id".to_string(), project_id.to_string())]),
-    ).unwrap_or(json!([]));
+    let tasks = server
+        .api
+        .get(
+            "/api/v2/tasks",
+            Some(vec![("project_id".to_string(), project_id.to_string())]),
+        )
+        .unwrap_or(json!([]));
 
     // CULTRA-938: /api/v2/tasks now returns {tasks, total, limit, offset}
     // (CULTRA-929 A1) instead of a bare []. Unwrap the array before passing
@@ -2233,34 +2294,50 @@ fn recent_activity(server: &Server, args: Map<String, Value>) -> Result<Value> {
         None => tasks,
     };
 
-    let documents = server.api.get(
-        "/api/v2/documents",
-        Some(vec![("project_id".to_string(), project_id.to_string())]),
-    ).unwrap_or(json!([]));
+    let documents = server
+        .api
+        .get(
+            "/api/v2/documents",
+            Some(vec![("project_id".to_string(), project_id.to_string())]),
+        )
+        .unwrap_or(json!([]));
 
-    let decisions = server.api.get(
-        "/api/v2/decisions",
-        Some(vec![("project_id".to_string(), project_id.to_string())]),
-    ).unwrap_or(json!([]));
+    let decisions = server
+        .api
+        .get(
+            "/api/v2/decisions",
+            Some(vec![("project_id".to_string(), project_id.to_string())]),
+        )
+        .unwrap_or(json!([]));
 
-    let sessions = server.api.get(
-        "/api/v2/sessions",
-        Some(vec![("project_id".to_string(), project_id.to_string())]),
-    ).unwrap_or(json!([]));
+    let sessions = server
+        .api
+        .get(
+            "/api/v2/sessions",
+            Some(vec![("project_id".to_string(), project_id.to_string())]),
+        )
+        .unwrap_or(json!([]));
 
     // Filter by updated_at > cutoff
     let filter_recent = |items: &Value| -> Vec<Value> {
-        items.as_array().map(|arr| {
-            arr.iter().filter(|item| {
-                // Try updated_at, then last_active, then created_at
-                let ts = item.get("updated_at")
-                    .or_else(|| item.get("last_active"))
-                    .or_else(|| item.get("created_at"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                parse_timestamp_secs(ts) > cutoff_secs
-            }).cloned().collect()
-        }).unwrap_or_default()
+        items
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|item| {
+                        // Try updated_at, then last_active, then created_at
+                        let ts = item
+                            .get("updated_at")
+                            .or_else(|| item.get("last_active"))
+                            .or_else(|| item.get("created_at"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        parse_timestamp_secs(ts) > cutoff_secs
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     };
 
     let recent_tasks = filter_recent(&tasks);
@@ -2268,9 +2345,10 @@ fn recent_activity(server: &Server, args: Map<String, Value>) -> Result<Value> {
     let recent_decisions = filter_recent(&decisions);
     let recent_sessions = filter_recent(&sessions);
 
-    Ok(json!({
+    let mut response = json!({
         "project_id": project_id,
         "lookback_hours": hours,
+        "cutoff_unix": cutoff_secs,
         "tasks": {
             "count": recent_tasks.len(),
             "items": recent_tasks.iter().map(|t| json!({
@@ -2307,7 +2385,37 @@ fn recent_activity(server: &Server, args: Map<String, Value>) -> Result<Value> {
                 "working_memory": s.get("working_memory"),
             })).collect::<Vec<_>>()
         }
-    }))
+    });
+    // CULTRA-1074: surface the session anchor in the response so callers can
+    // distinguish "anchored to this session" from "wall-clock window".
+    if let Some(sid) = since_session_id {
+        response["since_session_id"] = json!(sid);
+    }
+    Ok(response)
+}
+
+/// CULTRA-1074: validates a fetched session belongs to `expected_project_id`
+/// and returns its last_active as unix seconds. Pure — no HTTP, easy to test.
+/// Cross-project session IDs are rejected so callers can't accidentally see
+/// another project's activity through the lookback anchor.
+fn resolve_session_cutoff(session: &Value, expected_project_id: &str, sid: &str) -> Result<i64> {
+    let session_project = session
+        .get("project_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if session_project != expected_project_id {
+        return Err(anyhow!(
+            "CROSS_PROJECT_SESSION: session {} belongs to project '{}', not '{}'",
+            sid,
+            session_project,
+            expected_project_id
+        ));
+    }
+    let last_active = session
+        .get("last_active")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    Ok(parse_timestamp_secs(last_active))
 }
 
 /// Parse RFC 3339 timestamp to unix seconds. Returns 0 on parse failure.
@@ -2324,7 +2432,9 @@ fn kb_ask(server: &Server, args: Map<String, Value>) -> Result<Value> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("Missing required parameter: query"))?;
 
-    server.api.post("/api/v2/kb/ask", serde_json::Value::Object(args))
+    server
+        .api
+        .post("/api/v2/kb/ask", serde_json::Value::Object(args))
 }
 
 /// Tool implementation: unified_search — search across all entity types
@@ -2377,8 +2487,8 @@ fn install_skills(args: Map<String, Value>) -> Result<Value> {
     }
 
     // Determine skills directory
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow!("Failed to get current directory: {}", e))?;
+    let cwd =
+        std::env::current_dir().map_err(|e| anyhow!("Failed to get current directory: {}", e))?;
     let skills_dir = cwd.join(".claude").join("skills");
 
     // Create directory if needed
@@ -2426,7 +2536,12 @@ fn get_template(args: Map<String, Value>) -> Result<Value> {
     let (title, content) = match name {
         "claude_md" => ("CLAUDE.md Template", CLAUDE_MD_TEMPLATE),
         "template_guide" => ("CLAUDE.md Template Guide", CLAUDE_TEMPLATE_GUIDE),
-        other => return Err(anyhow!("Invalid template '{}'. Must be 'claude_md' or 'template_guide'", other)),
+        other => {
+            return Err(anyhow!(
+                "Invalid template '{}'. Must be 'claude_md' or 'template_guide'",
+                other
+            ))
+        }
     };
 
     Ok(json!({
@@ -2457,6 +2572,9 @@ fn load_session_state(server: &Server, mut args: Map<String, Value>) -> Result<V
     )?;
 
     merge_project_map_into(&mut result, &server.workspace_root);
+    // CULTRA-1081: also attach a freshly-captured current_git snapshot so
+    // callers can compute drift = (session.context_snapshot.git_snapshot vs current_git).
+    crate::git_snapshot::merge_current_git_into(&mut result, &server.workspace_root);
     Ok(result)
 }
 
@@ -2486,7 +2604,12 @@ fn require_non_empty_string(
 ) -> Result<()> {
     match obj.get(field) {
         Some(v) if v.is_string() && !v.as_str().unwrap_or("").trim().is_empty() => Ok(()),
-        Some(_) => Err(anyhow!("{}.{} must be a non-empty string ({})", namespace, field, hint)),
+        Some(_) => Err(anyhow!(
+            "{}.{} must be a non-empty string ({})",
+            namespace,
+            field,
+            hint
+        )),
         None => Err(anyhow!("{}.{} is required (Engine V3)", namespace, field)),
     }
 }
@@ -2498,19 +2621,34 @@ fn save_session_state(server: &Server, mut args: Map<String, Value>) -> Result<V
 
     // Engine V3 validation for working_memory structure.
     if let Some(wm) = args.get("working_memory").and_then(|v| v.as_object()) {
-        require_non_empty_string(wm, "phase", "working_memory",
-            "e.g., 'Implementation', 'Testing', 'Planning'")?;
-        require_non_empty_string(wm, "current_focus", "working_memory",
-            "describes what you're doing now")?;
-        require_non_empty_string(wm, "next_action", "working_memory",
-            "specific next step")?;
+        require_non_empty_string(
+            wm,
+            "phase",
+            "working_memory",
+            "e.g., 'Implementation', 'Testing', 'Planning'",
+        )?;
+        require_non_empty_string(
+            wm,
+            "current_focus",
+            "working_memory",
+            "describes what you're doing now",
+        )?;
+        require_non_empty_string(wm, "next_action", "working_memory", "specific next step")?;
     }
 
     // Engine V3 validation for context_snapshot structure.
     if let Some(cs) = args.get("context_snapshot").and_then(|v| v.as_object()) {
-        require_non_empty_string(cs, "next_session_start", "context_snapshot",
-            "clear resuming instructions")?;
+        require_non_empty_string(
+            cs,
+            "next_session_start",
+            "context_snapshot",
+            "clear resuming instructions",
+        )?;
     }
+
+    // CULTRA-1080: auto-attach git_snapshot to context_snapshot when running
+    // inside a git repo. Best-effort — capture failure leaves args unchanged.
+    crate::git_snapshot::inject_into_save_args(&mut args, &server.workspace_root);
 
     api_post(server, "/api/v2/sessions", args)
 }
@@ -2544,7 +2682,8 @@ fn get_session_code_context(server: &Server, args: Map<String, Value>) -> Result
 
 /// Tool implementation: create_project
 fn create_project(server: &Server, args: Map<String, Value>) -> Result<Value> {
-    if !args.contains_key("project_id") || args.get("project_id").and_then(|v| v.as_str()).is_none() {
+    if !args.contains_key("project_id") || args.get("project_id").and_then(|v| v.as_str()).is_none()
+    {
         return Err(anyhow!("project_id is required"));
     }
     if !args.contains_key("name") || args.get("name").and_then(|v| v.as_str()).is_none() {
@@ -2564,7 +2703,10 @@ fn get_project_estimate_accuracy(server: &Server, args: Map<String, Value>) -> R
         .ok_or_else(|| anyhow!("Missing required parameter: project_id"))?;
     validate_id("project_id", project_id)?;
 
-    server.api.get(&format!("/api/v2/projects/{}/estimate-accuracy", project_id), None)
+    server.api.get(
+        &format!("/api/v2/projects/{}/estimate-accuracy", project_id),
+        None,
+    )
 }
 
 /// Tool implementation: get_tasks
@@ -2580,16 +2722,20 @@ fn get_tasks(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
         }
         Some(Value::Array(arr)) => {
             for v in &arr {
-                let s = v.as_str().ok_or_else(|| anyhow!(
-                    "status array must contain only strings, got: {}",
-                    get_value_type_name(v)
-                ))?;
-                let _: TaskStatus = serde_json::from_value(Value::String(s.to_string()))
-                    .map_err(|_| anyhow!(
-                        "Invalid status value '{}'. Valid values: [{}]",
-                        s,
-                        TaskStatus::valid_values().join(", ")
-                    ))?;
+                let s = v.as_str().ok_or_else(|| {
+                    anyhow!(
+                        "status array must contain only strings, got: {}",
+                        get_value_type_name(v)
+                    )
+                })?;
+                let _: TaskStatus =
+                    serde_json::from_value(Value::String(s.to_string())).map_err(|_| {
+                        anyhow!(
+                            "Invalid status value '{}'. Valid values: [{}]",
+                            s,
+                            TaskStatus::valid_values().join(", ")
+                        )
+                    })?;
             }
         }
         Some(Value::Null) | None => {}
@@ -2611,7 +2757,15 @@ fn get_tasks(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
         &["project_id"],
         // CULTRA-939: pagination + sort surfaced for the new /api/v2/tasks
         // wrapped response shape (CULTRA-929 A1).
-        &["status", "priority", "assigned_to", "limit", "offset", "sort", "dir"],
+        &[
+            "status",
+            "priority",
+            "assigned_to",
+            "limit",
+            "offset",
+            "sort",
+            "dir",
+        ],
         &args,
     )
 }
@@ -2688,7 +2842,9 @@ fn get_task_chain(server: &Server, args: Map<String, Value>) -> Result<Value> {
         Some(query_params)
     };
 
-    server.api.get(&format!("/api/v2/tasks/{}/chain", task_id), query)
+    server
+        .api
+        .get(&format!("/api/v2/tasks/{}/chain", task_id), query)
 }
 
 /// Tool implementation: update_task_status
@@ -2755,17 +2911,22 @@ fn task_dependency(server: &Server, args: Map<String, Value>) -> Result<Value> {
         "add" => {
             let mut api_body = Map::new();
             api_body.insert("blocked_by".to_string(), depends_on.clone());
-            api_post(server, &format!("/api/v2/tasks/{}/dependencies", task_id), api_body)
-        }
-        "remove" => {
-            api_delete(
+            api_post(
                 server,
-                "/api/v2/tasks/{}/dependencies/{}",
-                &["task_id", "depends_on"],
-                &args,
+                &format!("/api/v2/tasks/{}/dependencies", task_id),
+                api_body,
             )
         }
-        other => Err(anyhow!("Invalid action '{}'. Must be 'add' or 'remove'", other)),
+        "remove" => api_delete(
+            server,
+            "/api/v2/tasks/{}/dependencies/{}",
+            &["task_id", "depends_on"],
+            &args,
+        ),
+        other => Err(anyhow!(
+            "Invalid action '{}'. Must be 'add' or 'remove'",
+            other
+        )),
     }
 }
 
@@ -2782,7 +2943,10 @@ fn add_progress_log(server: &Server, args: Map<String, Value>) -> Result<Value> 
 
 /// Tool implementation: save_document
 fn resolve_content_file(args: &mut Map<String, Value>) -> Result<()> {
-    if let Some(file_path) = args.remove("content_file").and_then(|v| v.as_str().map(|s| s.to_string())) {
+    if let Some(file_path) = args
+        .remove("content_file")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+    {
         let file_content = std::fs::read_to_string(&file_path)
             .map_err(|e| anyhow!("Failed to read file '{}': {}", file_path, e))?;
         args.insert("content".to_string(), Value::String(file_content));
@@ -2811,7 +2975,8 @@ fn get_documents(server: &Server, mut args: Map<String, Value>) -> Result<Value>
 
     // Convert tags array to comma-separated string for the API
     if let Some(Value::Array(tags)) = args.remove("tags") {
-        let tag_str: Vec<String> = tags.iter()
+        let tag_str: Vec<String> = tags
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
         if !tag_str.is_empty() {
@@ -2855,20 +3020,24 @@ fn update_document(server: &Server, mut args: Map<String, Value>) -> Result<Valu
 
 /// Tool implementation: link_document (CULTRA-1065: now accepts task_ids, plan_id, and plan_ids).
 fn link_document(server: &Server, args: Map<String, Value>) -> Result<Value> {
-    let _document_id = args.get("document_id")
+    let _document_id = args
+        .get("document_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("document_id is required"))?;
     validate_id("document_id", _document_id)?;
 
-    let task_ids = args.get("task_ids")
+    let task_ids = args
+        .get("task_ids")
         .and_then(|v| v.as_array())
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
-    let plan_ids = args.get("plan_ids")
+    let plan_ids = args
+        .get("plan_ids")
         .and_then(|v| v.as_array())
         .map(|a| a.as_slice())
         .unwrap_or(&[]);
-    let plan_id = args.get("plan_id")
+    let plan_id = args
+        .get("plan_id")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty());
 
@@ -2957,13 +3126,7 @@ fn get_plans(server: &Server, mut args: Map<String, Value>) -> Result<Value> {
         args.insert("status".to_string(), Value::String(status.to_string()));
     }
 
-    api_get_with_filters(
-        server,
-        "/api/v2/plans",
-        &["project_id"],
-        &["status"],
-        &args,
-    )
+    api_get_with_filters(server, "/api/v2/plans", &["project_id"], &["status"], &args)
 }
 
 /// Tool implementation: get_plan (consolidated from get_plan_status + get_plan_details).
@@ -2976,14 +3139,20 @@ fn get_plan(server: &Server, args: Map<String, Value>) -> Result<Value> {
         .ok_or_else(|| anyhow!("Missing required parameter: plan_id"))?;
     validate_id("plan_id", plan_id)?;
 
-    let detail = args.get("detail").and_then(|v| v.as_str()).unwrap_or("status");
+    let detail = args
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("status");
     let endpoint = match detail {
         "status" => format!("/api/v2/plans/{}/status", plan_id),
         "full" => format!("/api/v2/plans/{}/details", plan_id),
         "ascii" => format!("/api/v2/plans/{}/ascii", plan_id),
-        other => return Err(anyhow!(
-            "Invalid detail value '{}'. Must be 'status', 'full', or 'ascii'", other
-        )),
+        other => {
+            return Err(anyhow!(
+                "Invalid detail value '{}'. Must be 'status', 'full', or 'ascii'",
+                other
+            ))
+        }
     };
 
     // Render knobs are only meaningful for detail='ascii'. We could silently
@@ -2991,7 +3160,11 @@ fn get_plan(server: &Server, args: Map<String, Value>) -> Result<Value> {
     // class of mistakes (e.g. agent typed detail='status' when it meant
     // 'ascii' but supplied with_titles=true). Cheap insurance.
     let render_query = build_plan_render_query(&args, detail)?;
-    let query = if render_query.is_empty() { None } else { Some(render_query) };
+    let query = if render_query.is_empty() {
+        None
+    } else {
+        Some(render_query)
+    };
     server.api.get(&endpoint, query)
 }
 
@@ -3007,7 +3180,10 @@ fn get_plan(server: &Server, args: Map<String, Value>) -> Result<Value> {
 /// Returns an empty vec when the caller supplied no extra params. Mirrors
 /// the validation used by execution_waves.rs::build_waves_query_params so
 /// the two entry points reject the same shape of bad inputs.
-fn build_plan_render_query(args: &Map<String, Value>, detail: &str) -> Result<Vec<(String, String)>> {
+fn build_plan_render_query(
+    args: &Map<String, Value>,
+    detail: &str,
+) -> Result<Vec<(String, String)>> {
     let has_render_knob = args.contains_key("width")
         || args.contains_key("style")
         || args.contains_key("with_titles")
@@ -3043,7 +3219,8 @@ fn build_plan_render_query(args: &Map<String, Value>, detail: &str) -> Result<Ve
     if let Some(s) = args.get("style").and_then(|v| v.as_str()) {
         if s != "unicode" && s != "ascii" {
             return Err(anyhow!(
-                "invalid style '{}'. Must be 'unicode' or 'ascii'", s
+                "invalid style '{}'. Must be 'unicode' or 'ascii'",
+                s
             ));
         }
         out.push(("style".to_string(), s.to_string()));
@@ -3076,7 +3253,8 @@ fn build_plan_render_query(args: &Map<String, Value>, detail: &str) -> Result<Ve
     if let Some(g) = args.get("group_by").and_then(|v| v.as_str()) {
         if g != "tag" {
             return Err(anyhow!(
-                "invalid group_by '{}'. Must be 'tag' (only supported value for v1)", g
+                "invalid group_by '{}'. Must be 'tag' (only supported value for v1)",
+                g
             ));
         }
         out.push(("group_by".to_string(), g.to_string()));
@@ -3154,7 +3332,8 @@ fn parse_file_ast(server: &Server, mut args: Map<String, Value>) -> Result<Value
 
     // Parse file locally (fast, no network overhead)
     let parser = Parser::new();
-    let file_context = parser.parse_file(&file_path)
+    let file_context = parser
+        .parse_file(&file_path)
         .map_err(|e| anyhow!("Failed to parse file: {}", e))?;
 
     // POST to API for storage (respects RLS, enables search_code_context)
@@ -3169,7 +3348,11 @@ fn parse_file_ast(server: &Server, mut args: Map<String, Value>) -> Result<Value
 
     // unwrap: body is constructed above via the json!({...}) literal, which
     // always produces Value::Object — as_object() is infallible here.
-    api_post(server, "/api/v2/ast/parse", body.as_object().unwrap().clone())?;
+    api_post(
+        server,
+        "/api/v2/ast/parse",
+        body.as_object().unwrap().clone(),
+    )?;
 
     // Build symbols array, optionally enriched with caller lookups.
     // Enrichment is best-effort: any LSP failure degrades gracefully to
@@ -3187,19 +3370,23 @@ fn parse_file_ast(server: &Server, mut args: Map<String, Value>) -> Result<Value
         let source_lines: Vec<&str> = source.lines().collect();
         match symbols_value {
             Value::Array(syms) => {
-                let enriched: Vec<Value> = syms.into_iter().map(|mut sym| {
-                    if let Value::Object(ref mut obj) = sym {
-                        let start = obj.get("line")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(1) as usize;
-                        let from = start.saturating_sub(1);
-                        let to = (from + n).min(source_lines.len());
-                        let preview: Vec<String> = source_lines[from..to]
-                            .iter().map(|s| s.to_string()).collect();
-                        obj.insert("preview".to_string(), json!(preview));
-                    }
-                    sym
-                }).collect();
+                let enriched: Vec<Value> = syms
+                    .into_iter()
+                    .map(|mut sym| {
+                        if let Value::Object(ref mut obj) = sym {
+                            let start =
+                                obj.get("line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+                            let from = start.saturating_sub(1);
+                            let to = (from + n).min(source_lines.len());
+                            let preview: Vec<String> = source_lines[from..to]
+                                .iter()
+                                .map(|s| s.to_string())
+                                .collect();
+                            obj.insert("preview".to_string(), json!(preview));
+                        }
+                        sym
+                    })
+                    .collect();
                 Value::Array(enriched)
             }
             other => other,
@@ -3285,7 +3472,12 @@ fn diff_file_ast_tool(args: Map<String, Value>, workspace_root: &std::path::Path
             .map_err(|e| anyhow!("git show failed to spawn: {}", e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            return Err(anyhow!("git show {}:{} failed: {}", gitref, rel_path, stderr.trim()));
+            return Err(anyhow!(
+                "git show {}:{} failed: {}",
+                gitref,
+                rel_path,
+                stderr.trim()
+            ));
         }
         // Write to a temp file preserving the original extension so the
         // parser dispatches to the right language frontend. Use stdlib
@@ -3338,7 +3530,9 @@ fn diff_file_ast_tool(args: Map<String, Value>, workspace_root: &std::path::Path
     // we build a richer comparison key by joining the parameter list + return
     // type. Two symbols are "the same" iff this composite key matches.
     let comparison_key = |s: &crate::ast::types::Symbol| -> String {
-        let params: Vec<String> = s.parameters.iter()
+        let params: Vec<String> = s
+            .parameters
+            .iter()
             .map(|p| format!("{}:{}", p.name, p.param_type))
             .collect();
         format!(
@@ -3350,7 +3544,9 @@ fn diff_file_ast_tool(args: Map<String, Value>, workspace_root: &std::path::Path
     };
 
     let symbol_summary = |s: &crate::ast::types::Symbol| -> Value {
-        let params: Vec<Value> = s.parameters.iter()
+        let params: Vec<Value> = s
+            .parameters
+            .iter()
             .map(|p| json!({"name": p.name, "type": p.param_type}))
             .collect();
         json!({
@@ -3415,7 +3611,10 @@ fn diff_file_ast_tool(args: Map<String, Value>, workspace_root: &std::path::Path
 /// CULTRA-908: analyze_changes — wrap analyze_files with a git-diff file
 /// list. Limits the analyzer scope to files changed between a ref and HEAD,
 /// filtered by language for the chosen analyzer.
-fn analyze_changes_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+fn analyze_changes_tool(
+    args: Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value> {
     let since = args
         .get("since")
         .and_then(|v| v.as_str())
@@ -3466,7 +3665,7 @@ fn analyze_changes_tool(args: Map<String, Value>, workspace_root: &std::path::Pa
         }
         total_changed += 1;
         // Filter by extension for the chosen analyzer.
-        if !file_matches_analyzer(relpath, &extensions) {
+        if !file_matches_analyzer(relpath, extensions) {
             continue;
         }
         let abs = workspace_root.join(relpath);
@@ -3535,7 +3734,10 @@ fn analyze_changes_tool(args: Map<String, Value>, workspace_root: &std::path::Pa
     // Annotate with the git ref used so the response is self-describing.
     if let Value::Object(ref mut obj) = result {
         obj.insert("since".to_string(), json!(since));
-        obj.insert("include_working_tree".to_string(), json!(include_working_tree));
+        obj.insert(
+            "include_working_tree".to_string(),
+            json!(include_working_tree),
+        );
     }
     Ok(result)
 }
@@ -3557,7 +3759,9 @@ fn analyzer_extensions(analyzer: &str) -> &'static [&'static str] {
 /// True if `path` ends with one of the listed extensions (case-insensitive).
 fn file_matches_analyzer(path: &str, extensions: &[&str]) -> bool {
     let lower = path.to_lowercase();
-    extensions.iter().any(|ext| lower.ends_with(&format!(".{}", ext)))
+    extensions
+        .iter()
+        .any(|ext| lower.ends_with(&format!(".{}", ext)))
 }
 
 /// CULTRA-907: find_dead_code — flag exported callables in a file that have
@@ -3589,12 +3793,16 @@ fn find_dead_code_tool(args: Map<String, Value>, server: &Server) -> Result<Valu
         .unwrap_or(false);
 
     let parser = Parser::new();
-    let file_context = parser.parse_file(file_path)
+    let file_context = parser
+        .parse_file(file_path)
         .map_err(|e| anyhow!("Failed to parse file: {}", e))?;
 
     // Warmup runs after we know the language but before any LSP calls.
     let warmup_report: Option<crate::lsp::manager::WarmupReport> = if do_warmup {
-        Some(server.lsp.ensure_warm(&file_context.language.to_string(), std::path::Path::new(&file_context.file_path)))
+        Some(server.lsp.ensure_warm(
+            &file_context.language.to_string(),
+            std::path::Path::new(&file_context.file_path),
+        ))
     } else {
         None
     };
@@ -3652,7 +3860,8 @@ fn find_dead_code_tool(args: Map<String, Value>, server: &Server) -> Result<Valu
             }
         };
 
-        let refs = refs_value.get("references")
+        let refs = refs_value
+            .get("references")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
@@ -3661,21 +3870,24 @@ fn find_dead_code_tool(args: Map<String, Value>, server: &Server) -> Result<Valu
         // A symbol is "dead" if every reference is either the declaration
         // site itself or absent. include_declaration=true means the
         // declaration is normally included; we filter it out before counting.
-        let external_refs = refs.iter().filter(|loc| {
-            let same_file = loc
-                .get("uri")
-                .and_then(|u| u.as_str())
-                .map(|u| u.ends_with(&file_context.file_path))
-                .unwrap_or(false);
-            let same_line = loc
-                .get("range")
-                .and_then(|r| r.get("start"))
-                .and_then(|s| s.get("line"))
-                .and_then(|l| l.as_u64())
-                .map(|l| (l as u32) == lsp_line)
-                .unwrap_or(false);
-            !(same_file && same_line)
-        }).count();
+        let external_refs = refs
+            .iter()
+            .filter(|loc| {
+                let same_file = loc
+                    .get("uri")
+                    .and_then(|u| u.as_str())
+                    .map(|u| u.ends_with(&file_context.file_path))
+                    .unwrap_or(false);
+                let same_line = loc
+                    .get("range")
+                    .and_then(|r| r.get("start"))
+                    .and_then(|s| s.get("line"))
+                    .and_then(|l| l.as_u64())
+                    .map(|l| (l as u32) == lsp_line)
+                    .unwrap_or(false);
+                !(same_file && same_line)
+            })
+            .count();
         if external_refs > 0 {
             any_symbol_has_external_refs = true;
         }
@@ -3766,7 +3978,10 @@ fn find_dead_code_tool(args: Map<String, Value>, server: &Server) -> Result<Valu
     // whether it succeeded — a "failed" warmup is signal too.
     if let Some(report) = warmup_report {
         if let Value::Object(ref mut obj) = response {
-            obj.insert("warmup_report".to_string(), serde_json::to_value(&report).unwrap_or(Value::Null));
+            obj.insert(
+                "warmup_report".to_string(),
+                serde_json::to_value(&report).unwrap_or(Value::Null),
+            );
         }
     }
 
@@ -3784,7 +3999,10 @@ fn build_cold_warning_for_find_dead_code(
     warmup_report: Option<&crate::lsp::manager::WarmupReport>,
 ) -> String {
     let warmup_succeeded = warmup_report
-        .map(|r| r.status == "warm" || (r.status == "cached" && r.cached_status.as_deref() == Some("warm")))
+        .map(|r| {
+            r.status == "warm"
+                || (r.status == "cached" && r.cached_status.as_deref() == Some("warm"))
+        })
         .unwrap_or(false);
 
     if warmup_succeeded {
@@ -3852,11 +4070,15 @@ fn find_references_tool(args: Map<String, Value>, server: &Server) -> Result<Val
 
     // 1. Parse the anchor file and locate the symbol declaration.
     let parser = Parser::new();
-    let file_context = parser.parse_file(file_path)
+    let file_context = parser
+        .parse_file(file_path)
         .map_err(|e| anyhow!("Failed to parse file: {}", e))?;
 
     let warmup_report: Option<crate::lsp::manager::WarmupReport> = if do_warmup {
-        Some(server.lsp.ensure_warm(&file_context.language.to_string(), std::path::Path::new(&file_context.file_path)))
+        Some(server.lsp.ensure_warm(
+            &file_context.language.to_string(),
+            std::path::Path::new(&file_context.file_path),
+        ))
     } else {
         None
     };
@@ -3878,10 +4100,14 @@ fn find_references_tool(args: Map<String, Value>, server: &Server) -> Result<Val
     let anchor_col = anchor_lines
         .get(anchor_line_idx)
         .and_then(|l| l.find(symbol))
-        .ok_or_else(|| anyhow!(
-            "Could not locate symbol '{}' on declaration line {} of {}",
-            symbol, anchor.line, file_path
-        ))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "Could not locate symbol '{}' on declaration line {} of {}",
+                symbol,
+                anchor.line,
+                file_path
+            )
+        })?;
     let lsp_line = anchor.line.saturating_sub(1);
 
     // 3. Query LSP references. An LSP failure (no server, missing binary,
@@ -3900,7 +4126,8 @@ fn find_references_tool(args: Map<String, Value>, server: &Server) -> Result<Val
     }
 
     let refs: Vec<Value> = match crate::lsp::tools::lsp_query(lsp_args, &server.lsp) {
-        Ok(v) => v.get("references")
+        Ok(v) => v
+            .get("references")
             .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default(),
@@ -3909,7 +4136,8 @@ fn find_references_tool(args: Map<String, Value>, server: &Server) -> Result<Val
 
     // 4. Classify each reference. Cache per-file source reads so a function
     //    with 50 call sites in one file only reads that file once.
-    let mut file_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut file_cache: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     let mut results: Vec<Value> = Vec::new();
     let mut any_non_definition = false;
 
@@ -3919,8 +4147,14 @@ fn find_references_tool(args: Map<String, Value>, server: &Server) -> Result<Val
         let ref_path: String = uri.strip_prefix("file://").unwrap_or(uri).to_string();
 
         let start = loc.get("range").and_then(|r| r.get("start"));
-        let ref_line = start.and_then(|s| s.get("line")).and_then(|l| l.as_u64()).unwrap_or(0) as u32;
-        let ref_col = start.and_then(|s| s.get("character")).and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+        let ref_line = start
+            .and_then(|s| s.get("line"))
+            .and_then(|l| l.as_u64())
+            .unwrap_or(0) as u32;
+        let ref_col = start
+            .and_then(|s| s.get("character"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0) as u32;
 
         // Anchor-declaration detection: same file + same LSP line.
         let is_def = ref_path.ends_with(&file_context.file_path) && ref_line == lsp_line;
@@ -3997,7 +4231,8 @@ fn find_references_tool(args: Map<String, Value>, server: &Server) -> Result<Val
     });
 
     if lsp_index_status == "cold" {
-        let warning_text = build_cold_warning_for_find_references(symbol, refs.len(), warmup_report.as_ref());
+        let warning_text =
+            build_cold_warning_for_find_references(symbol, refs.len(), warmup_report.as_ref());
         if let Value::Object(ref mut obj) = response {
             obj.insert("warning".to_string(), json!(warning_text));
         }
@@ -4006,7 +4241,10 @@ fn find_references_tool(args: Map<String, Value>, server: &Server) -> Result<Val
     // CULTRA-950: surface the warmup report. Same shape as find_dead_code.
     if let Some(report) = warmup_report {
         if let Value::Object(ref mut obj) = response {
-            obj.insert("warmup_report".to_string(), serde_json::to_value(&report).unwrap_or(Value::Null));
+            obj.insert(
+                "warmup_report".to_string(),
+                serde_json::to_value(&report).unwrap_or(Value::Null),
+            );
         }
     }
 
@@ -4022,7 +4260,10 @@ fn build_cold_warning_for_find_references(
     warmup_report: Option<&crate::lsp::manager::WarmupReport>,
 ) -> String {
     let warmup_succeeded = warmup_report
-        .map(|r| r.status == "warm" || (r.status == "cached" && r.cached_status.as_deref() == Some("warm")))
+        .map(|r| {
+            r.status == "warm"
+                || (r.status == "cached" && r.cached_status.as_deref() == Some("warm"))
+        })
         .unwrap_or(false);
 
     if warmup_succeeded {
@@ -4051,7 +4292,12 @@ fn build_cold_warning_for_find_references(
 /// one rather than 3 — the refinement is cheap and the "other" catch-all would
 /// have forced callers to grep through it manually to split struct literals
 /// from doc comments.
-fn classify_reference_role(line: &str, col: usize, symbol_len: usize, is_def: bool) -> &'static str {
+fn classify_reference_role(
+    line: &str,
+    col: usize,
+    symbol_len: usize,
+    is_def: bool,
+) -> &'static str {
     if is_def {
         return "definition";
     }
@@ -4081,7 +4327,10 @@ fn classify_reference_role(line: &str, col: usize, symbol_len: usize, is_def: bo
     // symbol; that single char is usually enough to disambiguate call from
     // type usage.
     let after_start = col.saturating_add(symbol_len);
-    let after = line.get(after_start..).map(|s| s.trim_start()).unwrap_or("");
+    let after = line
+        .get(after_start..)
+        .map(|s| s.trim_start())
+        .unwrap_or("");
     let first = after.chars().next();
 
     match first {
@@ -4097,7 +4346,10 @@ fn classify_reference_role(line: &str, col: usize, symbol_len: usize, is_def: bo
 /// `callers` array via LSP textDocument/references. Best-effort: any per-symbol
 /// failure (LSP error, position lookup miss) yields a symbol without the field.
 /// Default cap: top 10 callers per symbol.
-fn enrich_symbols_with_callers(file_context: &crate::ast::types::FileContext, server: &Server) -> Value {
+fn enrich_symbols_with_callers(
+    file_context: &crate::ast::types::FileContext,
+    server: &Server,
+) -> Value {
     use crate::mcp::types::{Scope, SymbolType};
 
     const MAX_CALLERS_PER_SYMBOL: usize = 10;
@@ -4112,12 +4364,9 @@ fn enrich_symbols_with_callers(file_context: &crate::ast::types::FileContext, se
     };
     let lines: Vec<&str> = file_contents.lines().collect();
 
-    let is_exported = |scope: &Scope| -> bool {
-        matches!(scope, Scope::Public | Scope::Exported)
-    };
-    let is_callable = |t: &SymbolType| -> bool {
-        matches!(t, SymbolType::Function | SymbolType::Method)
-    };
+    let is_exported = |scope: &Scope| -> bool { matches!(scope, Scope::Public | Scope::Exported) };
+    let is_callable =
+        |t: &SymbolType| -> bool { matches!(t, SymbolType::Function | SymbolType::Method) };
 
     let mut out: Vec<Value> = Vec::with_capacity(file_context.symbols.len());
     for sym in &file_context.symbols {
@@ -4135,7 +4384,8 @@ fn enrich_symbols_with_callers(file_context: &crate::ast::types::FileContext, se
 
         // Find column of the symbol name on its declared line.
         let line_idx = sym.line.saturating_sub(1) as usize;
-        let column = lines.get(line_idx)
+        let column = lines
+            .get(line_idx)
             .and_then(|line| line.find(sym.name.as_str()));
         let column = match column {
             Some(c) => c as u32,
@@ -4161,13 +4411,15 @@ fn enrich_symbols_with_callers(file_context: &crate::ast::types::FileContext, se
 
         match crate::lsp::tools::lsp_query(lsp_args, &server.lsp) {
             Ok(refs_value) => {
-                let refs = refs_value.get("references")
+                let refs = refs_value
+                    .get("references")
                     .and_then(|v| v.as_array())
                     .cloned()
                     .unwrap_or_default();
 
                 // Filter out the declaration site itself and cap to top N.
-                let callers: Vec<Value> = refs.into_iter()
+                let callers: Vec<Value> = refs
+                    .into_iter()
                     .filter_map(|loc| {
                         let uri = loc.get("uri")?.as_str()?.to_string();
                         let range = loc.get("range")?;
@@ -4225,10 +4477,8 @@ impl ComplexityFilters {
         Ok(Self {
             min_cyclomatic: parse_positive_int(args, "min_cyclomatic", None, None)?
                 .map(|n| n as u32),
-            min_cognitive: parse_positive_int(args, "min_cognitive", None, None)?
-                .map(|n| n as u32),
-            top_n: parse_positive_int(args, "top_n", Some(1), None)?
-                .map(|n| n as usize),
+            min_cognitive: parse_positive_int(args, "min_cognitive", None, None)?.map(|n| n as u32),
+            top_n: parse_positive_int(args, "top_n", Some(1), None)?.map(|n| n as usize),
         })
     }
 
@@ -4278,32 +4528,27 @@ fn run_analyzer(
             }
             let analysis = analyze_concurrency(file_path)
                 .map_err(|e| anyhow!("Failed to analyze concurrency: {}", e))?;
-            serde_json::to_value(analysis)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "react" => {
             let analysis = analyze_react_component(file_path)
                 .map_err(|e| anyhow!("Failed to analyze React component: {}", e))?;
-            serde_json::to_value(analysis)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "css" => {
-            let analysis = analyze_css(file_path)
-                .map_err(|e| anyhow!("Failed to analyze CSS: {}", e))?;
-            serde_json::to_value(analysis)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            let analysis =
+                analyze_css(file_path).map_err(|e| anyhow!("Failed to analyze CSS: {}", e))?;
+            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "css_variables" => {
             let graph = css_variable_graph(file_path)
                 .map_err(|e| anyhow!("Failed to build CSS variable graph: {}", e))?;
-            serde_json::to_value(graph)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(graph).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "security" => {
             let analysis = analyze_security(file_path)
                 .map_err(|e| anyhow!("Failed to run security analysis: {}", e))?;
-            serde_json::to_value(analysis)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
         "complexity" => {
             let analysis = analyze_complexity(file_path)
@@ -4313,10 +4558,11 @@ fn run_analyzer(
             } else {
                 analysis
             };
-            serde_json::to_value(analysis)
-                .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+            serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
         }
-        _ => Err(anyhow!("analyzer already validated; this should be unreachable")),
+        _ => Err(anyhow!(
+            "analyzer already validated; this should be unreachable"
+        )),
     }
 }
 
@@ -4352,7 +4598,10 @@ fn analyze_file_tool(args: Map<String, Value>, workspace_root: &std::path::Path)
 /// {cyclomatic, cognitive, lines, rating}, the corresponding metric is
 /// rendered as {prev, now, delta} instead of a scalar. This is purely a
 /// presentation layer — no server-side baseline storage, per the task spec.
-fn analyze_symbol_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+fn analyze_symbol_tool(
+    args: Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value> {
     let analyzer = args
         .get("analyzer")
         .and_then(|v| v.as_str())
@@ -4382,14 +4631,14 @@ fn analyze_symbol_tool(args: Map<String, Value>, workspace_root: &std::path::Pat
     // Filter to functions named `symbol`. Preserves the order from the
     // analyzer walker so the first match is deterministic (first occurrence
     // in source).
-    let matches: Vec<_> = analysis.functions.iter()
+    let matches: Vec<_> = analysis
+        .functions
+        .iter()
         .filter(|f| f.name == symbol)
         .collect();
 
     if matches.is_empty() {
-        let available: Vec<&str> = analysis.functions.iter()
-            .map(|f| f.name.as_str())
-            .collect();
+        let available: Vec<&str> = analysis.functions.iter().map(|f| f.name.as_str()).collect();
         return Err(anyhow!(
             "Symbol '{}' not found in {} (analyzer: complexity). \
              Available functions ({}): {}. \
@@ -4397,20 +4646,25 @@ fn analyze_symbol_tool(args: Map<String, Value>, workspace_root: &std::path::Pat
             symbol,
             file_path,
             available.len(),
-            if available.is_empty() { "<none>".to_string() } else { available.join(", ") }
+            if available.is_empty() {
+                "<none>".to_string()
+            } else {
+                available.join(", ")
+            }
         ));
     }
 
     let first = matches[0];
-    let overload_warning = if matches.len() > 1 {
-        Some(format!(
+    let overload_warning =
+        if matches.len() > 1 {
+            Some(format!(
             "Multiple functions named '{}' found ({} total) — returning the first match at {}. \
              analyze_symbol v1 does not disambiguate by receiver/signature.",
             symbol, matches.len(), first.location
         ))
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Delta-against-baseline rendering. Each metric's baseline is optional:
     // a baseline with only `cyclomatic` renders just that metric as a delta
@@ -4426,7 +4680,10 @@ fn analyze_symbol_tool(args: Map<String, Value>, workspace_root: &std::path::Pat
     };
 
     let (cyclomatic_v, cognitive_v, lines_v, rating_v) = if let Some(b) = baseline {
-        let cyc = mk_delta(b.get("cyclomatic").and_then(|v| v.as_i64()), first.cyclomatic);
+        let cyc = mk_delta(
+            b.get("cyclomatic").and_then(|v| v.as_i64()),
+            first.cyclomatic,
+        );
         let cog = mk_delta(b.get("cognitive").and_then(|v| v.as_i64()), first.cognitive);
         let lin = mk_delta(b.get("lines").and_then(|v| v.as_i64()), first.lines);
         let rat = match b.get("rating").and_then(|v| v.as_str()) {
@@ -4491,7 +4748,10 @@ fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path
         return Err(anyhow!("file_paths must contain at least one entry"));
     }
     if file_paths_arr.len() > 500 {
-        return Err(anyhow!("file_paths capped at 500 entries per call (got {})", file_paths_arr.len()));
+        return Err(anyhow!(
+            "file_paths capped at 500 entries per call (got {})",
+            file_paths_arr.len()
+        ));
     }
 
     // Validate every entry up front. Path validation is cheap (filesystem
@@ -4499,7 +4759,9 @@ fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path
     // messages deterministic.
     let mut file_paths: Vec<String> = Vec::with_capacity(file_paths_arr.len());
     for (i, v) in file_paths_arr.iter().enumerate() {
-        let s = v.as_str().ok_or_else(|| anyhow!("file_paths[{}] is not a string", i))?;
+        let s = v
+            .as_str()
+            .ok_or_else(|| anyhow!("file_paths[{}] is not a string", i))?;
         file_paths.push(s.to_string());
     }
 
@@ -4509,7 +4771,7 @@ fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path
     // Cap concurrency so a 500-file batch doesn't spawn 500 threads.
     // 8 is a sensible default for CPU-bound tree-sitter parsing on most hosts.
     let max_workers = 8usize.min(file_paths.len());
-    let chunk_size = (file_paths.len() + max_workers - 1) / max_workers;
+    let chunk_size = file_paths.len().div_ceil(max_workers);
     let analyzer_owned = analyzer.to_string();
     let workspace_root_owned: std::path::PathBuf = workspace_root.to_path_buf();
     let filters_owned = complexity_filters.clone();
@@ -4525,9 +4787,8 @@ fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path
                 break;
             }
             let end = std::cmp::min(start + chunk_size, file_paths.len());
-            let chunk: Vec<(usize, String)> = (start..end)
-                .map(|i| (i, file_paths[i].clone()))
-                .collect();
+            let chunk: Vec<(usize, String)> =
+                (start..end).map(|i| (i, file_paths[i].clone())).collect();
             let analyzer_ref = &analyzer_owned;
             let workspace_ref = &workspace_root_owned;
             let filters_ref = &filters_owned;
@@ -4570,7 +4831,10 @@ fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path
     let ordered: Vec<Value> = results.into_iter().map(|(_, v)| v).collect();
 
     let total = ordered.len();
-    let succeeded = ordered.iter().filter(|v| v.get("success").and_then(|s| s.as_bool()).unwrap_or(false)).count();
+    let succeeded = ordered
+        .iter()
+        .filter(|v| v.get("success").and_then(|s| s.as_bool()).unwrap_or(false))
+        .count();
 
     Ok(json!({
         "analyzer": analyzer,
@@ -4582,7 +4846,10 @@ fn analyze_files_tool(args: Map<String, Value>, workspace_root: &std::path::Path
 }
 
 /// Tool implementation: find_interface_implementations
-fn find_interface_implementations_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+fn find_interface_implementations_tool(
+    args: Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value> {
     let file_path = args
         .get("file_path")
         .and_then(|v| v.as_str())
@@ -4590,21 +4857,21 @@ fn find_interface_implementations_tool(args: Map<String, Value>, workspace_root:
 
     validate_file_exists(file_path, workspace_root)?;
 
-    let interface_name = args
-        .get("interface_name")
-        .and_then(|v| v.as_str());
+    let interface_name = args.get("interface_name").and_then(|v| v.as_str());
 
     let analysis = find_interface_implementations(file_path, interface_name)
         .map_err(|e| anyhow!("Failed to find interface implementations: {}", e))?;
 
-    serde_json::to_value(analysis)
-        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(analysis).map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
 
 // ========== CSS Analysis Tools ==========
 
 /// Tool implementation: find_css_rules
-fn find_css_rules_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+fn find_css_rules_tool(
+    args: Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value> {
     let file_path = args
         .get("file_path")
         .and_then(|v| v.as_str())
@@ -4620,12 +4887,14 @@ fn find_css_rules_tool(args: Map<String, Value>, workspace_root: &std::path::Pat
     let rules = find_css_rules(file_path, pattern)
         .map_err(|e| anyhow!("Failed to find CSS rules: {}", e))?;
 
-    serde_json::to_value(rules)
-        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(rules).map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
 
 /// Tool implementation: find_unused_selectors
-fn find_unused_selectors_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+fn find_unused_selectors_tool(
+    args: Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value> {
     let css_path = args
         .get("css_path")
         .and_then(|v| v.as_str())
@@ -4645,8 +4914,7 @@ fn find_unused_selectors_tool(args: Map<String, Value>, workspace_root: &std::pa
     let unused = find_unused_selectors(css_path, &path_refs)
         .map_err(|e| anyhow!("Failed to find unused selectors: {}", e))?;
 
-    serde_json::to_value(unused)
-        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(unused).map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
 
 /// Walk a directory and collect .tsx/.ts/.jsx/.js/.html file paths
@@ -4658,7 +4926,18 @@ fn collect_component_files(dir: &str) -> Result<Vec<String>> {
         if path.is_dir() {
             // Skip common non-source directories
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if matches!(name, "node_modules" | ".git" | "dist" | "build" | "target" | ".next" | "__pycache__" | ".venv" | "vendor") {
+                if matches!(
+                    name,
+                    "node_modules"
+                        | ".git"
+                        | "dist"
+                        | "build"
+                        | "target"
+                        | ".next"
+                        | "__pycache__"
+                        | ".venv"
+                        | "vendor"
+                ) {
                     return;
                 }
             }
@@ -4685,7 +4964,10 @@ fn collect_component_files(dir: &str) -> Result<Vec<String>> {
 // ========== CSS Analysis Tools V2 ==========
 
 /// Tool implementation: resolve_tailwind_classes
-fn resolve_tailwind_classes_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+fn resolve_tailwind_classes_tool(
+    args: Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value> {
     let classes_val = args
         .get("classes")
         .ok_or_else(|| anyhow!("Missing required parameter: classes"))?;
@@ -4707,10 +4989,8 @@ fn resolve_tailwind_classes_tool(args: Map<String, Value>, workspace_root: &std:
     let result = resolve_tailwind_classes(&class_refs, css_path)
         .map_err(|e| anyhow!("Failed to resolve Tailwind classes: {}", e))?;
 
-    serde_json::to_value(result)
-        .map_err(|e| anyhow!("Failed to serialize result: {}", e))
+    serde_json::to_value(result).map_err(|e| anyhow!("Failed to serialize result: {}", e))
 }
-
 
 // ========== Engine V2 Intelligence Tools ==========
 
@@ -4739,19 +5019,29 @@ impl<'a> SymbolFilters<'a> {
     /// True iff every active filter matches. A filter is inactive (passes) when None.
     fn matches(&self, sym: &Map<String, Value>) -> bool {
         if let Some(f) = self.symbol_name {
-            if !sym_field_contains_ci(sym, "name", f) { return false; }
+            if !sym_field_contains_ci(sym, "name", f) {
+                return false;
+            }
         }
         if let Some(f) = self.symbol_type {
-            if !sym_field_eq(sym, "type", f) { return false; }
+            if !sym_field_eq(sym, "type", f) {
+                return false;
+            }
         }
         if let Some(f) = self.receiver {
-            if !sym_field_eq(sym, "receiver", f) { return false; }
+            if !sym_field_eq(sym, "receiver", f) {
+                return false;
+            }
         }
         if let Some(f) = self.scope {
-            if !sym_field_eq(sym, "scope", f) { return false; }
+            if !sym_field_eq(sym, "scope", f) {
+                return false;
+            }
         }
         if let Some(f) = self.calls {
-            if !sym_calls_contain(sym, f) { return false; }
+            if !sym_calls_contain(sym, f) {
+                return false;
+            }
         }
         true
     }
@@ -4771,7 +5061,10 @@ fn sym_field_eq(sym: &Map<String, Value>, field: &str, expected: &str) -> bool {
 fn sym_calls_contain(sym: &Map<String, Value>, needle: &str) -> bool {
     sym.get("calls")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().any(|c| c.as_str().map(|s| s.contains(needle)).unwrap_or(false)))
+        .map(|arr| {
+            arr.iter()
+                .any(|c| c.as_str().map(|s| s.contains(needle)).unwrap_or(false))
+        })
         .unwrap_or(false)
 }
 
@@ -4804,11 +5097,17 @@ fn search_code_context(server: &Server, args: Map<String, Value>) -> Result<Valu
     let mut results: Vec<Value> = Vec::new();
 
     for ctx in code_context.as_array().into_iter().flatten() {
-        if results.len() >= limit { break; }
-        let Some(ctx_obj) = ctx.as_object() else { continue; };
+        if results.len() >= limit {
+            break;
+        }
+        let Some(ctx_obj) = ctx.as_object() else {
+            continue;
+        };
 
         if let Some(pattern) = file_pattern {
-            if !ctx_matches_file_pattern(ctx_obj, pattern) { continue; }
+            if !ctx_matches_file_pattern(ctx_obj, pattern) {
+                continue;
+            }
         }
 
         let symbols = match ctx_obj.get("symbols").and_then(|v| v.as_array()) {
@@ -4817,8 +5116,12 @@ fn search_code_context(server: &Server, args: Map<String, Value>) -> Result<Valu
         };
 
         for sym in symbols {
-            if results.len() >= limit { break; }
-            let Some(sym_obj) = sym.as_object() else { continue; };
+            if results.len() >= limit {
+                break;
+            }
+            let Some(sym_obj) = sym.as_object() else {
+                continue;
+            };
             if filters.matches(sym_obj) {
                 results.push(sym.clone());
             }
@@ -4837,43 +5140,45 @@ fn read_symbol_lines(args: Map<String, Value>, workspace_root: &std::path::Path)
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let (file_path, start_line, end_line) = if let Some(location) = args.get("location").and_then(|v| v.as_str()) {
-        // Parse location string "file.go:57-130" or "file.go:57"
-        split_location(location)?
-    } else {
-        // Use explicit parameters
-        let file_path = args
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("file_path or location is required"))?
-            .to_string();
+    let (file_path, start_line, end_line) =
+        if let Some(location) = args.get("location").and_then(|v| v.as_str()) {
+            // Parse location string "file.go:57-130" or "file.go:57"
+            split_location(location)?
+        } else {
+            // Use explicit parameters
+            let file_path = args
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("file_path or location is required"))?
+                .to_string();
 
-        let start_line = args
-            .get("start_line")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow!("start_line is required when using file_path"))? as usize;
+            let start_line = args
+                .get("start_line")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| anyhow!("start_line is required when using file_path"))?
+                as usize;
 
-        let end_line = args
-            .get("end_line")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as usize)
-            .unwrap_or(start_line);
+            let end_line = args
+                .get("end_line")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as usize)
+                .unwrap_or(start_line);
 
-        (file_path, start_line, end_line)
-    };
+            (file_path, start_line, end_line)
+        };
 
     // Validate file exists, is readable, and is within workspace
     validate_file_exists(&file_path, workspace_root)?;
 
     // Read file lines
-    let file = File::open(&file_path)
-        .map_err(|e| anyhow!("Failed to open file {}: {}", file_path, e))?;
+    let file =
+        File::open(&file_path).map_err(|e| anyhow!("Failed to open file {}: {}", file_path, e))?;
 
     let reader = BufReader::new(file);
     let mut content = Vec::new();
-    let mut current_line = 1;
 
-    for line in reader.lines() {
+    for (i, line) in reader.lines().enumerate() {
+        let current_line = i + 1;
         let line = line.map_err(|e| anyhow!("Failed to read line: {}", e))?;
 
         if current_line >= start_line && current_line <= end_line {
@@ -4883,8 +5188,6 @@ fn read_symbol_lines(args: Map<String, Value>, workspace_root: &std::path::Path)
         if current_line > end_line {
             break;
         }
-
-        current_line += 1;
     }
 
     Ok(json!({
@@ -4929,12 +5232,23 @@ fn query_context(server: &Server, args: Map<String, Value>) -> Result<Value> {
     });
 
     // unwrap: body is a json!({...}) literal — always Value::Object.
-    api_post(server, "/api/v2/vector/query", body.as_object().unwrap().clone())
+    api_post(
+        server,
+        "/api/v2/vector/query",
+        body.as_object().unwrap().clone(),
+    )
 }
 
 /// Tool implementation: add_graph_edge
 fn add_graph_edge(server: &Server, args: Map<String, Value>) -> Result<Value> {
-    let required_fields = ["from_type", "from_id", "to_type", "to_id", "edge_type", "project_id"];
+    let required_fields = [
+        "from_type",
+        "from_id",
+        "to_type",
+        "to_id",
+        "edge_type",
+        "project_id",
+    ];
     for field in &required_fields {
         if !args.contains_key(*field) || args.get(*field).and_then(|v| v.as_str()).is_none() {
             return Err(anyhow!("Missing required parameter: {}", field));
@@ -5000,8 +5314,12 @@ fn get_graph_neighbors(server: &Server, args: Map<String, Value>) -> Result<Valu
 /// Split location string "file.go:57-130" into (file_path, start_line, end_line)
 fn split_location(location: &str) -> Result<(String, usize, usize)> {
     // Find the LAST colon - handles Windows paths like C:\path:42
-    let colon_pos = location.rfind(':')
-        .ok_or_else(|| anyhow!("Invalid location format '{}' - expected 'file:line' or 'file:start-end'", location))?;
+    let colon_pos = location.rfind(':').ok_or_else(|| {
+        anyhow!(
+            "Invalid location format '{}' - expected 'file:line' or 'file:start-end'",
+            location
+        )
+    })?;
     let file_path = location[..colon_pos].to_string();
     let line_part = &location[colon_pos + 1..];
 
@@ -5012,15 +5330,18 @@ fn split_location(location: &str) -> Result<(String, usize, usize)> {
             return Err(anyhow!("Invalid line range format"));
         }
 
-        let start_line = range[0].parse::<usize>()
+        let start_line = range[0]
+            .parse::<usize>()
             .map_err(|_| anyhow!("Invalid start line number"))?;
-        let end_line = range[1].parse::<usize>()
+        let end_line = range[1]
+            .parse::<usize>()
             .map_err(|_| anyhow!("Invalid end line number"))?;
 
         Ok((file_path, start_line, end_line))
     } else {
         // Single line: "57"
-        let line = line_part.parse::<usize>()
+        let line = line_part
+            .parse::<usize>()
             .map_err(|_| anyhow!("Invalid line number"))?;
         Ok((file_path, line, line))
     }
@@ -5032,7 +5353,10 @@ fn split_location(location: &str) -> Result<(String, usize, usize)> {
 
 /// Search for a text pattern and annotate each match with the containing AST symbol.
 /// Combines ripgrep-style text search with parse_file_ast-level context.
-fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+fn contextual_search_tool(
+    args: Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value> {
     use crate::ast::parser::Parser;
     use std::process::Command;
 
@@ -5086,13 +5410,21 @@ fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::
         .unwrap_or(100) as usize;
 
     // Step 1: grep for the pattern using ripgrep (preferred) or grep (fallback)
-    let has_rg = Command::new("rg").arg("--version")
+    let has_rg = Command::new("rg")
+        .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status().is_ok();
+        .status()
+        .is_ok();
     let mut cmd = if has_rg {
         let mut c = Command::new("rg");
-        c.args(["--line-number", "--no-heading", "--with-filename", "--max-count", "50"]);
+        c.args([
+            "--line-number",
+            "--no-heading",
+            "--with-filename",
+            "--max-count",
+            "50",
+        ]);
         if let Some(glob) = file_glob {
             c.args(["--glob", glob]);
         }
@@ -5129,7 +5461,9 @@ fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::
 
     let mut hits: Vec<GrepHit> = Vec::new();
     for line in stdout.lines() {
-        if hits.len() >= max_matches { break; }
+        if hits.len() >= max_matches {
+            break;
+        }
         // Parse "file:line:text" — handle Windows paths with drive letters
         let parts: Vec<&str> = line.splitn(3, ':').collect();
         if parts.len() >= 3 {
@@ -5153,15 +5487,27 @@ fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::
 
     // Step 3: group by file and parse AST for each unique file
     let parser = Parser::new();
-    let mut ast_cache: std::collections::HashMap<String, Vec<(String, String, u32, u32)>> = std::collections::HashMap::new();
+    let mut ast_cache: std::collections::HashMap<String, Vec<(String, String, u32, u32)>> =
+        std::collections::HashMap::new();
 
     for hit in &hits {
-        if ast_cache.contains_key(&hit.file) { continue; }
+        if ast_cache.contains_key(&hit.file) {
+            continue;
+        }
         // Parse the file's AST to get symbol ranges
         let symbols: Vec<(String, String, u32, u32)> = match parser.parse_file(&hit.file) {
-            Ok(ctx) => ctx.symbols.iter().map(|s| {
-                (s.name.clone(), format!("{:?}", s.symbol_type).to_lowercase(), s.line, s.end_line)
-            }).collect(),
+            Ok(ctx) => ctx
+                .symbols
+                .iter()
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        format!("{:?}", s.symbol_type).to_lowercase(),
+                        s.line,
+                        s.end_line,
+                    )
+                })
+                .collect(),
             Err(_) => Vec::new(), // Unsupported language — no symbol context
         };
         ast_cache.insert(hit.file.clone(), symbols);
@@ -5176,27 +5522,28 @@ fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::
     let canonical_str = canonical_workspace.to_string_lossy();
 
     for hit in &hits {
-        let relative_file = hit.file
+        let relative_file = hit
+            .file
             .strip_prefix(canonical_str.as_ref())
             .or_else(|| hit.file.strip_prefix(workspace_str.as_ref()))
             .unwrap_or(&hit.file)
             .trim_start_matches('/');
 
-        let containing_symbol = ast_cache.get(&hit.file)
-            .and_then(|symbols| {
-                // Find the innermost symbol containing this line
-                symbols.iter()
-                    .filter(|(_, _, start, end)| hit.line >= *start && hit.line <= *end)
-                    .max_by_key(|(_, _, start, _)| *start) // innermost = highest start line
-                    .map(|(name, sym_type, start, end)| {
-                        json!({
-                            "name": name,
-                            "type": sym_type,
-                            "line": start,
-                            "end_line": end,
-                        })
+        let containing_symbol = ast_cache.get(&hit.file).and_then(|symbols| {
+            // Find the innermost symbol containing this line
+            symbols
+                .iter()
+                .filter(|(_, _, start, end)| hit.line >= *start && hit.line <= *end)
+                .max_by_key(|(_, _, start, _)| *start) // innermost = highest start line
+                .map(|(name, sym_type, start, end)| {
+                    json!({
+                        "name": name,
+                        "type": sym_type,
+                        "line": start,
+                        "end_line": end,
                     })
-            });
+                })
+        });
 
         let mut entry = json!({
             "file": relative_file,
@@ -5204,7 +5551,10 @@ fn contextual_search_tool(args: Map<String, Value>, workspace_root: &std::path::
             "text": hit.text.trim(),
         });
         if let Some(sym) = containing_symbol {
-            entry.as_object_mut().unwrap().insert("containing_symbol".to_string(), sym);
+            entry
+                .as_object_mut()
+                .unwrap()
+                .insert("containing_symbol".to_string(), sym);
         }
         matches.push(entry);
     }
@@ -5228,7 +5578,10 @@ fn project_info_tool(args: Map<String, Value>, server: &Server) -> Result<Value>
 
 /// Inner impl of project_info_tool that takes the workspace_root directly so
 /// it's testable without a full Server. (CULTRA-1070)
-fn project_info_tool_inner(args: Map<String, Value>, workspace_root: &std::path::Path) -> Result<Value> {
+fn project_info_tool_inner(
+    args: Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value> {
     // CULTRA-1070: same resolve+canonicalize pattern as contextual_search_tool
     // (CULTRA-1067). Relative paths join with workspace_root; canonicalization
     // defeats `..` traversal and symlink escapes; nonexistent paths get a clear
@@ -5267,7 +5620,10 @@ fn project_info_tool_inner(args: Map<String, Value>, workspace_root: &std::path:
     let project_path = canonical_path;
 
     if !project_path.is_dir() {
-        return Err(anyhow!("Path '{}' is not a directory", project_path.display()));
+        return Err(anyhow!(
+            "Path '{}' is not a directory",
+            project_path.display()
+        ));
     }
 
     // Detect manifest type by checking for known files
@@ -5324,10 +5680,13 @@ fn project_info_tool_inner(args: Map<String, Value>, workspace_root: &std::path:
                     .stderr(std::process::Stdio::null())
                     .status()
                     .is_ok();
-                result.as_object_mut().unwrap().insert("lsp".to_string(), json!({
-                    "server": lsp_binary,
-                    "available": available,
-                }));
+                result.as_object_mut().unwrap().insert(
+                    "lsp".to_string(),
+                    json!({
+                        "server": lsp_binary,
+                        "available": available,
+                    }),
+                );
             }
 
             // Count source files
@@ -5340,18 +5699,23 @@ fn project_info_tool_inner(args: Map<String, Value>, workspace_root: &std::path:
                 _ => &[],
             };
             let (source_count, test_count) = count_project_files(&project_path, extensions);
-            result.as_object_mut().unwrap().insert("files".to_string(), json!({
-                "source": source_count,
-                "test": test_count,
-            }));
+            result.as_object_mut().unwrap().insert(
+                "files".to_string(),
+                json!({
+                    "source": source_count,
+                    "test": test_count,
+                }),
+            );
 
             return Ok(result);
         }
     }
 
-    Err(anyhow!("No recognized manifest file found in '{}'", project_path.display()))
+    Err(anyhow!(
+        "No recognized manifest file found in '{}'",
+        project_path.display()
+    ))
 }
-
 
 fn parse_cargo_toml(content: &str, project_path: &std::path::Path) -> Value {
     let mut deps = Vec::new();
@@ -5365,10 +5729,15 @@ fn parse_cargo_toml(content: &str, project_path: &std::path::Path) -> Value {
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            section = if trimmed.starts_with("[package]") { "package" }
-                else if trimmed.starts_with("[dependencies]") { "deps" }
-                else if trimmed.starts_with("[dev-dependencies]") { "dev-deps" }
-                else { "other" };
+            section = if trimmed.starts_with("[package]") {
+                "package"
+            } else if trimmed.starts_with("[dependencies]") {
+                "deps"
+            } else if trimmed.starts_with("[dev-dependencies]") {
+                "dev-deps"
+            } else {
+                "other"
+            };
             continue;
         }
         if let Some((key, val)) = trimmed.split_once('=') {
@@ -5436,8 +5805,14 @@ fn parse_pyproject_toml(content: &str, project_path: &std::path::Path) -> Value 
         }
 
         if in_deps {
-            let dep = trimmed.trim_matches(',').trim().trim_matches('"').to_string();
-            if !dep.is_empty() { deps.push(dep); }
+            let dep = trimmed
+                .trim_matches(',')
+                .trim()
+                .trim_matches('"')
+                .to_string();
+            if !dep.is_empty() {
+                deps.push(dep);
+            }
         } else if in_dev_deps {
             if let Some((key, _)) = trimmed.split_once('=') {
                 dev_deps.push(key.trim().trim_matches('"').to_string());
@@ -5449,18 +5824,23 @@ fn parse_pyproject_toml(content: &str, project_path: &std::path::Path) -> Value 
             let key = key.trim();
             let val = val.trim().trim_matches('"');
             match key {
-                "name" => if name.is_empty() { name = val.to_string(); },
-                "version" => if version.is_empty() { version = val.to_string(); },
+                "name" if name.is_empty() => name = val.to_string(),
+                "version" if version.is_empty() => version = val.to_string(),
                 "requires-python" => python_version = val.to_string(),
                 _ => {}
             }
         }
     }
 
-    let pm = if project_path.join("uv.lock").exists() { "uv" }
-        else if project_path.join("poetry.lock").exists() { "poetry" }
-        else if project_path.join("Pipfile.lock").exists() { "pipenv" }
-        else { "pip" };
+    let pm = if project_path.join("uv.lock").exists() {
+        "uv"
+    } else if project_path.join("poetry.lock").exists() {
+        "poetry"
+    } else if project_path.join("Pipfile.lock").exists() {
+        "pipenv"
+    } else {
+        "pip"
+    };
 
     let has_venv = project_path.join(".venv").exists() || project_path.join("venv").exists();
 
@@ -5479,32 +5859,58 @@ fn parse_package_json(content: &str, project_path: &std::path::Path) -> Value {
     let parsed: Value = serde_json::from_str(content).unwrap_or(json!({}));
     let obj = parsed.as_object();
 
-    let name = obj.and_then(|o| o.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let version = obj.and_then(|o| o.get("version")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let name = obj
+        .and_then(|o| o.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let version = obj
+        .and_then(|o| o.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
-    let deps: Vec<String> = obj.and_then(|o| o.get("dependencies"))
+    let deps: Vec<String> = obj
+        .and_then(|o| o.get("dependencies"))
         .and_then(|v| v.as_object())
         .map(|d| d.keys().cloned().collect())
         .unwrap_or_default();
 
-    let dev_deps: Vec<String> = obj.and_then(|o| o.get("devDependencies"))
+    let dev_deps: Vec<String> = obj
+        .and_then(|o| o.get("devDependencies"))
         .and_then(|v| v.as_object())
         .map(|d| d.keys().cloned().collect())
         .unwrap_or_default();
 
-    let pm = if project_path.join("bun.lock").exists() || project_path.join("bun.lockb").exists() { "bun" }
-        else if project_path.join("pnpm-lock.yaml").exists() { "pnpm" }
-        else if project_path.join("yarn.lock").exists() { "yarn" }
-        else { "npm" };
+    let pm = if project_path.join("bun.lock").exists() || project_path.join("bun.lockb").exists() {
+        "bun"
+    } else if project_path.join("pnpm-lock.yaml").exists() {
+        "pnpm"
+    } else if project_path.join("yarn.lock").exists() {
+        "yarn"
+    } else {
+        "npm"
+    };
 
     // Detect TS/Svelte/React
-    let has_ts = deps.iter().chain(dev_deps.iter()).any(|d| d == "typescript");
-    let has_svelte = deps.iter().chain(dev_deps.iter()).any(|d| d.contains("svelte"));
+    let has_ts = deps
+        .iter()
+        .chain(dev_deps.iter())
+        .any(|d| d == "typescript");
+    let has_svelte = deps
+        .iter()
+        .chain(dev_deps.iter())
+        .any(|d| d.contains("svelte"));
     let has_react = deps.iter().chain(dev_deps.iter()).any(|d| d == "react");
-    let framework = if has_svelte { "svelte" }
-        else if has_react { "react" }
-        else if has_ts { "typescript" }
-        else { "javascript" };
+    let framework = if has_svelte {
+        "svelte"
+    } else if has_react {
+        "react"
+    } else if has_ts {
+        "typescript"
+    } else {
+        "javascript"
+    };
 
     json!({
         "name": name,
@@ -5553,20 +5959,27 @@ fn parse_composer_json(content: &str, _project_path: &std::path::Path) -> Value 
     let parsed: Value = serde_json::from_str(content).unwrap_or(json!({}));
     let obj = parsed.as_object();
 
-    let name = obj.and_then(|o| o.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let php_version = obj.and_then(|o| o.get("require"))
+    let name = obj
+        .and_then(|o| o.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let php_version = obj
+        .and_then(|o| o.get("require"))
         .and_then(|v| v.as_object())
         .and_then(|r| r.get("php"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
-    let deps: Vec<String> = obj.and_then(|o| o.get("require"))
+    let deps: Vec<String> = obj
+        .and_then(|o| o.get("require"))
         .and_then(|v| v.as_object())
         .map(|d| d.keys().filter(|k| *k != "php").cloned().collect())
         .unwrap_or_default();
 
-    let dev_deps: Vec<String> = obj.and_then(|o| o.get("require-dev"))
+    let dev_deps: Vec<String> = obj
+        .and_then(|o| o.get("require-dev"))
         .and_then(|v| v.as_object())
         .map(|d| d.keys().cloned().collect())
         .unwrap_or_default();
@@ -5586,7 +5999,12 @@ fn count_project_files(path: &std::path::Path, extensions: &[&str]) -> (usize, u
     (source, test)
 }
 
-fn count_files_recursive(dir: &std::path::Path, extensions: &[&str], source: &mut usize, test: &mut usize) {
+fn count_files_recursive(
+    dir: &std::path::Path,
+    extensions: &[&str],
+    source: &mut usize,
+    test: &mut usize,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -5597,8 +6015,12 @@ fn count_files_recursive(dir: &std::path::Path, extensions: &[&str], source: &mu
         let name_str = name.to_str().unwrap_or("");
 
         // Skip hidden dirs, node_modules, vendor, target, __pycache__, .venv
-        if name_str.starts_with('.') || name_str == "node_modules" || name_str == "vendor"
-            || name_str == "target" || name_str == "__pycache__" || name_str == ".venv"
+        if name_str.starts_with('.')
+            || name_str == "node_modules"
+            || name_str == "vendor"
+            || name_str == "target"
+            || name_str == "__pycache__"
+            || name_str == ".venv"
             || name_str == "venv"
         {
             continue;
@@ -5608,10 +6030,15 @@ fn count_files_recursive(dir: &std::path::Path, extensions: &[&str], source: &mu
             count_files_recursive(&path, extensions, source, test);
         } else if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !extensions.contains(&ext) { continue; }
+            if !extensions.contains(&ext) {
+                continue;
+            }
 
             let path_str = path.to_string_lossy();
-            if path_str.contains("test") || path_str.contains("_test.") || path_str.contains(".test.") {
+            if path_str.contains("test")
+                || path_str.contains("_test.")
+                || path_str.contains(".test.")
+            {
                 *test += 1;
             } else {
                 *source += 1;
@@ -5632,7 +6059,7 @@ mod tests {
     fn test_get_value_type_name() {
         assert_eq!(get_value_type_name(&json!("hello")), "string");
         assert_eq!(get_value_type_name(&json!(42)), "number");
-        assert_eq!(get_value_type_name(&json!(3.14)), "number");
+        assert_eq!(get_value_type_name(&json!(1.5)), "number");
         assert_eq!(get_value_type_name(&json!(true)), "boolean");
         assert_eq!(get_value_type_name(&json!(false)), "boolean");
         assert_eq!(get_value_type_name(&json!([])), "array");
@@ -5729,13 +6156,19 @@ mod tests {
         args.insert("depth".to_string(), json!(0));
         let result = parse_positive_int(&args, "depth", Some(1), Some(5));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must be at least 1"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be at least 1"));
 
         // Test above range
         args.insert("depth".to_string(), json!(10));
         let result = parse_positive_int(&args, "depth", Some(1), Some(5));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must be at most 5"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must be at most 5"));
     }
 
     #[test]
@@ -5815,14 +6248,20 @@ mod tests {
     fn test_split_location_invalid_format() {
         let result = split_location("file.go");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid location format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid location format"));
     }
 
     #[test]
     fn test_split_location_invalid_line_number() {
         let result = split_location("file.go:abc");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid line number"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid line number"));
     }
 
     // Helper to create a test server (API calls will fail but validation runs first)
@@ -5870,9 +6309,12 @@ mod tests {
     fn test_batch_recursive_call_blocked() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert("operations".to_string(), json!([
-            {"tool": "batch", "args": {"operations": [{"tool": "get_task", "args": {}}]}}
-        ]));
+        args.insert(
+            "operations".to_string(),
+            json!([
+                {"tool": "batch", "args": {"operations": [{"tool": "get_task", "args": {}}]}}
+            ]),
+        );
         let result = batch(&mut server, args).unwrap();
         let results = result["results"].as_array().unwrap();
         assert_eq!(results.len(), 1);
@@ -5884,26 +6326,35 @@ mod tests {
     fn test_batch_unknown_tool_returns_error_result() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert("operations".to_string(), json!([
-            {"tool": "nonexistent_tool_xyz", "args": {}}
-        ]));
+        args.insert(
+            "operations".to_string(),
+            json!([
+                {"tool": "nonexistent_tool_xyz", "args": {}}
+            ]),
+        );
         let result = batch(&mut server, args).unwrap();
         assert_eq!(result["total"], 1);
         let results = result["results"].as_array().unwrap();
         assert_eq!(results[0]["index"], 0);
         assert_eq!(results[0]["tool"], "nonexistent_tool_xyz");
         assert_eq!(results[0]["success"], false);
-        assert!(results[0]["error"].as_str().unwrap().contains("Unknown tool"));
+        assert!(results[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown tool"));
     }
 
     #[test]
     fn test_batch_result_structure() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert("operations".to_string(), json!([
-            {"tool": "unknown_a", "args": {}},
-            {"tool": "unknown_b", "args": {}}
-        ]));
+        args.insert(
+            "operations".to_string(),
+            json!([
+                {"tool": "unknown_a", "args": {}},
+                {"tool": "unknown_b", "args": {}}
+            ]),
+        );
         let result = batch(&mut server, args).unwrap();
         assert_eq!(result["total"], 2);
         let results = result["results"].as_array().unwrap();
@@ -5917,9 +6368,12 @@ mod tests {
     fn test_batch_missing_tool_field() {
         let mut server = test_server();
         let mut args = Map::new();
-        args.insert("operations".to_string(), json!([
-            {"args": {}}
-        ]));
+        args.insert(
+            "operations".to_string(),
+            json!([
+                {"args": {}}
+            ]),
+        );
         let result = batch(&mut server, args).unwrap();
         let results = result["results"].as_array().unwrap();
         assert_eq!(results[0]["success"], false);
@@ -5949,7 +6403,10 @@ mod tests {
     #[test]
     fn test_parse_timestamp_secs_microseconds() {
         // Postgres json_agg format with microseconds — should parse, truncating fractional seconds
-        assert_eq!(parse_timestamp_secs("2026-04-11T01:30:00.123456Z"), 1775871000);
+        assert_eq!(
+            parse_timestamp_secs("2026-04-11T01:30:00.123456Z"),
+            1775871000
+        );
     }
 
     #[test]
@@ -5976,15 +6433,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p1 = write_go_file(&dir, "a.go", "package main\nfunc main() {}\n");
         let p2 = write_go_file(&dir, "b.go", "package main\nfunc helper() {}\n");
-        let p3 = write_go_file(&dir, "c.go", "package main\nimport \"sync\"\nvar _ sync.Mutex\n");
+        let p3 = write_go_file(
+            &dir,
+            "c.go",
+            "package main\nimport \"sync\"\nvar _ sync.Mutex\n",
+        );
 
         let mut args = Map::new();
         args.insert("analyzer".to_string(), json!("complexity"));
-        args.insert("file_paths".to_string(), json!([
-            p1.to_str().unwrap(),
-            p2.to_str().unwrap(),
-            p3.to_str().unwrap(),
-        ]));
+        args.insert(
+            "file_paths".to_string(),
+            json!([
+                p1.to_str().unwrap(),
+                p2.to_str().unwrap(),
+                p3.to_str().unwrap(),
+            ]),
+        );
 
         let workspace = std::path::PathBuf::from("/");
         let result = analyze_files_tool(args, &workspace).unwrap();
@@ -6005,9 +6469,13 @@ mod tests {
 
         let mut args = Map::new();
         args.insert("analyzer".to_string(), json!("security"));
-        args.insert("file_paths".to_string(), json!(
-            paths.iter().map(|p| p.to_str().unwrap()).collect::<Vec<_>>()
-        ));
+        args.insert(
+            "file_paths".to_string(),
+            json!(paths
+                .iter()
+                .map(|p| p.to_str().unwrap())
+                .collect::<Vec<_>>()),
+        );
 
         let workspace = std::path::PathBuf::from("/");
         let result = analyze_files_tool(args, &workspace).unwrap();
@@ -6016,7 +6484,8 @@ mod tests {
             assert_eq!(
                 entry["file_path"].as_str().unwrap(),
                 paths[i].to_str().unwrap(),
-                "result {} out of order", i
+                "result {} out of order",
+                i
             );
         }
     }
@@ -6029,10 +6498,10 @@ mod tests {
 
         let mut args = Map::new();
         args.insert("analyzer".to_string(), json!("complexity"));
-        args.insert("file_paths".to_string(), json!([
-            good.to_str().unwrap(),
-            bad.to_str().unwrap(),
-        ]));
+        args.insert(
+            "file_paths".to_string(),
+            json!([good.to_str().unwrap(), bad.to_str().unwrap(),]),
+        );
 
         let workspace = std::path::PathBuf::from("/");
         let result = analyze_files_tool(args, &workspace).unwrap();
@@ -6082,7 +6551,7 @@ mod tests {
     fn fake_function(name: &str, cyc: u32, cog: u32) -> crate::ast::FunctionComplexity {
         crate::ast::FunctionComplexity {
             name: name.to_string(),
-            location: format!("/fake.go:1-10"),
+            location: "/fake.go:1-10".to_string(),
             line_start: 1,
             line_end: 10,
             lines: 10,
@@ -6124,12 +6593,19 @@ mod tests {
         let filters = ComplexityFilters::default();
         assert!(!filters.is_active());
         let out = apply_complexity_filters(analysis, &filters);
-        assert_eq!(out.functions.len(), 4, "default filters should not drop anything");
+        assert_eq!(
+            out.functions.len(),
+            4,
+            "default filters should not drop anything"
+        );
     }
 
     #[test]
     fn test_apply_complexity_filters_min_cyclomatic_drops_below_threshold() {
-        let filters = ComplexityFilters { min_cyclomatic: Some(10), ..Default::default() };
+        let filters = ComplexityFilters {
+            min_cyclomatic: Some(10),
+            ..Default::default()
+        };
         assert!(filters.is_active());
         let out = apply_complexity_filters(fake_analysis(), &filters);
         assert_eq!(out.functions.len(), 2, "expected 2 funcs >= CC 10");
@@ -6138,7 +6614,10 @@ mod tests {
 
     #[test]
     fn test_apply_complexity_filters_min_cognitive_drops_below_threshold() {
-        let filters = ComplexityFilters { min_cognitive: Some(15), ..Default::default() };
+        let filters = ComplexityFilters {
+            min_cognitive: Some(15),
+            ..Default::default()
+        };
         let out = apply_complexity_filters(fake_analysis(), &filters);
         assert_eq!(out.functions.len(), 2, "expected 2 funcs >= cognitive 15");
         assert!(out.functions.iter().all(|f| f.cognitive >= 15));
@@ -6146,7 +6625,10 @@ mod tests {
 
     #[test]
     fn test_apply_complexity_filters_top_n_truncates() {
-        let filters = ComplexityFilters { top_n: Some(2), ..Default::default() };
+        let filters = ComplexityFilters {
+            top_n: Some(2),
+            ..Default::default()
+        };
         let out = apply_complexity_filters(fake_analysis(), &filters);
         assert_eq!(out.functions.len(), 2);
         // Pre-sorted by cyclomatic desc, so top 2 are very_complex + complex
@@ -6172,9 +6654,15 @@ mod tests {
     fn test_apply_complexity_filters_preserves_summary() {
         // File-level summary aggregates should NOT change when functions are filtered
         // (otherwise avg_cyclomatic etc. become "avg of the top N" — meaningless).
-        let filters = ComplexityFilters { top_n: Some(1), ..Default::default() };
+        let filters = ComplexityFilters {
+            top_n: Some(1),
+            ..Default::default()
+        };
         let out = apply_complexity_filters(fake_analysis(), &filters);
-        assert_eq!(out.summary.total_functions, 4, "summary preserves unfiltered count");
+        assert_eq!(
+            out.summary.total_functions, 4,
+            "summary preserves unfiltered count"
+        );
         assert_eq!(out.summary.max_cyclomatic, 25);
         assert_eq!(out.functions.len(), 1);
     }
@@ -6203,7 +6691,7 @@ mod tests {
         let mut args = Map::new();
         args.insert("top_n".to_string(), json!(0));
         let err = ComplexityFilters::parse_from_args(&args).unwrap_err();
-        assert!(err.to_string().contains("at least 1"), "got: {}", err.to_string());
+        assert!(err.to_string().contains("at least 1"), "got: {}", err);
     }
 
     #[test]
@@ -6211,12 +6699,16 @@ mod tests {
         // End-to-end: analyze a Go file with multiple functions and verify
         // top_n=1 returns exactly one function in the JSON response.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_go_file(&dir, "multi.go", concat!(
-            "package main\n",
-            "func a() {}\n",
-            "func b(x int) int { if x > 0 { return 1 } else { return 0 } }\n",
-            "func c(x int) int { if x > 0 { return 1 }; if x < 0 { return -1 }; return 0 }\n",
-        ));
+        let path = write_go_file(
+            &dir,
+            "multi.go",
+            concat!(
+                "package main\n",
+                "func a() {}\n",
+                "func b(x int) int { if x > 0 { return 1 } else { return 0 } }\n",
+                "func c(x int) int { if x > 0 { return 1 }; if x < 0 { return -1 }; return 0 }\n",
+            ),
+        );
 
         let mut args = Map::new();
         args.insert("analyzer".to_string(), json!("complexity"));
@@ -6234,11 +6726,15 @@ mod tests {
     #[test]
     fn test_analyze_file_complexity_min_cyclomatic_drops_simple() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_go_file(&dir, "multi.go", concat!(
-            "package main\n",
-            "func a() {}\n",  // CC=1
-            "func b(x int) int { if x > 0 { return 1 } else { return 0 } }\n", // CC=2
-        ));
+        let path = write_go_file(
+            &dir,
+            "multi.go",
+            concat!(
+                "package main\n",
+                "func a() {}\n", // CC=1
+                "func b(x int) int { if x > 0 { return 1 } else { return 0 } }\n", // CC=2
+            ),
+        );
 
         let mut args = Map::new();
         args.insert("analyzer".to_string(), json!("complexity"));
@@ -6248,9 +6744,14 @@ mod tests {
         let workspace = std::path::PathBuf::from("/");
         let result = analyze_file_tool(args, &workspace).unwrap();
         let funcs = result["functions"].as_array().unwrap();
-        assert!(funcs.iter().all(|f| f["cyclomatic"].as_u64().unwrap() >= 2),
+        assert!(
+            funcs.iter().all(|f| f["cyclomatic"].as_u64().unwrap() >= 2),
             "expected all functions to have CC>=2, got: {:?}",
-            funcs.iter().map(|f| (f["name"].as_str(), f["cyclomatic"].as_u64())).collect::<Vec<_>>());
+            funcs
+                .iter()
+                .map(|f| (f["name"].as_str(), f["cyclomatic"].as_u64()))
+                .collect::<Vec<_>>()
+        );
         // function 'a' (CC=1) should be filtered out, leaving 'b' (CC>=2)
         assert!(funcs.iter().any(|f| f["name"].as_str() == Some("b")));
         assert!(!funcs.iter().any(|f| f["name"].as_str() == Some("a")));
@@ -6259,20 +6760,31 @@ mod tests {
     #[test]
     fn test_analyze_files_complexity_filters_apply_per_file() {
         let dir = tempfile::tempdir().unwrap();
-        let p1 = write_go_file(&dir, "a.go", concat!(
-            "package main\n",
-            "func a1() {}\n",
-            "func a2(x int) int { if x > 0 { return 1 } else { return 0 } }\n",
-        ));
-        let p2 = write_go_file(&dir, "b.go", concat!(
-            "package main\n",
-            "func b1() {}\n",
-            "func b2(x int) int { if x > 0 { return 1 }; if x < 0 { return -1 }; return 0 }\n",
-        ));
+        let p1 = write_go_file(
+            &dir,
+            "a.go",
+            concat!(
+                "package main\n",
+                "func a1() {}\n",
+                "func a2(x int) int { if x > 0 { return 1 } else { return 0 } }\n",
+            ),
+        );
+        let p2 = write_go_file(
+            &dir,
+            "b.go",
+            concat!(
+                "package main\n",
+                "func b1() {}\n",
+                "func b2(x int) int { if x > 0 { return 1 }; if x < 0 { return -1 }; return 0 }\n",
+            ),
+        );
 
         let mut args = Map::new();
         args.insert("analyzer".to_string(), json!("complexity"));
-        args.insert("file_paths".to_string(), json!([p1.to_str().unwrap(), p2.to_str().unwrap()]));
+        args.insert(
+            "file_paths".to_string(),
+            json!([p1.to_str().unwrap(), p2.to_str().unwrap()]),
+        );
         args.insert("top_n".to_string(), json!(1));
 
         let workspace = std::path::PathBuf::from("/");
@@ -6282,8 +6794,12 @@ mod tests {
         // Each file should report exactly 1 function (top_n applied per-file)
         for entry in results {
             let funcs = entry["result"]["functions"].as_array().unwrap();
-            assert_eq!(funcs.len(), 1,
-                "expected per-file top_n=1; entry: {}", entry["file_path"]);
+            assert_eq!(
+                funcs.len(),
+                1,
+                "expected per-file top_n=1; entry: {}",
+                entry["file_path"]
+            );
         }
     }
 
@@ -6300,7 +6816,8 @@ mod tests {
 
         let workspace = std::path::PathBuf::from("/");
         // Should not error — filters are no-op for non-complexity analyzers
-        let _result = analyze_file_tool(args, &workspace).expect("filters should be ignored, not errored");
+        let _result =
+            analyze_file_tool(args, &workspace).expect("filters should be ignored, not errored");
     }
 
     // CULTRA-906: caller enrichment tests (LSP graceful degradation).
@@ -6338,10 +6855,16 @@ mod tests {
         // return an empty references list (empty array) — both are degraded
         // states we accept.
         for entry in arr {
-            let obj = entry.as_object().expect("symbol should serialize as object");
+            let obj = entry
+                .as_object()
+                .expect("symbol should serialize as object");
             assert!(obj.contains_key("name"), "symbol missing name");
             if let Some(callers) = obj.get("callers") {
-                assert!(callers.is_array(), "callers must be an array, got {:?}", callers);
+                assert!(
+                    callers.is_array(),
+                    "callers must be an array, got {:?}",
+                    callers
+                );
             }
         }
     }
@@ -6357,7 +6880,12 @@ mod tests {
                 .current_dir(dir)
                 .output()
                 .expect("git command failed to spawn");
-            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["init", "-q", "-b", "main"]);
         run(&["config", "user.email", "test@example.com"]);
@@ -6372,7 +6900,12 @@ mod tests {
                 .current_dir(dir)
                 .output()
                 .expect("git command failed");
-            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["add", "-A"]);
         run(&["commit", "-q", "-m", msg]);
@@ -6383,10 +6916,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_git_repo(dir.path());
 
-        std::fs::write(dir.path().join("safe.go"), "package main\nfunc Helper() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("safe.go"),
+            "package main\nfunc Helper() {}\n",
+        )
+        .unwrap();
         commit_all(dir.path(), "init");
 
-        std::fs::write(dir.path().join("changed.go"), "package main\nfunc Changed() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("changed.go"),
+            "package main\nfunc Changed() {}\n",
+        )
+        .unwrap();
         commit_all(dir.path(), "add changed");
 
         let mut args = Map::new();
@@ -6395,9 +6936,16 @@ mod tests {
         let result = analyze_changes_tool(args, dir.path()).expect("should not error");
 
         let total = result["total"].as_u64().unwrap();
-        assert_eq!(total, 1, "expected 1 file analyzed, got {}: {:?}", total, result);
+        assert_eq!(
+            total, 1,
+            "expected 1 file analyzed, got {}: {:?}",
+            total, result
+        );
         let results = result["results"].as_array().unwrap();
-        assert!(results[0]["file_path"].as_str().unwrap().ends_with("changed.go"));
+        assert!(results[0]["file_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("changed.go"));
     }
 
     #[test]
@@ -6426,7 +6974,11 @@ mod tests {
         args.insert("since".to_string(), json!("nonexistent-ref"));
         args.insert("analyzer".to_string(), json!("security"));
         let err = analyze_changes_tool(args, dir.path()).unwrap_err();
-        assert!(err.to_string().contains("git diff failed"), "expected git error, got: {}", err);
+        assert!(
+            err.to_string().contains("git diff failed"),
+            "expected git error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -6446,7 +6998,10 @@ mod tests {
         let result = analyze_changes_tool(args, dir.path()).unwrap();
         assert_eq!(result["total"], 1);
         let results = result["results"].as_array().unwrap();
-        assert!(results[0]["file_path"].as_str().unwrap().ends_with("more.go"));
+        assert!(results[0]["file_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("more.go"));
     }
 
     // CULTRA-956: include_working_tree default + descriptive empty messages.
@@ -6471,8 +7026,11 @@ mod tests {
         args.insert("analyzer".to_string(), json!("complexity"));
         let result = analyze_changes_tool(args, dir.path()).unwrap();
         let total = result["total"].as_u64().unwrap();
-        assert!(total >= 1,
-            "working-tree changes should be included by default, got total={}", total);
+        assert!(
+            total >= 1,
+            "working-tree changes should be included by default, got total={}",
+            total
+        );
         assert_eq!(result["include_working_tree"], true);
     }
 
@@ -6513,13 +7071,14 @@ mod tests {
         assert_eq!(result["total"], 0);
         let msg = result["message"].as_str().unwrap();
         assert!(
-            msg.contains("No changes found")
-                || msg.contains("no changes found"),
+            msg.contains("No changes found") || msg.contains("no changes found"),
             "empty diff should say 'no changes found', got: {}",
             msg
         );
-        assert!(!msg.contains("language filter rejected"),
-            "empty diff must NOT blame the language filter when there's no diff at all");
+        assert!(
+            !msg.contains("language filter rejected"),
+            "empty diff must NOT blame the language filter when there's no diff at all"
+        );
     }
 
     #[test]
@@ -6543,10 +7102,15 @@ mod tests {
         let result = analyze_changes_tool(args, dir.path()).unwrap();
         assert_eq!(result["total"], 0);
         let msg = result["message"].as_str().unwrap();
-        assert!(msg.contains("language filter") || msg.contains("none matched"),
-            "should blame the language filter, got: {}", msg);
-        assert!(result["total_changed_files"].as_u64().unwrap() >= 1,
-            "should report the count of files that were filtered out");
+        assert!(
+            msg.contains("language filter") || msg.contains("none matched"),
+            "should blame the language filter, got: {}",
+            msg
+        );
+        assert!(
+            result["total_changed_files"].as_u64().unwrap() >= 1,
+            "should report the count of files that were filtered out"
+        );
     }
 
     #[test]
@@ -6563,7 +7127,10 @@ mod tests {
         args.insert("since".to_string(), json!("HEAD~1"));
         args.insert("analyzer".to_string(), json!("complexity"));
         let result = analyze_changes_tool(args, dir.path()).unwrap();
-        assert_eq!(result["total"], 0, "deleted files must not appear in analysis");
+        assert_eq!(
+            result["total"], 0,
+            "deleted files must not appear in analysis"
+        );
     }
 
     // CULTRA-909: diff_file_ast tests. Real git repo with two commits.
@@ -6585,10 +7152,28 @@ mod tests {
         args.insert("base_ref".to_string(), json!("HEAD~1"));
         let result = diff_file_ast_tool(args, dir.path()).expect("should not error");
 
-        let added: Vec<_> = result["added"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect();
-        let removed: Vec<_> = result["removed"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap().to_string()).collect();
-        assert!(added.contains(&"New".to_string()), "expected New in added, got {:?}", added);
-        assert!(removed.contains(&"Old".to_string()), "expected Old in removed, got {:?}", removed);
+        let added: Vec<_> = result["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        let removed: Vec<_> = result["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            added.contains(&"New".to_string()),
+            "expected New in added, got {:?}",
+            added
+        );
+        assert!(
+            removed.contains(&"Old".to_string()),
+            "expected Old in removed, got {:?}",
+            removed
+        );
         // Stable function appears in neither.
         assert!(!added.contains(&"Stable".to_string()));
         assert!(!removed.contains(&"Stable".to_string()));
@@ -6619,7 +7204,11 @@ mod tests {
         let head_params = entry["head"]["parameters"].as_array().unwrap();
         assert_eq!(base_params.len(), 1, "base should have 1 param");
         assert_eq!(head_params.len(), 2, "head should have 2 params");
-        assert!(head_params.iter().any(|p| p["name"] == "y"), "head should include y param: {:?}", head_params);
+        assert!(
+            head_params.iter().any(|p| p["name"] == "y"),
+            "head should include y param: {:?}",
+            head_params
+        );
     }
 
     #[test]
@@ -6656,7 +7245,11 @@ mod tests {
         args.insert("file_path".to_string(), json!(file.to_str().unwrap()));
         args.insert("base_ref".to_string(), json!("nonexistent-ref-xyz"));
         let err = diff_file_ast_tool(args, dir.path()).unwrap_err();
-        assert!(err.to_string().contains("git show"), "expected git error, got: {}", err);
+        assert!(
+            err.to_string().contains("git show"),
+            "expected git error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -6687,14 +7280,28 @@ mod tests {
         let result = diff_file_ast_tool(args, outer.path())
             .expect("nested git repo should be discovered via walk-up");
 
-        let added: Vec<_> = result["added"].as_array().unwrap().iter()
-            .map(|s| s["name"].as_str().unwrap().to_string()).collect();
-        let removed: Vec<_> = result["removed"].as_array().unwrap().iter()
-            .map(|s| s["name"].as_str().unwrap().to_string()).collect();
-        assert!(added.contains(&"New".to_string()),
-            "expected New in added (proves git ran from the right cwd), got: {:?}", added);
-        assert!(removed.contains(&"Old".to_string()),
-            "expected Old in removed, got: {:?}", removed);
+        let added: Vec<_> = result["added"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        let removed: Vec<_> = result["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            added.contains(&"New".to_string()),
+            "expected New in added (proves git ran from the right cwd), got: {:?}",
+            added
+        );
+        assert!(
+            removed.contains(&"Old".to_string()),
+            "expected Old in removed, got: {:?}",
+            removed
+        );
     }
 
     #[test]
@@ -6711,8 +7318,11 @@ mod tests {
         args.insert("base_ref".to_string(), json!("HEAD"));
         let err = diff_file_ast_tool(args, dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains(".git") && msg.contains("sandbox"),
-            "error should mention .git and sandbox boundary, got: {}", msg);
+        assert!(
+            msg.contains(".git") && msg.contains("sandbox"),
+            "error should mention .git and sandbox boundary, got: {}",
+            msg
+        );
     }
 
     // CULTRA-907: find_dead_code tests. Same constraint as caller enrichment:
@@ -6746,7 +7356,11 @@ mod tests {
 
         // 2 exported functions checked; private one skipped.
         let checked = obj["checked_symbols"].as_u64().unwrap();
-        assert_eq!(checked, 2, "expected 2 checked exported symbols, got {}", checked);
+        assert_eq!(
+            checked, 2,
+            "expected 2 checked exported symbols, got {}",
+            checked
+        );
 
         // Without LSP, every symbol either gets skipped (lsp_failures bumped)
         // or returns no references (would be flagged dead). Either is a valid
@@ -6783,18 +7397,37 @@ mod tests {
 
         // Verify caveats mention CULTRA-945 confidence behaviour.
         let caveats = result["caveats"].as_array().unwrap();
-        let joined: String = caveats.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" ");
-        assert!(joined.contains("CULTRA-945") && joined.contains("confidence"),
-            "expected CULTRA-945 confidence caveat, got: {}", joined);
+        let joined: String = caveats
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            joined.contains("CULTRA-945") && joined.contains("confidence"),
+            "expected CULTRA-945 confidence caveat, got: {}",
+            joined
+        );
 
         // Every dead entry must have confidence + total_references.
         let dead = result["dead_symbols"].as_array().unwrap();
         for entry in dead {
             let obj = entry.as_object().unwrap();
-            assert!(obj.contains_key("confidence"), "dead entry missing confidence: {:?}", obj);
-            assert!(obj.contains_key("total_references"), "dead entry missing total_references: {:?}", obj);
+            assert!(
+                obj.contains_key("confidence"),
+                "dead entry missing confidence: {:?}",
+                obj
+            );
+            assert!(
+                obj.contains_key("total_references"),
+                "dead entry missing total_references: {:?}",
+                obj
+            );
             let c = obj["confidence"].as_str().unwrap();
-            assert!(c == "high" || c == "low", "confidence must be 'high' or 'low', got: {}", c);
+            assert!(
+                c == "high" || c == "low",
+                "confidence must be 'high' or 'low', got: {}",
+                c
+            );
         }
     }
 
@@ -6818,13 +7451,25 @@ mod tests {
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         let result = find_dead_code_tool(args, &server).unwrap();
 
-        assert_eq!(result["lsp_index_status"], "cold",
-            "expected cold status when no LSP index, got {:?}", result["lsp_index_status"]);
-        let warning = result.get("warning").and_then(|v| v.as_str())
+        assert_eq!(
+            result["lsp_index_status"], "cold",
+            "expected cold status when no LSP index, got {:?}",
+            result["lsp_index_status"]
+        );
+        let warning = result
+            .get("warning")
+            .and_then(|v| v.as_str())
             .expect("cold status must surface a top-level warning");
-        assert!(warning.contains("cold"), "warning should mention cold: {}", warning);
-        assert!(warning.contains("require_warm_index"),
-            "warning should point at the require_warm_index knob: {}", warning);
+        assert!(
+            warning.contains("cold"),
+            "warning should mention cold: {}",
+            warning
+        );
+        assert!(
+            warning.contains("require_warm_index"),
+            "warning should point at the require_warm_index knob: {}",
+            warning
+        );
     }
 
     #[test]
@@ -6846,8 +7491,11 @@ mod tests {
 
         assert_eq!(result["checked_symbols"], 0);
         assert_eq!(result["lsp_index_status"], "unknown");
-        assert!(result.get("warning").is_none(),
-            "unknown status must not emit a warning, got {:?}", result.get("warning"));
+        assert!(
+            result.get("warning").is_none(),
+            "unknown status must not emit a warning, got {:?}",
+            result.get("warning")
+        );
     }
 
     #[test]
@@ -6866,9 +7514,16 @@ mod tests {
         args.insert("require_warm_index".to_string(), json!(true));
         let err = find_dead_code_tool(args, &server).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("cold"), "expected cold-index error, got: {}", msg);
-        assert!(msg.contains("require_warm_index"),
-            "error should reference require_warm_index, got: {}", msg);
+        assert!(
+            msg.contains("cold"),
+            "expected cold-index error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("require_warm_index"),
+            "error should reference require_warm_index, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -6888,7 +7543,10 @@ mod tests {
         args.insert("require_warm_index".to_string(), json!(false));
         let result = find_dead_code_tool(args, &server).expect("should not error in lax mode");
         assert_eq!(result["lsp_index_status"], "cold");
-        assert!(result.get("warning").is_some(), "should still surface warning");
+        assert!(
+            result.get("warning").is_some(),
+            "should still surface warning"
+        );
     }
 
     #[test]
@@ -6921,8 +7579,11 @@ mod tests {
         let mut args = Map::new();
         args.insert("file_path".to_string(), json!("/tmp/whatever.go"));
         let err = find_references_tool(args, &server).unwrap_err();
-        assert!(err.to_string().contains("symbol"),
-            "expected symbol param error, got: {}", err);
+        assert!(
+            err.to_string().contains("symbol"),
+            "expected symbol param error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -6931,8 +7592,11 @@ mod tests {
         let mut args = Map::new();
         args.insert("symbol".to_string(), json!("Foo"));
         let err = find_references_tool(args, &server).unwrap_err();
-        assert!(err.to_string().contains("file_path"),
-            "expected file_path param error, got: {}", err);
+        assert!(
+            err.to_string().contains("file_path"),
+            "expected file_path param error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -6949,8 +7613,11 @@ mod tests {
         args.insert("symbol".to_string(), json!("NonexistentFn"));
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         let err = find_references_tool(args, &server).unwrap_err();
-        assert!(err.to_string().contains("NonexistentFn"),
-            "expected symbol-not-found error naming the symbol, got: {}", err);
+        assert!(
+            err.to_string().contains("NonexistentFn"),
+            "expected symbol-not-found error naming the symbol, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -6979,12 +7646,21 @@ mod tests {
         assert!(obj.contains_key("lsp_index_status"));
         assert!(obj["results"].is_array());
         assert_eq!(obj["lsp_index_status"], "cold");
-        assert!(obj.get("warning").is_some(),
-            "cold status must surface a top-level warning");
+        assert!(
+            obj.get("warning").is_some(),
+            "cold status must surface a top-level warning"
+        );
         let warning = obj["warning"].as_str().unwrap();
-        assert!(warning.contains("cold"), "warning should mention cold: {}", warning);
-        assert!(warning.contains("require_warm_index"),
-            "warning should point at the require_warm_index knob: {}", warning);
+        assert!(
+            warning.contains("cold"),
+            "warning should mention cold: {}",
+            warning
+        );
+        assert!(
+            warning.contains("require_warm_index"),
+            "warning should point at the require_warm_index knob: {}",
+            warning
+        );
     }
 
     #[test]
@@ -7003,9 +7679,16 @@ mod tests {
         args.insert("require_warm_index".to_string(), json!(true));
         let err = find_references_tool(args, &server).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("cold"), "expected cold-index error, got: {}", msg);
-        assert!(msg.contains("require_warm_index"),
-            "error should reference require_warm_index, got: {}", msg);
+        assert!(
+            msg.contains("cold"),
+            "expected cold-index error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("require_warm_index"),
+            "error should reference require_warm_index, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -7023,8 +7706,7 @@ mod tests {
         args.insert("symbol".to_string(), json!("Lax"));
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("require_warm_index".to_string(), json!(false));
-        let result = find_references_tool(args, &server)
-            .expect("explicit false should not error");
+        let result = find_references_tool(args, &server).expect("explicit false should not error");
         assert_eq!(result["lsp_index_status"], "cold");
         assert!(result.get("warning").is_some());
     }
@@ -7114,10 +7796,7 @@ mod tests {
     #[test]
     fn test_classify_reference_role_unknown_fallback() {
         // `foo;` — next char is ';', no match
-        assert_eq!(
-            classify_reference_role("foo;", 0, 3, false),
-            "unknown"
-        );
+        assert_eq!(classify_reference_role("foo;", 0, 3, false), "unknown");
     }
 
     // CULTRA-950: warmup parameter wiring tests. Verify the find_dead_code
@@ -7135,7 +7814,8 @@ mod tests {
         match result {
             Err(e) => {
                 let msg = e.to_string();
-                msg.contains("Invalid status") || msg.contains("status array must")
+                msg.contains("Invalid status")
+                    || msg.contains("status array must")
                     || msg.contains("status must be")
             }
             Ok(_) => false,
@@ -7183,28 +7863,55 @@ pub async fn run() {
         assert_eq!(result["language"], "rust");
 
         let spawns = result["spawns"].as_array().expect("spawns should be array");
-        assert!(!spawns.is_empty(),
-            "tokio::spawn must be detected by the Rust analyzer dispatcher path, got: {:?}", spawns);
+        assert!(
+            !spawns.is_empty(),
+            "tokio::spawn must be detected by the Rust analyzer dispatcher path, got: {:?}",
+            spawns
+        );
 
-        let sync = result["synchronization"].as_array().expect("synchronization should be array");
-        assert!(sync.iter().any(|s| s["kind"].as_str().unwrap_or("").contains("Mutex")),
-            "Mutex must be detected, got: {:?}", sync);
+        let sync = result["synchronization"]
+            .as_array()
+            .expect("synchronization should be array");
+        assert!(
+            sync.iter()
+                .any(|s| s["kind"].as_str().unwrap_or("").contains("Mutex")),
+            "Mutex must be detected, got: {:?}",
+            sync
+        );
 
-        let channels = result["channels"].as_array().expect("channels should be array");
-        assert!(!channels.is_empty(),
-            "mpsc::channel must be detected, got: {:?}", channels);
+        let channels = result["channels"]
+            .as_array()
+            .expect("channels should be array");
+        assert!(
+            !channels.is_empty(),
+            "mpsc::channel must be detected, got: {:?}",
+            channels
+        );
 
-        let selects = result["selects"].as_array().expect("selects should be array");
-        assert!(!selects.is_empty(),
-            "tokio::select! must be detected, got: {:?}", selects);
+        let selects = result["selects"]
+            .as_array()
+            .expect("selects should be array");
+        assert!(
+            !selects.is_empty(),
+            "tokio::select! must be detected, got: {:?}",
+            selects
+        );
 
-        let async_fns = result["async_functions"].as_array().expect("async_functions should be array");
-        assert!(!async_fns.is_empty(),
-            "async fn must be detected, got: {:?}", async_fns);
+        let async_fns = result["async_functions"]
+            .as_array()
+            .expect("async_functions should be array");
+        assert!(
+            !async_fns.is_empty(),
+            "async fn must be detected, got: {:?}",
+            async_fns
+        );
 
         let await_count = result["await_points"].as_u64().unwrap_or(0);
-        assert!(await_count > 0,
-            "await points must be detected, got: {}", await_count);
+        assert!(
+            await_count > 0,
+            "await points must be detected, got: {}",
+            await_count
+        );
     }
 
     #[test]
@@ -7257,8 +7964,11 @@ pub async fn run() {
 
         let mut args = Map::new();
         resolve_project_id(&server, &mut args).unwrap();
-        assert_eq!(args.get("project_id").unwrap(), "vestige",
-            "should inject the server's default_project_id");
+        assert_eq!(
+            args.get("project_id").unwrap(),
+            "vestige",
+            "should inject the server's default_project_id"
+        );
     }
 
     #[test]
@@ -7268,10 +7978,16 @@ pub async fn run() {
         let server = test_server();
         let mut args = Map::new();
         let err = resolve_project_id(&server, &mut args).unwrap_err();
-        assert!(err.to_string().contains("project_id"),
-            "error should name the missing parameter, got: {}", err);
-        assert!(err.to_string().contains("CLAUDE.md") || err.to_string().contains("default"),
-            "error should explain where the default would come from, got: {}", err);
+        assert!(
+            err.to_string().contains("project_id"),
+            "error should name the missing parameter, got: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("CLAUDE.md") || err.to_string().contains("default"),
+            "error should explain where the default would come from, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -7286,8 +8002,11 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("project_id".to_string(), json!(""));
         resolve_project_id(&server, &mut args).unwrap();
-        assert_eq!(args.get("project_id").unwrap(), "vestige",
-            "empty project_id should fall through to the harness default");
+        assert_eq!(
+            args.get("project_id").unwrap(),
+            "vestige",
+            "empty project_id should fall through to the harness default"
+        );
     }
 
     #[test]
@@ -7297,8 +8016,11 @@ pub async fn run() {
         args.insert("project_id".to_string(), json!("proj-x"));
         args.insert("status".to_string(), json!("done"));
         let result = get_tasks(&server, args);
-        assert!(!err_is_status_validation(&result),
-            "single-string status should pass validation, got: {:?}", result);
+        assert!(
+            !err_is_status_validation(&result),
+            "single-string status should pass validation, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -7311,8 +8033,11 @@ pub async fn run() {
         args.insert("project_id".to_string(), json!("proj-x"));
         args.insert("status".to_string(), json!(["done", "cancelled"]));
         let result = get_tasks(&server, args);
-        assert!(!err_is_status_validation(&result),
-            "valid status array should pass validation, got: {:?}", result);
+        assert!(
+            !err_is_status_validation(&result),
+            "valid status array should pass validation, got: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -7322,11 +8047,17 @@ pub async fn run() {
         let server = test_server();
         let mut args = Map::new();
         args.insert("project_id".to_string(), json!("proj-x"));
-        args.insert("status".to_string(), json!(["done", "totally_made_up_xyzzy"]));
+        args.insert(
+            "status".to_string(),
+            json!(["done", "totally_made_up_xyzzy"]),
+        );
         let err = get_tasks(&server, args).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("totally_made_up_xyzzy") || msg.contains("Invalid status"),
-            "expected validation error naming the bad value, got: {}", msg);
+        assert!(
+            msg.contains("totally_made_up_xyzzy") || msg.contains("Invalid status"),
+            "expected validation error naming the bad value, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -7337,9 +8068,12 @@ pub async fn run() {
         args.insert("status".to_string(), json!(["done", 42]));
         let err = get_tasks(&server, args).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("status array must contain only strings")
+        assert!(
+            msg.contains("status array must contain only strings")
                 || msg.contains("must be a string"),
-            "expected element type error, got: {}", msg);
+            "expected element type error, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -7350,8 +8084,11 @@ pub async fn run() {
         args.insert("status".to_string(), json!(42));
         let err = get_tasks(&server, args).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("status must be a string or array"),
-            "expected type error for scalar status, got: {}", msg);
+        assert!(
+            msg.contains("status must be a string or array"),
+            "expected type error for scalar status, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -7373,11 +8110,17 @@ pub async fn run() {
         };
 
         let from_new = unwrap(new_shape);
-        assert!(from_new.is_array(), "new wrapped shape must unwrap to array");
+        assert!(
+            from_new.is_array(),
+            "new wrapped shape must unwrap to array"
+        );
         assert_eq!(from_new.as_array().unwrap().len(), 2);
 
         let from_legacy = unwrap(legacy_shape);
-        assert!(from_legacy.is_array(), "legacy bare array must pass through");
+        assert!(
+            from_legacy.is_array(),
+            "legacy bare array must pass through"
+        );
         assert_eq!(from_legacy.as_array().unwrap().len(), 1);
 
         let from_empty = unwrap(empty_object);
@@ -7385,6 +8128,69 @@ pub async fn run() {
         // downstream filter_recent will then call .as_array() → None →
         // empty vec, which is correct (no items match a missing list).
         assert!(from_empty.is_object());
+    }
+
+    // CULTRA-1074: cutoff resolution for since_session_id.
+    #[test]
+    fn test_resolve_session_cutoff_matching_project_returns_last_active() {
+        let last_active = "2026-05-04T12:00:00Z";
+        let session = json!({
+            "session_id": "s-1",
+            "project_id": "proj-x",
+            "last_active": last_active,
+        });
+        let secs = resolve_session_cutoff(&session, "proj-x", "s-1").unwrap();
+        // Compare against the same parser the production code uses, rather
+        // than hard-coding a magic number.
+        assert_eq!(secs, parse_timestamp_secs(last_active));
+        assert!(secs > 0, "non-zero unix seconds expected, got {}", secs);
+    }
+
+    #[test]
+    fn test_resolve_session_cutoff_cross_project_rejected() {
+        let session = json!({
+            "session_id": "s-foreign",
+            "project_id": "proj-other",
+            "last_active": "2026-05-04T12:00:00Z",
+        });
+        let err = resolve_session_cutoff(&session, "proj-x", "s-foreign").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CROSS_PROJECT_SESSION"),
+            "expected CROSS_PROJECT_SESSION error, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("proj-other") && msg.contains("proj-x"),
+            "error should name both projects, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_resolve_session_cutoff_missing_last_active_returns_zero() {
+        // Defensive: malformed session without last_active falls through to 0
+        // (parse_timestamp_secs returns 0 on parse failure). Caller will see a
+        // huge lookback window, which is annoying but better than panicking.
+        let session = json!({
+            "session_id": "s-broken",
+            "project_id": "proj-x",
+        });
+        let secs = resolve_session_cutoff(&session, "proj-x", "s-broken").unwrap();
+        assert_eq!(secs, 0);
+    }
+
+    #[test]
+    fn test_resolve_session_cutoff_missing_project_id_treated_as_cross_project() {
+        // If the session response doesn't have project_id at all, treat it as
+        // a project mismatch — defensive default (don't leak data on partial
+        // server response).
+        let session = json!({
+            "session_id": "s-empty",
+            "last_active": "2026-05-04T12:00:00Z",
+        });
+        let err = resolve_session_cutoff(&session, "proj-x", "s-empty").unwrap_err();
+        assert!(err.to_string().contains("CROSS_PROJECT_SESSION"));
     }
 
     #[test]
@@ -7400,8 +8206,10 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         let result = find_dead_code_tool(args, &server).unwrap();
-        assert!(result.get("warmup_report").is_none(),
-            "warmup_report should be absent when warmup is not requested");
+        assert!(
+            result.get("warmup_report").is_none(),
+            "warmup_report should be absent when warmup is not requested"
+        );
     }
 
     #[test]
@@ -7423,7 +8231,8 @@ pub async fn run() {
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("warmup".to_string(), json!(true));
         let result = find_dead_code_tool(args, &server).unwrap();
-        let report = result.get("warmup_report")
+        let report = result
+            .get("warmup_report")
             .and_then(|v| v.as_object())
             .expect("warmup_report should be present when warmup=true");
 
@@ -7431,12 +8240,15 @@ pub async fn run() {
         let status = report["status"].as_str().unwrap();
         assert!(
             matches!(status, "warm" | "failed" | "cached"),
-            "status should be warm/failed/cached for go (got {})", status
+            "status should be warm/failed/cached for go (got {})",
+            status
         );
         assert!(report.contains_key("elapsed_ms"));
         assert!(report.contains_key("cached"));
-        assert!(report.contains_key("manifest_dir"),
-            "CULTRA-952: report must surface the resolved manifest_dir");
+        assert!(
+            report.contains_key("manifest_dir"),
+            "CULTRA-952: report must surface the resolved manifest_dir"
+        );
     }
 
     // CULTRA-952 (post-verification): the cargo-warm-but-LSP-cold race.
@@ -7458,13 +8270,23 @@ pub async fn run() {
             manifest_dir: Some("/x".to_string()),
         };
         let warning = build_cold_warning_for_find_dead_code(5, Some(&report));
-        assert!(warning.contains("despite warmup completing successfully"),
-            "should mention the race: {}", warning);
-        assert!(warning.contains("cargo-warm-but-LSP-cold")
-                || warning.contains("Retry") || warning.contains("retry"),
-            "should suggest retry: {}", warning);
-        assert!(warning.contains("20-60s") || warning.contains("30s"),
-            "should give the latency window: {}", warning);
+        assert!(
+            warning.contains("despite warmup completing successfully"),
+            "should mention the race: {}",
+            warning
+        );
+        assert!(
+            warning.contains("cargo-warm-but-LSP-cold")
+                || warning.contains("Retry")
+                || warning.contains("retry"),
+            "should suggest retry: {}",
+            warning
+        );
+        assert!(
+            warning.contains("20-60s") || warning.contains("30s"),
+            "should give the latency window: {}",
+            warning
+        );
     }
 
     #[test]
@@ -7483,8 +8305,11 @@ pub async fn run() {
             manifest_dir: Some("/x".to_string()),
         };
         let warning = build_cold_warning_for_find_dead_code(5, Some(&report));
-        assert!(warning.contains("despite warmup"),
-            "cached-warm should also trigger the race callout: {}", warning);
+        assert!(
+            warning.contains("despite warmup"),
+            "cached-warm should also trigger the race callout: {}",
+            warning
+        );
     }
 
     #[test]
@@ -7504,8 +8329,11 @@ pub async fn run() {
             manifest_dir: Some("/x".to_string()),
         };
         let warning = build_cold_warning_for_find_dead_code(5, Some(&report));
-        assert!(!warning.contains("despite warmup completing successfully"),
-            "failed warmup must NOT trigger the race callout: {}", warning);
+        assert!(
+            !warning.contains("despite warmup completing successfully"),
+            "failed warmup must NOT trigger the race callout: {}",
+            warning
+        );
     }
 
     #[test]
@@ -7513,10 +8341,16 @@ pub async fn run() {
         // No warmup at all → standard cold-index warning that suggests
         // passing warmup=true.
         let warning = build_cold_warning_for_find_dead_code(5, None);
-        assert!(!warning.contains("despite warmup"),
-            "no-warmup case must not mention the race: {}", warning);
-        assert!(warning.contains("warmup=true") || warning.contains("require_warm_index"),
-            "no-warmup case should suggest the warmup or strict-mode opt-in: {}", warning);
+        assert!(
+            !warning.contains("despite warmup"),
+            "no-warmup case must not mention the race: {}",
+            warning
+        );
+        assert!(
+            warning.contains("warmup=true") || warning.contains("require_warm_index"),
+            "no-warmup case should suggest the warmup or strict-mode opt-in: {}",
+            warning
+        );
     }
 
     #[test]
@@ -7532,11 +8366,18 @@ pub async fn run() {
             cached_status: None,
             manifest_dir: Some("/x".to_string()),
         };
-        let warning = build_cold_warning_for_find_references("compose_from_diff_screens", 1, Some(&report));
-        assert!(warning.contains("compose_from_diff_screens"),
-            "should name the symbol: {}", warning);
-        assert!(warning.contains("despite warmup completing successfully"),
-            "should call out the race: {}", warning);
+        let warning =
+            build_cold_warning_for_find_references("compose_from_diff_screens", 1, Some(&report));
+        assert!(
+            warning.contains("compose_from_diff_screens"),
+            "should name the symbol: {}",
+            warning
+        );
+        assert!(
+            warning.contains("despite warmup completing successfully"),
+            "should call out the race: {}",
+            warning
+        );
     }
 
     #[test]
@@ -7555,13 +8396,17 @@ pub async fn run() {
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("warmup".to_string(), json!(true));
         let result = find_dead_code_tool(args, &server).unwrap();
-        let report = result.get("warmup_report")
+        let report = result
+            .get("warmup_report")
             .and_then(|v| v.as_object())
             .expect("warmup_report should be present");
         assert_eq!(report["status"], "skipped");
         let msg = report["message"].as_str().unwrap();
-        assert!(msg.contains("go.mod"),
-            "skipped message should name the missing manifest, got: {}", msg);
+        assert!(
+            msg.contains("go.mod"),
+            "skipped message should name the missing manifest, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -7580,12 +8425,15 @@ pub async fn run() {
         args.insert("warmup".to_string(), json!(true));
         let result = find_dead_code_tool(args, &server)
             .expect("warmup on python should not error — should skip gracefully");
-        let report = result.get("warmup_report")
+        let report = result
+            .get("warmup_report")
             .and_then(|v| v.as_object())
             .expect("warmup_report should be present");
         assert_eq!(report["status"], "skipped");
-        assert!(report["message"].is_string(),
-            "skipped report should explain why");
+        assert!(
+            report["message"].is_string(),
+            "skipped report should explain why"
+        );
     }
 
     #[test]
@@ -7605,14 +8453,17 @@ pub async fn run() {
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("warmup".to_string(), json!(true));
         let result = find_references_tool(args, &server).unwrap();
-        let report = result.get("warmup_report")
+        let report = result
+            .get("warmup_report")
             .and_then(|v| v.as_object())
             .expect("warmup_report should be present when warmup=true");
         assert_eq!(report["language"], "go");
         assert!(report.contains_key("status"));
         assert!(report.contains_key("elapsed_ms"));
-        assert!(report.contains_key("manifest_dir"),
-            "CULTRA-952: report must surface the resolved manifest_dir");
+        assert!(
+            report.contains_key("manifest_dir"),
+            "CULTRA-952: report must surface the resolved manifest_dir"
+        );
     }
 
     #[test]
@@ -7643,57 +8494,77 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("symbol".to_string(), json!("Foo"));
         let err = analyze_symbol_tool(args, dir.path()).unwrap_err();
-        assert!(err.to_string().contains("file_path"),
-            "expected file_path error, got: {}", err);
+        assert!(
+            err.to_string().contains("file_path"),
+            "expected file_path error, got: {}",
+            err
+        );
     }
 
     #[test]
     fn test_analyze_symbol_requires_symbol() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_go_file(&dir, "a.go",
-            "package main\nfunc Foo() {}\n");
+        let path = write_go_file(&dir, "a.go", "package main\nfunc Foo() {}\n");
         let mut args = Map::new();
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         let err = analyze_symbol_tool(args, dir.path()).unwrap_err();
-        assert!(err.to_string().contains("symbol"),
-            "expected symbol error, got: {}", err);
+        assert!(
+            err.to_string().contains("symbol"),
+            "expected symbol error, got: {}",
+            err
+        );
     }
 
     #[test]
     fn test_analyze_symbol_rejects_unsupported_analyzer() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_go_file(&dir, "a.go",
-            "package main\nfunc Foo() {}\n");
+        let path = write_go_file(&dir, "a.go", "package main\nfunc Foo() {}\n");
         let mut args = Map::new();
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("symbol".to_string(), json!("Foo"));
         args.insert("analyzer".to_string(), json!("security"));
         let err = analyze_symbol_tool(args, dir.path()).unwrap_err();
-        assert!(err.to_string().contains("complexity"),
-            "expected analyzer rejection, got: {}", err);
+        assert!(
+            err.to_string().contains("complexity"),
+            "expected analyzer rejection, got: {}",
+            err
+        );
     }
 
     #[test]
     fn test_analyze_symbol_not_found_lists_available() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_go_file(&dir, "avail.go",
-            "package main\nfunc Alpha() {}\nfunc Beta() {}\n");
+        let path = write_go_file(
+            &dir,
+            "avail.go",
+            "package main\nfunc Alpha() {}\nfunc Beta() {}\n",
+        );
         let mut args = Map::new();
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("symbol".to_string(), json!("Gamma"));
         let err = analyze_symbol_tool(args, dir.path()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Gamma"), "should name the missing symbol: {}", msg);
-        assert!(msg.contains("Alpha") || msg.contains("Beta"),
-            "should list available functions: {}", msg);
+        assert!(
+            msg.contains("Gamma"),
+            "should name the missing symbol: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Alpha") || msg.contains("Beta"),
+            "should list available functions: {}",
+            msg
+        );
     }
 
     #[test]
     fn test_analyze_symbol_returns_scalar_metrics_without_baseline() {
         // Simple function → cyclomatic/cognitive are scalars, delta_mode=false.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_go_file(&dir, "scalar.go",
-            "package main\nfunc Simple() int { return 1 }\n");
+        let path = write_go_file(
+            &dir,
+            "scalar.go",
+            "package main\nfunc Simple() int { return 1 }\n",
+        );
         let mut args = Map::new();
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("symbol".to_string(), json!("Simple"));
@@ -7701,8 +8572,11 @@ pub async fn run() {
 
         assert_eq!(result["name"], "Simple");
         assert_eq!(result["delta_mode"], false);
-        assert!(result["cyclomatic"].is_number(),
-            "cyclomatic should be scalar in non-delta mode, got: {:?}", result["cyclomatic"]);
+        assert!(
+            result["cyclomatic"].is_number(),
+            "cyclomatic should be scalar in non-delta mode, got: {:?}",
+            result["cyclomatic"]
+        );
         assert!(result["cognitive"].is_number());
         assert!(result["lines"].is_number());
         assert!(result["rating"].is_string());
@@ -7715,22 +8589,30 @@ pub async fn run() {
         // Inline baseline → each baseline-covered metric renders as
         // {prev, now, delta}.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_go_file(&dir, "delta.go",
-            "package main\nfunc Target() int { return 1 }\n");
+        let path = write_go_file(
+            &dir,
+            "delta.go",
+            "package main\nfunc Target() int { return 1 }\n",
+        );
         let mut args = Map::new();
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("symbol".to_string(), json!("Target"));
-        args.insert("delta_against".to_string(), json!({
-            "cyclomatic": 17,
-            "cognitive": 26,
-            "lines": 128,
-            "rating": "complex"
-        }));
+        args.insert(
+            "delta_against".to_string(),
+            json!({
+                "cyclomatic": 17,
+                "cognitive": 26,
+                "lines": 128,
+                "rating": "complex"
+            }),
+        );
         let result = analyze_symbol_tool(args, dir.path()).unwrap();
 
         assert_eq!(result["delta_mode"], true);
 
-        let cyc = result["cyclomatic"].as_object().expect("cyclomatic should be object in delta mode");
+        let cyc = result["cyclomatic"]
+            .as_object()
+            .expect("cyclomatic should be object in delta mode");
         assert_eq!(cyc["prev"], 17);
         assert!(cyc.contains_key("now"));
         assert!(cyc.contains_key("delta"));
@@ -7738,7 +8620,9 @@ pub async fn run() {
         let now = cyc["now"].as_i64().unwrap();
         assert_eq!(delta, now - 17);
 
-        let rating = result["rating"].as_object().expect("rating should be object when baseline had rating");
+        let rating = result["rating"]
+            .as_object()
+            .expect("rating should be object when baseline had rating");
         assert_eq!(rating["prev"], "complex");
         assert!(rating.contains_key("now"));
     }
@@ -7748,8 +8632,11 @@ pub async fn run() {
         // Baseline with only cyclomatic → cyclomatic renders as delta,
         // other metrics stay scalar.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_go_file(&dir, "partial.go",
-            "package main\nfunc Partial() int { return 1 }\n");
+        let path = write_go_file(
+            &dir,
+            "partial.go",
+            "package main\nfunc Partial() int { return 1 }\n",
+        );
         let mut args = Map::new();
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("symbol".to_string(), json!("Partial"));
@@ -7757,10 +8644,14 @@ pub async fn run() {
         let result = analyze_symbol_tool(args, dir.path()).unwrap();
 
         assert_eq!(result["delta_mode"], true);
-        assert!(result["cyclomatic"].is_object(),
-            "cyclomatic should be delta-shaped when in baseline");
-        assert!(result["cognitive"].is_number(),
-            "cognitive should stay scalar when not in baseline");
+        assert!(
+            result["cyclomatic"].is_object(),
+            "cyclomatic should be delta-shaped when in baseline"
+        );
+        assert!(
+            result["cognitive"].is_number(),
+            "cognitive should stay scalar when not in baseline"
+        );
         assert!(result["lines"].is_number());
         assert!(result["rating"].is_string());
     }
@@ -7771,7 +8662,9 @@ pub async fn run() {
         // Pinning a specific number would couple us to the analyzer's
         // counting, which is a test-the-implementation anti-pattern.
         let dir = tempfile::tempdir().unwrap();
-        let path = write_go_file(&dir, "branchy.go",
+        let path = write_go_file(
+            &dir,
+            "branchy.go",
             "package main\n\
              func Branchy(x int) int {\n\
              \tif x > 0 {\n\
@@ -7780,13 +8673,18 @@ pub async fn run() {
              \t}\n\
              \tfor i := 0; i < 3; i++ { x++ }\n\
              \treturn x\n\
-             }\n");
+             }\n",
+        );
         let mut args = Map::new();
         args.insert("file_path".to_string(), json!(path.to_str().unwrap()));
         args.insert("symbol".to_string(), json!("Branchy"));
         let result = analyze_symbol_tool(args, dir.path()).unwrap();
         let cyc = result["cyclomatic"].as_u64().unwrap();
-        assert!(cyc > 1, "branchy function should have cyclomatic > 1, got {}", cyc);
+        assert!(
+            cyc > 1,
+            "branchy function should have cyclomatic > 1, got {}",
+            cyc
+        );
     }
 
     #[test]
@@ -7824,7 +8722,11 @@ pub async fn run() {
     fn test_build_plan_render_query_empty_when_no_knobs() {
         let args = Map::new();
         let q = build_plan_render_query(&args, "status").unwrap();
-        assert!(q.is_empty(), "no knobs + no detail=ascii should yield empty query, got {:?}", q);
+        assert!(
+            q.is_empty(),
+            "no knobs + no detail=ascii should yield empty query, got {:?}",
+            q
+        );
     }
 
     #[test]
@@ -7836,7 +8738,9 @@ pub async fn run() {
         let q = build_plan_render_query(&args, "ascii").unwrap();
 
         let lookup = |key: &str| -> String {
-            q.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+            q.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
                 .unwrap_or_else(|| panic!("expected {} in {:?}", key, q))
         };
         assert_eq!(lookup("width"), "120");
@@ -7851,8 +8755,11 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("with_titles".to_string(), json!(true));
         let err = build_plan_render_query(&args, "status").unwrap_err();
-        assert!(err.to_string().contains("only apply when detail='ascii'"),
-            "expected detail-mismatch error, got: {}", err);
+        assert!(
+            err.to_string().contains("only apply when detail='ascii'"),
+            "expected detail-mismatch error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -7860,8 +8767,11 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("width".to_string(), json!(0));
         let err = build_plan_render_query(&args, "ascii").unwrap_err();
-        assert!(err.to_string().contains("width"),
-            "expected width error, got: {}", err);
+        assert!(
+            err.to_string().contains("width"),
+            "expected width error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -7869,8 +8779,11 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("style".to_string(), json!("bold"));
         let err = build_plan_render_query(&args, "ascii").unwrap_err();
-        assert!(err.to_string().contains("style"),
-            "expected style error, got: {}", err);
+        assert!(
+            err.to_string().contains("style"),
+            "expected style error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -7878,8 +8791,11 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("with_titles".to_string(), json!(false));
         let q = build_plan_render_query(&args, "ascii").unwrap();
-        assert!(q.iter().all(|(k, _)| k != "with_titles"),
-            "with_titles=false should be omitted, got {:?}", q);
+        assert!(
+            q.iter().all(|(k, _)| k != "with_titles"),
+            "with_titles=false should be omitted, got {:?}",
+            q
+        );
     }
 
     // CULTRA-1069: compact_parallel passthrough on get_plan(detail='ascii').
@@ -7889,7 +8805,9 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("compact_parallel".to_string(), json!(true));
         let q = build_plan_render_query(&args, "ascii").unwrap();
-        let cp = q.iter().find(|(k, _)| k == "compact_parallel")
+        let cp = q
+            .iter()
+            .find(|(k, _)| k == "compact_parallel")
             .expect("compact_parallel=true should pass through");
         assert_eq!(cp.1, "true");
     }
@@ -7899,8 +8817,11 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("compact_parallel".to_string(), json!(false));
         let q = build_plan_render_query(&args, "ascii").unwrap();
-        assert!(q.iter().all(|(k, _)| k != "compact_parallel"),
-            "compact_parallel=false should be omitted (default), got {:?}", q);
+        assert!(
+            q.iter().all(|(k, _)| k != "compact_parallel"),
+            "compact_parallel=false should be omitted (default), got {:?}",
+            q
+        );
     }
 
     #[test]
@@ -7910,8 +8831,12 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("compact_parallel".to_string(), json!(true));
         let err = build_plan_render_query(&args, "status").unwrap_err();
-        assert!(err.to_string().contains("compact_parallel") || err.to_string().contains("only apply when detail='ascii'"),
-            "expected detail-mismatch error mentioning compact_parallel, got: {}", err);
+        assert!(
+            err.to_string().contains("compact_parallel")
+                || err.to_string().contains("only apply when detail='ascii'"),
+            "expected detail-mismatch error mentioning compact_parallel, got: {}",
+            err
+        );
     }
 
     // CULTRA-1057: get_project_estimate_accuracy shim. We can't test the HTTP
@@ -7924,8 +8849,11 @@ pub async fn run() {
         let server = test_server();
         let err = get_project_estimate_accuracy(&server, Map::new()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("project_id"),
-            "expected error naming project_id, got: {}", msg);
+        assert!(
+            msg.contains("project_id"),
+            "expected error naming project_id, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -7938,8 +8866,11 @@ pub async fn run() {
         args.insert("project_id".to_string(), json!("not a valid id"));
         let err = get_project_estimate_accuracy(&server, args).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("project_id"),
-            "expected error naming project_id, got: {}", msg);
+        assert!(
+            msg.contains("project_id"),
+            "expected error naming project_id, got: {}",
+            msg
+        );
     }
 
     // CULTRA-1063: get_plan(group_by) shim validation. Mirrors the
@@ -7950,7 +8881,9 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("group_by".to_string(), json!("tag"));
         let q = build_plan_render_query(&args, "status").unwrap();
-        let group_by = q.iter().find(|(k, _)| k == "group_by")
+        let group_by = q
+            .iter()
+            .find(|(k, _)| k == "group_by")
             .expect("group_by should pass through");
         assert_eq!(group_by.1, "tag");
     }
@@ -7960,8 +8893,11 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("group_by".to_string(), json!("status"));
         let err = build_plan_render_query(&args, "status").unwrap_err();
-        assert!(err.to_string().contains("group_by"),
-            "expected error naming group_by, got: {}", err);
+        assert!(
+            err.to_string().contains("group_by"),
+            "expected error naming group_by, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -7972,8 +8908,12 @@ pub async fn run() {
         let mut args = Map::new();
         args.insert("group_by".to_string(), json!("tag"));
         let err = build_plan_render_query(&args, "ascii").unwrap_err();
-        assert!(err.to_string().contains("only applies when detail='status'"),
-            "expected detail-mismatch error, got: {}", err);
+        assert!(
+            err.to_string()
+                .contains("only applies when detail='status'"),
+            "expected detail-mismatch error, got: {}",
+            err
+        );
     }
 
     // ========================================================================
@@ -8029,7 +8969,10 @@ pub async fn run() {
 
         let mut args = Map::new();
         args.insert("pattern".to_string(), json!("fox"));
-        args.insert("path".to_string(), json!(subdir.to_string_lossy().to_string()));
+        args.insert(
+            "path".to_string(),
+            json!(subdir.to_string_lossy().to_string()),
+        );
 
         let result = contextual_search_tool(args, &workspace)
             .expect("absolute path inside workspace should work");
@@ -8052,7 +8995,8 @@ pub async fn run() {
         let msg = err.to_string();
         assert!(
             msg.contains("must be within workspace"),
-            "expected workspace-membership error, got: {}", msg
+            "expected workspace-membership error, got: {}",
+            msg
         );
     }
 
@@ -8066,14 +9010,18 @@ pub async fn run() {
 
         let mut args = Map::new();
         args.insert("pattern".to_string(), json!("anything"));
-        args.insert("path".to_string(), json!(outside.to_string_lossy().to_string()));
+        args.insert(
+            "path".to_string(),
+            json!(outside.to_string_lossy().to_string()),
+        );
 
         let err = contextual_search_tool(args, &workspace)
             .expect_err("absolute path outside workspace must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("must be within workspace"),
-            "expected workspace-membership error, got: {}", msg
+            "expected workspace-membership error, got: {}",
+            msg
         );
     }
 
@@ -8091,7 +9039,8 @@ pub async fn run() {
         let msg = err.to_string();
         assert!(
             msg.contains("does not exist") || msg.contains("cannot be accessed"),
-            "expected nonexistent-path error, got: {}", msg
+            "expected nonexistent-path error, got: {}",
+            msg
         );
     }
 
@@ -8105,7 +9054,10 @@ pub async fn run() {
         let workspace = tmp.path().to_path_buf();
         let subdir = workspace.join("sub");
         std::fs::create_dir(&subdir).unwrap();
-        write_file(&subdir.join("Cargo.toml"), "[package]\nname=\"sub\"\nversion=\"0.1.0\"\n");
+        write_file(
+            &subdir.join("Cargo.toml"),
+            "[package]\nname=\"sub\"\nversion=\"0.1.0\"\n",
+        );
 
         let mut args = Map::new();
         args.insert("path".to_string(), json!("sub"));
@@ -8129,7 +9081,8 @@ pub async fn run() {
         let msg = err.to_string();
         assert!(
             msg.contains("must be within workspace"),
-            "expected workspace-membership error, got: {}", msg
+            "expected workspace-membership error, got: {}",
+            msg
         );
     }
 
@@ -8142,14 +9095,18 @@ pub async fn run() {
         std::fs::create_dir(&outside).unwrap();
 
         let mut args = Map::new();
-        args.insert("path".to_string(), json!(outside.to_string_lossy().to_string()));
+        args.insert(
+            "path".to_string(),
+            json!(outside.to_string_lossy().to_string()),
+        );
 
         let err = project_info_tool_inner(args, &workspace)
             .expect_err("absolute path outside workspace must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("must be within workspace"),
-            "expected workspace-membership error, got: {}", msg
+            "expected workspace-membership error, got: {}",
+            msg
         );
     }
 
@@ -8166,7 +9123,8 @@ pub async fn run() {
         let msg = err.to_string();
         assert!(
             msg.contains("does not exist") || msg.contains("cannot be accessed"),
-            "expected nonexistent-path error, got: {}", msg
+            "expected nonexistent-path error, got: {}",
+            msg
         );
     }
 }

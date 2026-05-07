@@ -96,7 +96,8 @@ pub fn analyze_concurrency(file_path: &str) -> Result<ConcurrencyAnalysis> {
 
     // Parse with tree-sitter
     let mut parser = tree_sitter::Parser::new();
-    let lang = tree_sitter_go::LANGUAGE.into(); parser.set_language(&lang)?;
+    let lang = tree_sitter_go::LANGUAGE.into();
+    parser.set_language(&lang)?;
 
     let tree = parser
         .parse(&content, None)
@@ -180,10 +181,7 @@ fn extract_goroutine_spawns(
 }
 
 /// Extract channel declarations and make() calls
-fn extract_channels(
-    root_node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<ChannelInfo>> {
+fn extract_channels(root_node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<ChannelInfo>> {
     let mut channels = Vec::new();
 
     // Query for channel variable declarations
@@ -219,16 +217,18 @@ fn extract_channels(
             }
         }
 
-        if !chan_name.is_empty() && chan_node.is_some() {
-            channels.push(ChannelInfo {
-                name: chan_name,
-                channel_type: chan_type.clone(),
-                location: format_location(&chan_node.unwrap()),
-                buffered: false,
-                buffer_size: None,
-                direction: Some(detect_channel_direction(&chan_type)),
-            });
+        if chan_name.is_empty() {
+            continue;
         }
+        let Some(node) = chan_node else { continue };
+        channels.push(ChannelInfo {
+            name: chan_name,
+            channel_type: chan_type.clone(),
+            location: format_location(&node),
+            buffered: false,
+            buffer_size: None,
+            direction: Some(detect_channel_direction(&chan_type)),
+        });
     }
 
     // Query for make(chan ...) calls
@@ -263,28 +263,27 @@ fn extract_channels(
             }
         }
 
-        if func_name == "make" && make_node.is_some() {
-            let (buffered, buffer_size) = detect_buffered_channel(&make_node.unwrap(), content);
-
-            channels.push(ChannelInfo {
-                name: "anonymous".to_string(),
-                channel_type: chan_type.clone(),
-                location: format_location(&make_node.unwrap()),
-                buffered,
-                buffer_size,
-                direction: Some(detect_channel_direction(&chan_type)),
-            });
+        if func_name != "make" {
+            continue;
         }
+        let Some(node) = make_node else { continue };
+        let (buffered, buffer_size) = detect_buffered_channel(&node, content);
+
+        channels.push(ChannelInfo {
+            name: "anonymous".to_string(),
+            channel_type: chan_type.clone(),
+            location: format_location(&node),
+            buffered,
+            buffer_size,
+            direction: Some(detect_channel_direction(&chan_type)),
+        });
     }
 
     Ok(channels)
 }
 
 /// Extract mutex/RWMutex declarations
-fn extract_mutexes(
-    root_node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<MutexInfo>> {
+fn extract_mutexes(root_node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<MutexInfo>> {
     let mut mutexes = Vec::new();
 
     let query_source = r#"
@@ -439,12 +438,15 @@ fn detect_race_conditions(
             }
         }
 
-        if !map_name.is_empty() && access_node.is_some() {
-            if is_map_type(root_node, content, &map_name)? {
-                let location = format_location(&access_node.unwrap());
-                map_accesses.entry(map_name).or_insert_with(Vec::new).push(location);
-            }
+        if map_name.is_empty() {
+            continue;
         }
+        let Some(node) = access_node else { continue };
+        if !is_map_type(root_node, content, &map_name)? {
+            continue;
+        }
+        let location = format_location(&node);
+        map_accesses.entry(map_name).or_default().push(location);
     }
 
     // Check for unprotected map access
@@ -479,7 +481,9 @@ fn detect_deadlock_risks(select_statements: &[SelectStatement]) -> Vec<DeadlockR
             risks.push(DeadlockRisk {
                 risk_type: "channel_deadlock".to_string(),
                 locations: vec![sel.location.clone()],
-                description: "Select statement without default case can deadlock if all channels block".to_string(),
+                description:
+                    "Select statement without default case can deadlock if all channels block"
+                        .to_string(),
                 severity: "info".to_string(),
             });
         }
@@ -750,22 +754,13 @@ func createBuffered() chan int {
         let analysis = result.unwrap();
 
         // Verify goroutines detected
-        assert!(
-            !analysis.goroutines.is_empty(),
-            "Should detect goroutines"
-        );
+        assert!(!analysis.goroutines.is_empty(), "Should detect goroutines");
 
         // Verify channels detected
-        assert!(
-            !analysis.channels.is_empty(),
-            "Should detect channels"
-        );
+        assert!(!analysis.channels.is_empty(), "Should detect channels");
 
         // Verify mutexes detected
-        assert!(
-            !analysis.mutexes.is_empty(),
-            "Should detect mutexes"
-        );
+        assert!(!analysis.mutexes.is_empty(), "Should detect mutexes");
 
         // Verify select statements detected
         assert!(
@@ -802,9 +797,7 @@ func createBuffered() chan int {
     fn test_goroutine_pattern_classification() {
         let mut parser = tree_sitter::Parser::new();
         let lang = tree_sitter_go::LANGUAGE.into();
-        parser
-            .set_language(&lang)
-            .expect("Failed to set language");
+        parser.set_language(&lang).expect("Failed to set language");
 
         // Test select_loop pattern
         let code = "select { case <-ch: }";

@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::mcp::types::{Language, Scope, SymbolType};
+use serde::{Deserialize, Serialize};
 
 /// Symbol represents a code symbol (function, type, class, etc.)
 #[derive(Debug, Clone, Serialize, Deserialize)]

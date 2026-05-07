@@ -78,9 +78,7 @@ pub fn analyze_concurrency_rust(file_path: &str) -> Result<RustConcurrencyAnalys
         .ok_or_else(|| anyhow::anyhow!("Failed to parse Rust file"))?;
 
     let root = tree.root_node();
-    let loc = |n: Node| -> String {
-        format!("{}:{}", file_path, n.start_position().row + 1)
-    };
+    let loc = |n: Node| -> String { format!("{}:{}", file_path, n.start_position().row + 1) };
 
     let mut spawns = Vec::new();
     let mut synchronization = Vec::new();
@@ -92,7 +90,7 @@ pub fn analyze_concurrency_rust(file_path: &str) -> Result<RustConcurrencyAnalys
     // Walk every node once. Tree-sitter Query is more elegant but the patterns
     // we need are simple enough that a single walk keeps the diff small and
     // avoids constructing per-feature queries.
-    walk(root, bytes, &mut |node| {
+    walk(root, &mut |node| {
         match node.kind() {
             "call_expression" => {
                 let func_text = node
@@ -101,11 +99,17 @@ pub fn analyze_concurrency_rust(file_path: &str) -> Result<RustConcurrencyAnalys
                 if let Some(text) = func_text {
                     // Spawns: full match on the path text.
                     if let Some(kind) = classify_spawn(&text) {
-                        spawns.push(RustSpawn { kind, location: loc(node) });
+                        spawns.push(RustSpawn {
+                            kind,
+                            location: loc(node),
+                        });
                     }
                     // Channels: same.
                     if let Some(kind) = classify_channel(&text) {
-                        channels.push(RustChannel { kind, location: loc(node) });
+                        channels.push(RustChannel {
+                            kind,
+                            location: loc(node),
+                        });
                     }
                 }
             }
@@ -114,7 +118,10 @@ pub fn analyze_concurrency_rust(file_path: &str) -> Result<RustConcurrencyAnalys
                 if let Some(name_node) = node.child_by_field_name("type") {
                     let name = node_text(name_node, bytes);
                     if let Some(kind) = classify_sync_type(&name) {
-                        synchronization.push(RustSyncPrimitive { kind, location: loc(node) });
+                        synchronization.push(RustSyncPrimitive {
+                            kind,
+                            location: loc(node),
+                        });
                     }
                 }
             }
@@ -122,7 +129,10 @@ pub fn analyze_concurrency_rust(file_path: &str) -> Result<RustConcurrencyAnalys
                 // Catches `parking_lot::Mutex` and bare `AtomicU64`.
                 let text = node_text(node, bytes);
                 if let Some(kind) = classify_sync_type(&text) {
-                    synchronization.push(RustSyncPrimitive { kind, location: loc(node) });
+                    synchronization.push(RustSyncPrimitive {
+                        kind,
+                        location: loc(node),
+                    });
                 }
             }
             "macro_invocation" => {
@@ -136,21 +146,22 @@ pub fn analyze_concurrency_rust(file_path: &str) -> Result<RustConcurrencyAnalys
                         } else {
                             "select".to_string()
                         };
-                        selects.push(RustSelect { kind, location: loc(node) });
+                        selects.push(RustSelect {
+                            kind,
+                            location: loc(node),
+                        });
                     }
                 }
             }
-            "function_item" => {
-                if is_async_function(node, bytes) {
-                    let name = node
-                        .child_by_field_name("name")
-                        .map(|n| node_text(n, bytes))
-                        .unwrap_or_else(|| "<anonymous>".to_string());
-                    async_functions.push(RustAsyncFn {
-                        name,
-                        location: loc(node),
-                    });
-                }
+            "function_item" if is_async_function(node, bytes) => {
+                let name = node
+                    .child_by_field_name("name")
+                    .map(|n| node_text(n, bytes))
+                    .unwrap_or_else(|| "<anonymous>".to_string());
+                async_functions.push(RustAsyncFn {
+                    name,
+                    location: loc(node),
+                });
             }
             "await_expression" => {
                 await_points += 1;
@@ -166,13 +177,10 @@ pub fn analyze_concurrency_rust(file_path: &str) -> Result<RustConcurrencyAnalys
     // underlying node maps to the same source position. Comparing on the
     // bare name (last `::` segment) normalizes across both forms; we keep
     // the more qualified entry (prefer the one whose kind contains "::").
-    let bare = |kind: &str| -> String {
-        kind.rsplit("::").next().unwrap_or(kind).to_string()
-    };
+    let bare = |kind: &str| -> String { kind.rsplit("::").next().unwrap_or(kind).to_string() };
     synchronization.sort_by(|a, b| {
         let (ba, bb) = (bare(&a.kind), bare(&b.kind));
-        (&a.location, &ba, a.kind.contains("::"))
-            .cmp(&(&b.location, &bb, b.kind.contains("::")))
+        (&a.location, &ba, a.kind.contains("::")).cmp(&(&b.location, &bb, b.kind.contains("::")))
     });
     // After sort, the qualified form sorts AFTER the bare form at the same
     // (location, bare_name). Dedup keeps the FIRST element; reverse so the
@@ -192,11 +200,11 @@ pub fn analyze_concurrency_rust(file_path: &str) -> Result<RustConcurrencyAnalys
     })
 }
 
-fn walk(node: Node, bytes: &[u8], visit: &mut dyn FnMut(Node)) {
+fn walk(node: Node, visit: &mut dyn FnMut(Node)) {
     visit(node);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        walk(child, bytes, visit);
+        walk(child, visit);
     }
 }
 
@@ -298,13 +306,7 @@ fn classify_sync_type(text: &str) -> Option<String> {
     let bare = text.rsplit("::").next().unwrap_or(text);
     let recognized = matches!(
         bare,
-        "Mutex"
-            | "RwLock"
-            | "Semaphore"
-            | "Barrier"
-            | "Notify"
-            | "OnceCell"
-            | "OnceLock"
+        "Mutex" | "RwLock" | "Semaphore" | "Barrier" | "Notify" | "OnceCell" | "OnceLock"
     ) || bare.starts_with("Atomic");
     if recognized {
         Some(text.to_string())
@@ -355,7 +357,10 @@ async fn main() {
             "fn main() {\n    std::thread::spawn(|| {\n        println!(\"hi\");\n    });\n}\n",
         );
         let analysis = analyze_concurrency_rust(p.to_str().unwrap()).unwrap();
-        assert!(analysis.spawns.iter().any(|s| s.kind == "std::thread::spawn"));
+        assert!(analysis
+            .spawns
+            .iter()
+            .any(|s| s.kind == "std::thread::spawn"));
     }
 
     #[test]
@@ -380,7 +385,10 @@ async fn main() {
         );
         let analysis = analyze_concurrency_rust(p.to_str().unwrap()).unwrap();
         assert!(
-            analysis.channels.iter().any(|c| c.kind == "std::sync::mpsc::channel"),
+            analysis
+                .channels
+                .iter()
+                .any(|c| c.kind == "std::sync::mpsc::channel"),
             "expected std::sync::mpsc::channel, got {:?}",
             analysis.channels
         );
@@ -399,7 +407,10 @@ async fn main() {
         );
         let analysis = analyze_concurrency_rust(p.to_str().unwrap()).unwrap();
         assert!(
-            analysis.channels.iter().any(|c| c.kind == "std::sync::mpsc::channel"),
+            analysis
+                .channels
+                .iter()
+                .any(|c| c.kind == "std::sync::mpsc::channel"),
             "turbofish constructor must be detected, got: {:?}",
             analysis.channels
         );
@@ -422,7 +433,11 @@ async fn main() {
             "async fn fetch() -> i32 {\n    let x = other().await;\n    x\n}\nasync fn other() -> i32 { 1 }\n",
         );
         let analysis = analyze_concurrency_rust(p.to_str().unwrap()).unwrap();
-        let names: Vec<_> = analysis.async_functions.iter().map(|f| f.name.clone()).collect();
+        let names: Vec<_> = analysis
+            .async_functions
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
         assert!(names.contains(&"fetch".to_string()), "got {:?}", names);
         assert!(names.contains(&"other".to_string()), "got {:?}", names);
         assert!(analysis.await_points >= 1, "expected at least one await");
@@ -511,10 +526,12 @@ async fn run() {
         }
         let analysis = analyze_concurrency_rust(path.to_str().unwrap()).unwrap();
         assert!(
-            analysis.synchronization.iter().any(|s| s.kind.contains("Mutex")),
+            analysis
+                .synchronization
+                .iter()
+                .any(|s| s.kind.contains("Mutex")),
             "expected at least one Mutex in lsp/manager.rs, got {:?}",
             analysis.synchronization
         );
     }
-
 }

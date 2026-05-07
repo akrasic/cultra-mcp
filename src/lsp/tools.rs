@@ -68,16 +68,19 @@ fn build_cold_index_metadata(
     let mut out = Map::new();
     out.insert("lsp_index_status".to_string(), json!(status));
     if status == "cold" {
-        out.insert("warning".to_string(), json!(format!(
-            "LSP index appears cold: {} returned no results for {}. \
+        out.insert(
+            "warning".to_string(),
+            json!(format!(
+                "LSP index appears cold: {} returned no results for {}. \
              This is almost always an indexing gap (rust-analyzer / gopls / etc \
              still populating the cross-file index), not a real absence. \
              Either retry after the language server finishes indexing, \
              pass workspace_root explicitly to ensure the right project is \
              being indexed, or pass require_warm_index=true to fail fast \
              rather than receive best-effort empty results.",
-            tool_kind, query_desc
-        )));
+                tool_kind, query_desc
+            )),
+        );
     }
     out
 }
@@ -99,7 +102,8 @@ fn resolve_lsp_client_for_file(
     if let Some(root) = get_workspace_root(args) {
         let language = super::client::detect_language(file_path)
             .map_err(|e| anyhow!("Language detection failed: {}", e))?;
-        return lsp.get_or_create_adhoc_client(&language, &root)
+        return lsp
+            .get_or_create_adhoc_client(&language, &root)
             .map_err(|e| anyhow!("Failed to create LSP client at {}: {}", root.display(), e));
     }
 
@@ -107,9 +111,18 @@ fn resolve_lsp_client_for_file(
     let language = super::client::detect_language(file_path)
         .map_err(|e| anyhow!("Language detection failed: {}", e))?;
     let abs_path = Path::new(file_path);
-    if let Some(workspace) = lsp_workspace_root_for_language(&language, abs_path, lsp.workspace_root()) {
-        return lsp.get_or_create_adhoc_client(&language, &workspace.root)
-            .map_err(|e| anyhow!("Failed to create LSP client at {}: {}", workspace.root.display(), e));
+    if let Some(workspace) =
+        lsp_workspace_root_for_language(&language, abs_path, lsp.workspace_root())
+    {
+        return lsp
+            .get_or_create_adhoc_client(&language, &workspace.root)
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to create LSP client at {}: {}",
+                    workspace.root.display(),
+                    e
+                )
+            });
     }
 
     // Fallback: legacy behavior for layouts where walk-up finds nothing
@@ -173,7 +186,8 @@ fn get_client_for_file_and_open(
     let client_arc = resolve_lsp_client_for_file(lsp, file_path, args)?;
     {
         let mut client = client_arc.lock().unwrap_or_else(|e| e.into_inner());
-        client.open_document(file_path)
+        client
+            .open_document(file_path)
             .map_err(|e| anyhow!("Failed to open document: {}", e))?;
     }
     Ok(client_arc)
@@ -202,7 +216,12 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
     // Validate action before doing any I/O
     match action {
         "references" | "definition" | "hover" | "implementation" => {}
-        other => return Err(anyhow!("Invalid action '{}'. Must be 'references', 'definition', 'hover', or 'implementation'", other)),
+        other => {
+            return Err(anyhow!(
+            "Invalid action '{}'. Must be 'references', 'definition', 'hover', or 'implementation'",
+            other
+        ))
+        }
     }
 
     let file_path = args
@@ -215,10 +234,10 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
         .and_then(|v| v.as_u64())
         .ok_or_else(|| anyhow!("Missing required parameter: line"))? as u32;
 
-    let character = args
-        .get("character")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("Missing required parameter: character"))? as u32;
+    let character =
+        args.get("character")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("Missing required parameter: character"))? as u32;
 
     let require_warm_index = args
         .get("require_warm_index")
@@ -248,20 +267,30 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
 
     // Inner helper: execute the LSP query once and return (body, useful_hits, query_desc).
     // Extracted so the retry loop below can re-execute without duplicating the match.
-    let execute_query = |client_arc: &std::sync::Arc<std::sync::Mutex<super::client::LSPClient>>,
-                         uri: &str, action: &str, file_path: &str, line: u32, character: u32|
-        -> Result<(Value, usize, String)>
-    {
+    let execute_query = |client_arc: &std::sync::Arc<
+        std::sync::Mutex<super::client::LSPClient>,
+    >,
+                         uri: &str,
+                         action: &str,
+                         file_path: &str,
+                         line: u32,
+                         character: u32|
+     -> Result<(Value, usize, String)> {
         match action {
             "references" => {
                 let params = ReferenceParams {
-                    text_document: TextDocumentIdentifier { uri: uri.to_string() },
+                    text_document: TextDocumentIdentifier {
+                        uri: uri.to_string(),
+                    },
                     position: Position { line, character },
-                    context: ReferenceContext { include_declaration: true },
+                    context: ReferenceContext {
+                        include_declaration: true,
+                    },
                 };
                 let response = {
                     let mut client = client_arc.lock().unwrap_or_else(|e| e.into_inner());
-                    client.send_request("textDocument/references", Some(json!(params)))
+                    client
+                        .send_request("textDocument/references", Some(json!(params)))
                         .map_err(|e| anyhow!("LSP request failed: {}", e))?
                 };
                 let locations: Vec<Location> = if response.is_null() {
@@ -270,11 +299,14 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
                     serde_json::from_value(response)
                         .map_err(|e| anyhow!("Failed to parse references response: {}", e))?
                 };
-                let non_decl_count = locations.iter().filter(|loc| {
-                    let same_file = loc.uri.ends_with(file_path);
-                    let same_line = loc.range.start.line == line;
-                    !(same_file && same_line)
-                }).count();
+                let non_decl_count = locations
+                    .iter()
+                    .filter(|loc| {
+                        let same_file = loc.uri.ends_with(file_path);
+                        let same_line = loc.range.start.line == line;
+                        !(same_file && same_line)
+                    })
+                    .count();
                 let count = locations.len();
                 Ok((
                     json!({"references": locations, "count": count}),
@@ -284,12 +316,15 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
             }
             "definition" => {
                 let params = TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: uri.to_string() },
+                    text_document: TextDocumentIdentifier {
+                        uri: uri.to_string(),
+                    },
                     position: Position { line, character },
                 };
                 let response = {
                     let mut client = client_arc.lock().unwrap_or_else(|e| e.into_inner());
-                    client.send_request("textDocument/definition", Some(json!(params)))
+                    client
+                        .send_request("textDocument/definition", Some(json!(params)))
                         .map_err(|e| anyhow!("LSP request failed: {}", e))?
                 };
                 if response.is_null() {
@@ -304,7 +339,9 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
                         1,
                         format!("definition at {}:{}:{}", file_path, line, character),
                     ))
-                } else if let Ok(locations) = serde_json::from_value::<Vec<Location>>(response.clone()) {
+                } else if let Ok(locations) =
+                    serde_json::from_value::<Vec<Location>>(response.clone())
+                {
                     if let Some(first) = locations.first() {
                         let n = locations.len();
                         Ok((
@@ -328,12 +365,15 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
             // as definition (TextDocumentPositionParams → Location | Location[]).
             "implementation" => {
                 let params = TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: uri.to_string() },
+                    text_document: TextDocumentIdentifier {
+                        uri: uri.to_string(),
+                    },
                     position: Position { line, character },
                 };
                 let response = {
                     let mut client = client_arc.lock().unwrap_or_else(|e| e.into_inner());
-                    client.send_request("textDocument/implementation", Some(json!(params)))
+                    client
+                        .send_request("textDocument/implementation", Some(json!(params)))
                         .map_err(|e| anyhow!("LSP request failed: {}", e))?
                 };
                 if response.is_null() {
@@ -348,7 +388,9 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
                         1,
                         format!("implementation at {}:{}:{}", file_path, line, character),
                     ))
-                } else if let Ok(locations) = serde_json::from_value::<Vec<Location>>(response.clone()) {
+                } else if let Ok(locations) =
+                    serde_json::from_value::<Vec<Location>>(response.clone())
+                {
                     let count = locations.len();
                     Ok((
                         json!({"found": count > 0, "implementations": locations, "count": count}),
@@ -361,12 +403,15 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
             }
             "hover" => {
                 let params = TextDocumentPositionParams {
-                    text_document: TextDocumentIdentifier { uri: uri.to_string() },
+                    text_document: TextDocumentIdentifier {
+                        uri: uri.to_string(),
+                    },
                     position: Position { line, character },
                 };
                 let response = {
                     let mut client = client_arc.lock().unwrap_or_else(|e| e.into_inner());
-                    client.send_request("textDocument/hover", Some(json!(params)))
+                    client
+                        .send_request("textDocument/hover", Some(json!(params)))
                         .map_err(|e| anyhow!("LSP request failed: {}", e))?
                 };
                 if response.is_null() {
@@ -380,7 +425,11 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
                         .map_err(|e| anyhow!("Failed to parse hover response: {}", e))?;
                     let text = match hover.contents {
                         HoverContents::Scalar(s) => s.text().to_string(),
-                        HoverContents::Array(arr) => arr.iter().map(|s| s.text()).collect::<Vec<_>>().join("\n\n"),
+                        HoverContents::Array(arr) => arr
+                            .iter()
+                            .map(|s| s.text())
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
                         HoverContents::Markup(m) => m.value,
                     };
                     let useful = if text.trim().is_empty() { 0 } else { 1 };
@@ -400,7 +449,8 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
     // returning a cold result immediately (the warmup race — cargo check / go build
     // finishes before the language server's internal index is ready), poll until the
     // index catches up. Timeout after 90s to avoid hanging indefinitely.
-    let (mut body, useful_hits, query_desc) = execute_query(&client_arc, &uri, action, file_path, line, character)?;
+    let (mut body, useful_hits, query_desc) =
+        execute_query(&client_arc, &uri, action, file_path, line, character)?;
     let mut status = classify_lsp_emptiness(1, useful_hits);
 
     if do_warmup && status == "cold" {
@@ -431,7 +481,8 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
                 "textDocument": { "uri": super::client::file_uri(file_path) }
             });
             let mut client = client_arc.lock().unwrap_or_else(|e| e.into_inner());
-            client.send_request("textDocument/documentSymbol", Some(sym_params))
+            client
+                .send_request("textDocument/documentSymbol", Some(sym_params))
                 .ok()
                 .and_then(|resp| resp.as_array().cloned())
                 .and_then(|symbols| {
@@ -442,16 +493,17 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
                             return None;
                         }
                         let name = sym.get("name").and_then(|n| n.as_str())?;
-                        let range = sym.get("location")
+                        let range = sym
+                            .get("location")
                             .and_then(|l| l.get("range"))
                             .or_else(|| sym.get("range"));
                         let start_line = range
                             .and_then(|r| r.get("start"))
                             .and_then(|s| s.get("line"))
-                            .and_then(|v| v.as_u64())? as usize;
+                            .and_then(|v| v.as_u64())?
+                            as usize;
                         // Find the name's column in the source line.
-                        let col = source_lines.get(start_line)
-                            .and_then(|l| l.find(name))? as u32;
+                        let col = source_lines.get(start_line).and_then(|l| l.find(name))? as u32;
                         Some((start_line as u32, col))
                     })
                 })
@@ -465,15 +517,22 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
             // original query is empty, the position genuinely has nothing.
             if let Some((probe_line, probe_char)) = probe_position {
                 let probe_warm = execute_query(
-                    &client_arc, &uri, "hover", file_path, probe_line, probe_char
-                ).map(|(_, hits, _)| hits > 0).unwrap_or(false);
+                    &client_arc,
+                    &uri,
+                    "hover",
+                    file_path,
+                    probe_line,
+                    probe_char,
+                )
+                .map(|(_, hits, _)| hits > 0)
+                .unwrap_or(false);
 
                 if probe_warm {
                     // Semantic index is ready. Re-execute the original query
                     // one final time — if still empty, it's genuinely empty.
-                    if let Ok((new_body, new_hits, _)) = execute_query(
-                        &client_arc, &uri, action, file_path, line, character
-                    ) {
+                    if let Ok((new_body, new_hits, _)) =
+                        execute_query(&client_arc, &uri, action, file_path, line, character)
+                    {
                         body = new_body;
                         status = classify_lsp_emptiness(1, new_hits);
                     }
@@ -501,18 +560,23 @@ pub fn lsp_query(args: Map<String, Value>, lsp: &LSPManager) -> Result<Value> {
     }
     let metadata = build_cold_index_metadata(status, &format!("lsp({})", action), &query_desc);
     if let Value::Object(ref mut obj) = body {
-        for (k, v) in metadata { obj.insert(k, v); }
+        for (k, v) in metadata {
+            obj.insert(k, v);
+        }
         // CULTRA-963: surface warmup report so callers can see whether warmup
         // ran, whether it was cached, and how long it took.
         if let Some(ref report) = warmup_report {
-            obj.insert("warmup_report".to_string(), json!({
-                "status": report.status,
-                "cached": report.cached,
-                "elapsed_ms": report.elapsed_ms,
-                "language": report.language,
-                "command": report.command,
-                "message": report.message,
-            }));
+            obj.insert(
+                "warmup_report".to_string(),
+                json!({
+                    "status": report.status,
+                    "cached": report.cached,
+                    "elapsed_ms": report.elapsed_ms,
+                    "language": report.language,
+                    "command": report.command,
+                    "message": report.message,
+                }),
+            );
         }
     }
     Ok(body)
@@ -574,7 +638,8 @@ pub fn lsp_workspace_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resu
     let warmup_report: Option<super::manager::WarmupReport> = if do_warmup {
         // Use file_path hint if provided, otherwise synthesize a path inside
         // the resolved root so ensure_warm can walk up to the manifest.
-        let warmup_path = args.get("file_path")
+        let warmup_path = args
+            .get("file_path")
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
             .unwrap_or_else(|| resolved_root.join("dummy.rs"));
@@ -588,7 +653,13 @@ pub fn lsp_workspace_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resu
             .map_err(|e| anyhow!("Failed to get LSP client: {}", e))?
     } else {
         lsp.get_or_create_adhoc_client(language, &resolved_root)
-            .map_err(|e| anyhow!("Failed to create LSP client at {}: {}", resolved_root.display(), e))?
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to create LSP client at {}: {}",
+                    resolved_root.display(),
+                    e
+                )
+            })?
     };
 
     // Trigger workspace indexing if this is a fresh client (pyright needs didOpen first)
@@ -597,12 +668,13 @@ pub fn lsp_workspace_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resu
 
         // Check if the client has been used before by trying workspace/symbol first
         let test_params = json!({"query": ""});
-        let test_response = client.send_request("workspace/symbol", Some(test_params))
+        let test_response = client
+            .send_request("workspace/symbol", Some(test_params))
             .map_err(|e| anyhow!("LSP request failed: {}", e))?;
 
         // If the test returned empty/null on a fresh client, trigger indexing
-        let needs_indexing = test_response.is_null()
-            || test_response.as_array().is_some_and(|a| a.is_empty());
+        let needs_indexing =
+            test_response.is_null() || test_response.as_array().is_some_and(|a| a.is_empty());
 
         if needs_indexing {
             let extensions: &[&str] = match language {
@@ -627,7 +699,11 @@ pub fn lsp_workspace_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resu
                     Err(e) => tracing::warn!("didOpen failed for workspace indexing: {}", e),
                 }
             } else {
-                tracing::warn!("No source file found for language '{}' in {:?}", language, resolved_root);
+                tracing::warn!(
+                    "No source file found for language '{}' in {:?}",
+                    language,
+                    resolved_root
+                );
             }
         }
     }
@@ -635,7 +711,8 @@ pub fn lsp_workspace_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resu
     let params = json!({"query": query});
     let response = {
         let mut client = client_arc.lock().unwrap_or_else(|e| e.into_inner());
-        client.send_request("workspace/symbol", Some(params))
+        client
+            .send_request("workspace/symbol", Some(params))
             .map_err(|e| anyhow!("LSP request failed: {}", e))?
     };
 
@@ -651,13 +728,18 @@ pub fn lsp_workspace_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resu
     // when a symbol is re-exported. Dedup by (name, kind, uri, start_line).
     let symbols = {
         let mut seen = std::collections::HashSet::new();
-        symbols.into_iter().filter(|s| {
-            let loc_key = s.location.as_ref().map(|l| {
-                format!("{}:{}", l.uri, l.range.start.line)
-            }).unwrap_or_default();
-            let key = format!("{}:{}:{}", s.name, s.kind as u32, loc_key);
-            seen.insert(key)
-        }).collect::<Vec<_>>()
+        symbols
+            .into_iter()
+            .filter(|s| {
+                let loc_key = s
+                    .location
+                    .as_ref()
+                    .map(|l| format!("{}:{}", l.uri, l.range.start.line))
+                    .unwrap_or_default();
+                let key = format!("{}:{}:{}", s.name, s.kind as u32, loc_key);
+                seen.insert(key)
+            })
+            .collect::<Vec<_>>()
     };
 
     let count = symbols.len();
@@ -686,16 +768,21 @@ pub fn lsp_workspace_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resu
         &format!("query '{}'", query),
     );
     if let Value::Object(ref mut obj) = body {
-        for (k, v) in metadata { obj.insert(k, v); }
+        for (k, v) in metadata {
+            obj.insert(k, v);
+        }
         if let Some(ref report) = warmup_report {
-            obj.insert("warmup_report".to_string(), json!({
-                "status": report.status,
-                "cached": report.cached,
-                "elapsed_ms": report.elapsed_ms,
-                "language": report.language,
-                "command": report.command,
-                "message": report.message,
-            }));
+            obj.insert(
+                "warmup_report".to_string(),
+                json!({
+                    "status": report.status,
+                    "cached": report.cached,
+                    "elapsed_ms": report.elapsed_ms,
+                    "language": report.language,
+                    "command": report.command,
+                    "message": report.message,
+                }),
+            );
         }
     }
     Ok(body)
@@ -733,10 +820,7 @@ pub fn lsp_document_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resul
         .get("max_results")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
-    let offset = args
-        .get("offset")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
     // CULTRA-963: optional active warmup, same as lsp_query.
     let do_warmup = args
@@ -762,7 +846,8 @@ pub fn lsp_document_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resul
 
     let response = {
         let mut client = client_arc.lock().unwrap_or_else(|e| e.into_inner());
-        client.send_request("textDocument/documentSymbol", Some(params))
+        client
+            .send_request("textDocument/documentSymbol", Some(params))
             .map_err(|e| anyhow!("LSP request failed: {}", e))?
     };
 
@@ -829,7 +914,13 @@ pub fn lsp_document_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resul
     } else {
         return Err(anyhow!(
             "Unexpected documentSymbol response format. Response type: {}",
-            if response.is_array() { "array" } else if response.is_object() { "object" } else { "other" }
+            if response.is_array() {
+                "array"
+            } else if response.is_object() {
+                "object"
+            } else {
+                "other"
+            }
         ));
     };
 
@@ -850,16 +941,21 @@ pub fn lsp_document_symbols(args: Map<String, Value>, lsp: &LSPManager) -> Resul
         &format!("document '{}'", file_path),
     );
     if let Value::Object(ref mut obj) = body {
-        for (k, v) in metadata { obj.insert(k, v); }
+        for (k, v) in metadata {
+            obj.insert(k, v);
+        }
         if let Some(ref report) = warmup_report {
-            obj.insert("warmup_report".to_string(), json!({
-                "status": report.status,
-                "cached": report.cached,
-                "elapsed_ms": report.elapsed_ms,
-                "language": report.language,
-                "command": report.command,
-                "message": report.message,
-            }));
+            obj.insert(
+                "warmup_report".to_string(),
+                json!({
+                    "status": report.status,
+                    "cached": report.cached,
+                    "elapsed_ms": report.elapsed_ms,
+                    "language": report.language,
+                    "command": report.command,
+                    "message": report.message,
+                }),
+            );
         }
     }
     Ok(body)
@@ -895,7 +991,10 @@ mod tests {
     fn test_build_cold_index_metadata_warm_no_warning() {
         let m = build_cold_index_metadata("warm", "lsp_document_symbols", "document 'foo.rs'");
         assert_eq!(m.get("lsp_index_status").unwrap(), "warm");
-        assert!(m.get("warning").is_none(), "warm status must not emit a warning");
+        assert!(
+            m.get("warning").is_none(),
+            "warm status must not emit a warning"
+        );
     }
 
     #[test]
@@ -903,10 +1002,26 @@ mod tests {
         let m = build_cold_index_metadata("cold", "lsp_workspace_symbols", "query 'compose'");
         assert_eq!(m.get("lsp_index_status").unwrap(), "cold");
         let warning = m.get("warning").and_then(|v| v.as_str()).unwrap();
-        assert!(warning.contains("lsp_workspace_symbols"), "warning should name the tool: {}", warning);
-        assert!(warning.contains("compose"), "warning should name the query: {}", warning);
-        assert!(warning.contains("require_warm_index"), "warning should mention the strict-mode opt-in: {}", warning);
-        assert!(warning.contains("workspace_root"), "warning should suggest workspace_root override: {}", warning);
+        assert!(
+            warning.contains("lsp_workspace_symbols"),
+            "warning should name the tool: {}",
+            warning
+        );
+        assert!(
+            warning.contains("compose"),
+            "warning should name the query: {}",
+            warning
+        );
+        assert!(
+            warning.contains("require_warm_index"),
+            "warning should mention the strict-mode opt-in: {}",
+            warning
+        );
+        assert!(
+            warning.contains("workspace_root"),
+            "warning should suggest workspace_root override: {}",
+            warning
+        );
     }
 
     #[test]
@@ -934,7 +1049,10 @@ mod tests {
         std::fs::write(&src, "fn main() {}\n").unwrap();
 
         let resolved = lsp_workspace_root_for_language("rust", &src, dir.path()).unwrap();
-        assert_eq!(resolved.root, crate_dir.canonicalize().unwrap(),
-            "should resolve to the crate dir, not the sandbox root");
+        assert_eq!(
+            resolved.root,
+            crate_dir.canonicalize().unwrap(),
+            "should resolve to the crate dir, not the sandbox root"
+        );
     }
 }

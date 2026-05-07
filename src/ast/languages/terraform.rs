@@ -148,7 +148,15 @@ fn parse_block(node: &tree_sitter::Node, content: &[u8]) -> Option<Symbol> {
             (
                 SymbolType::Other,
                 name.clone(),
-                format!("{} {}", block_type, labels.iter().map(|l| format!("\"{}\"", l)).collect::<Vec<_>>().join(" ")),
+                format!(
+                    "{} {}",
+                    block_type,
+                    labels
+                        .iter()
+                        .map(|l| format!("\"{}\"", l))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
             )
         }
     };
@@ -184,16 +192,21 @@ fn collect_module_sources(node: &tree_sitter::Node, content: &[u8], imports: &mu
 
                 // Check if this is a module block
                 if let Some(first) = children.first() {
-                    if first.kind() == "identifier" && node_text(first, content).as_deref() == Some("module") {
+                    if first.kind() == "identifier"
+                        && node_text(first, content).as_deref() == Some("module")
+                    {
                         // Look for source attribute in the body
                         if let Some(body) = children.iter().find(|c| c.kind() == "body") {
                             let mut body_cursor = body.walk();
                             for attr in body.children(&mut body_cursor) {
                                 if attr.kind() == "attribute" {
                                     let mut attr_cursor = attr.walk();
-                                    let attr_children: Vec<_> = attr.children(&mut attr_cursor).collect();
+                                    let attr_children: Vec<_> =
+                                        attr.children(&mut attr_cursor).collect();
                                     if let Some(key) = attr_children.first() {
-                                        if key.kind() == "identifier" && node_text(key, content).as_deref() == Some("source") {
+                                        if key.kind() == "identifier"
+                                            && node_text(key, content).as_deref() == Some("source")
+                                        {
                                             // Value may be nested: attribute > expr_term > template_expr > string_lit
                                             if let Some(text) = find_nested_string(&attr, content) {
                                                 imports.push(text);
@@ -244,12 +257,14 @@ mod tests {
 
     #[test]
     fn test_extract_resource() {
-        let (tree, content) = parse_tf(r#"
+        let (tree, content) = parse_tf(
+            r#"
 resource "aws_instance" "web" {
   ami           = "ami-12345"
   instance_type = "t3.micro"
 }
-"#);
+"#,
+        );
         let symbols = extract_terraform_symbols(&tree.root_node(), &content).unwrap();
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "aws_instance.web");
@@ -259,12 +274,14 @@ resource "aws_instance" "web" {
 
     #[test]
     fn test_extract_variable() {
-        let (tree, content) = parse_tf(r#"
+        let (tree, content) = parse_tf(
+            r#"
 variable "region" {
   type    = string
   default = "us-east-1"
 }
-"#);
+"#,
+        );
         let symbols = extract_terraform_symbols(&tree.root_node(), &content).unwrap();
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "region");
@@ -273,12 +290,14 @@ variable "region" {
 
     #[test]
     fn test_extract_module() {
-        let (tree, content) = parse_tf(r#"
+        let (tree, content) = parse_tf(
+            r#"
 module "vpc" {
   source = "terraform-aws-modules/vpc/aws"
   cidr   = "10.0.0.0/16"
 }
-"#);
+"#,
+        );
         let symbols = extract_terraform_symbols(&tree.root_node(), &content).unwrap();
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "vpc");
@@ -287,7 +306,8 @@ module "vpc" {
 
     #[test]
     fn test_extract_module_imports() {
-        let (tree, content) = parse_tf(r#"
+        let (tree, content) = parse_tf(
+            r#"
 module "vpc" {
   source = "terraform-aws-modules/vpc/aws"
 }
@@ -295,7 +315,8 @@ module "vpc" {
 module "eks" {
   source = "./modules/eks"
 }
-"#);
+"#,
+        );
         let imports = extract_terraform_imports(&tree.root_node(), &content).unwrap();
         assert_eq!(imports.len(), 2);
         assert!(imports.contains(&"terraform-aws-modules/vpc/aws".to_string()));
@@ -304,7 +325,8 @@ module "eks" {
 
     #[test]
     fn test_extract_multiple_block_types() {
-        let (tree, content) = parse_tf(r#"
+        let (tree, content) = parse_tf(
+            r#"
 terraform {
   required_version = ">= 1.0"
 }
@@ -328,7 +350,8 @@ output "bucket_arn" {
 locals {
   env = "production"
 }
-"#);
+"#,
+        );
         let symbols = extract_terraform_symbols(&tree.root_node(), &content).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"terraform"));

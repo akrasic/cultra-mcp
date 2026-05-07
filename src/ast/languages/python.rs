@@ -22,10 +22,7 @@ pub fn extract_python_symbols(
 }
 
 /// Extract Python function definitions
-fn extract_python_functions(
-    node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<Symbol>> {
+fn extract_python_functions(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
     let query_source = r#"
@@ -82,7 +79,7 @@ fn extract_python_functions(
                 name: func_name,
                 line: node.start_position().row as u32 + 1,
                 end_line: node.end_position().row as u32 + 1,
-                scope: Scope::from_str(&scope),
+                scope: scope.parse::<Scope>().unwrap(),
                 signature,
                 parent: None,
                 receiver: None,
@@ -98,10 +95,7 @@ fn extract_python_functions(
 }
 
 /// Extract Python class definitions
-fn extract_python_classes(
-    node: &tree_sitter::Node,
-    content: &[u8],
-) -> Result<Vec<Symbol>> {
+fn extract_python_classes(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Symbol>> {
     let mut symbols = Vec::new();
 
     let query_source = r#"
@@ -147,7 +141,7 @@ fn extract_python_classes(
                 name: class_name,
                 line: node.start_position().row as u32 + 1,
                 end_line: node.end_position().row as u32 + 1,
-                scope: Scope::from_str(&scope),
+                scope: scope.parse::<Scope>().unwrap(),
                 signature,
                 parent: None,
                 receiver: None,
@@ -242,7 +236,7 @@ fn extract_python_calls(
         ])
     "#;
 
-    let query = Query::new(&language, query_source)?;
+    let query = Query::new(language, query_source)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *func_node, content);
     while let Some(match_) = matches.next() {
@@ -341,15 +335,13 @@ def _private_function():
 
         let mut parser = tree_sitter::Parser::new();
         let lang = tree_sitter_python::LANGUAGE.into();
-        parser
-            .set_language(&lang)
-            .expect("Failed to set language");
+        parser.set_language(&lang).expect("Failed to set language");
 
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
 
-        let symbols =
-            extract_python_symbols(&root_node, source.as_bytes()).expect("Failed to extract symbols");
+        let symbols = extract_python_symbols(&root_node, source.as_bytes())
+            .expect("Failed to extract symbols");
 
         // Should extract class and functions
         assert!(
@@ -367,7 +359,10 @@ def _private_function():
 
         // Check public function
         let create_func = symbols.iter().find(|s| s.name == "create_calculator");
-        assert!(create_func.is_some(), "Should find create_calculator function");
+        assert!(
+            create_func.is_some(),
+            "Should find create_calculator function"
+        );
         let create_func = create_func.unwrap();
         assert_eq!(create_func.symbol_type, SymbolType::Function);
         assert_eq!(create_func.scope, Scope::Public);
@@ -392,14 +387,12 @@ def main():
 
         let mut parser = tree_sitter::Parser::new();
         let lang = tree_sitter_python::LANGUAGE.into();
-        parser
-            .set_language(&lang)
-            .expect("Failed to set language");
+        parser.set_language(&lang).expect("Failed to set language");
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
 
-        let imports =
-            extract_python_imports(&root_node, source.as_bytes()).expect("Failed to extract imports");
+        let imports = extract_python_imports(&root_node, source.as_bytes())
+            .expect("Failed to extract imports");
 
         assert_eq!(imports.len(), 3);
         assert!(imports.contains(&"os".to_string()));

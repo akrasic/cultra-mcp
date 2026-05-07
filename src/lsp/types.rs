@@ -56,7 +56,7 @@ pub struct Range {
 /// Location in a document (file + range)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Location {
-    pub uri: String,  // file:// URI
+    pub uri: String, // file:// URI
     pub range: Range,
 }
 
@@ -123,19 +123,44 @@ pub struct InitializeResult {
 pub struct ServerCapabilities {
     // Each capability can be `true`, `false`, or an options object like `{"workDoneProgress": true}`.
     // We use a custom deserializer to normalize both forms to Option<bool>.
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "definitionProvider", deserialize_with = "deserialize_capability")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "definitionProvider",
+        deserialize_with = "deserialize_capability"
+    )]
     pub definition_provider: Option<bool>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "referencesProvider", deserialize_with = "deserialize_capability")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "referencesProvider",
+        deserialize_with = "deserialize_capability"
+    )]
     pub references_provider: Option<bool>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "hoverProvider", deserialize_with = "deserialize_capability")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "hoverProvider",
+        deserialize_with = "deserialize_capability"
+    )]
     pub hover_provider: Option<bool>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "documentSymbolProvider", deserialize_with = "deserialize_capability")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "documentSymbolProvider",
+        deserialize_with = "deserialize_capability"
+    )]
     pub document_symbol_provider: Option<bool>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "workspaceSymbolProvider", deserialize_with = "deserialize_capability")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "workspaceSymbolProvider",
+        deserialize_with = "deserialize_capability"
+    )]
     pub workspace_symbol_provider: Option<bool>,
 }
 
@@ -193,7 +218,7 @@ pub enum HoverContents {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarkupContent {
-    pub kind: String,  // "plaintext" or "markdown"
+    pub kind: String, // "plaintext" or "markdown"
     pub value: String,
 }
 
@@ -274,7 +299,10 @@ impl<'de> Deserialize<'de> for SymbolKind {
             24 => Ok(SymbolKind::Event),
             25 => Ok(SymbolKind::Operator),
             26 => Ok(SymbolKind::TypeParameter),
-            _ => Err(serde::de::Error::custom(format!("Unknown SymbolKind: {}", value))),
+            _ => Err(serde::de::Error::custom(format!(
+                "Unknown SymbolKind: {}",
+                value
+            ))),
         }
     }
 }
@@ -299,7 +327,7 @@ pub struct DocumentSymbol {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
-    pub jsonrpc: String,  // Always "2.0"
+    pub jsonrpc: String, // Always "2.0"
     pub id: u64,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -62,7 +62,7 @@ fn extract_go_functions(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<
         }
 
         if let Some(node) = func_node {
-            let scope = if func_name.chars().next().map_or(false, |c| c.is_uppercase()) {
+            let scope = if func_name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 "exported"
             } else {
                 "unexported"
@@ -83,7 +83,7 @@ fn extract_go_functions(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<
                 name: func_name,
                 line: node.start_position().row as u32 + 1,
                 end_line: node.end_position().row as u32 + 1,
-                scope: Scope::from_str(&scope),
+                scope: scope.parse::<Scope>().unwrap(),
                 signature,
                 parent: None,
                 receiver: None,
@@ -151,11 +151,7 @@ fn extract_go_methods(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Sy
         }
 
         if let Some(node) = method_node {
-            let scope = if method_name
-                .chars()
-                .next()
-                .map_or(false, |c| c.is_uppercase())
-            {
+            let scope = if method_name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 "exported"
             } else {
                 "unexported"
@@ -176,7 +172,7 @@ fn extract_go_methods(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Sy
                 name: method_name,
                 line: node.start_position().row as u32 + 1,
                 end_line: node.end_position().row as u32 + 1,
-                scope: Scope::from_str(&scope),
+                scope: scope.parse::<Scope>().unwrap(),
                 signature,
                 parent: None,
                 receiver: Some(receiver_type),
@@ -238,11 +234,7 @@ fn extract_go_types(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Symb
         }
 
         if let Some(node) = type_node {
-            let scope = if type_name
-                .chars()
-                .next()
-                .map_or(false, |c| c.is_uppercase())
-            {
+            let scope = if type_name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 "exported"
             } else {
                 "unexported"
@@ -255,7 +247,7 @@ fn extract_go_types(node: &tree_sitter::Node, content: &[u8]) -> Result<Vec<Symb
                 name: type_name,
                 line: node.start_position().row as u32 + 1,
                 end_line: node.end_position().row as u32 + 1,
-                scope: Scope::from_str(&scope),
+                scope: scope.parse::<Scope>().unwrap(),
                 signature,
                 parent: None,
                 receiver: None,
@@ -337,7 +329,7 @@ fn extract_function_calls(
         ])
     "#;
 
-    let query = Query::new(&language, query_source)?;
+    let query = Query::new(language, query_source)?;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, *func_node, content);
     while let Some(match_) = matches.next() {
@@ -414,18 +406,21 @@ func (g *Greeter) Greet(message string) string {
         // Parse with tree-sitter
         let mut parser = tree_sitter::Parser::new();
         let lang = tree_sitter_go::LANGUAGE.into();
-        parser
-            .set_language(&lang)
-            .expect("Failed to set language");
+        parser.set_language(&lang).expect("Failed to set language");
 
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
 
         // Extract symbols
-        let symbols = extract_go_symbols(&root_node, source.as_bytes()).expect("Failed to extract symbols");
+        let symbols =
+            extract_go_symbols(&root_node, source.as_bytes()).expect("Failed to extract symbols");
 
         // Should have extracted function, type, and method
-        assert_eq!(symbols.len(), 3, "Should extract 3 symbols (function, type, method)");
+        assert_eq!(
+            symbols.len(),
+            3,
+            "Should extract 3 symbols (function, type, method)"
+        );
 
         // Check function
         let hello_func = symbols.iter().find(|s| s.name == "HelloWorld");
@@ -462,11 +457,13 @@ import (
 "#;
 
         let mut parser = tree_sitter::Parser::new();
-        let lang = tree_sitter_go::LANGUAGE.into(); parser.set_language(&lang).expect("Failed to set language");
+        let lang = tree_sitter_go::LANGUAGE.into();
+        parser.set_language(&lang).expect("Failed to set language");
         let tree = parser.parse(source, None).expect("Failed to parse");
         let root_node = tree.root_node();
 
-        let imports = extract_go_imports(&root_node, source.as_bytes()).expect("Failed to extract imports");
+        let imports =
+            extract_go_imports(&root_node, source.as_bytes()).expect("Failed to extract imports");
 
         assert_eq!(imports.len(), 2);
         assert!(imports.contains(&"fmt".to_string()));

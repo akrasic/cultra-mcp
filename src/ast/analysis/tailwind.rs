@@ -60,7 +60,10 @@ struct ThemeContext {
 
 /// Resolve a list of Tailwind utility class names to CSS declarations.
 /// Optionally reads @theme block from a CSS file for custom theme values (Tailwind v4).
-pub fn resolve_tailwind_classes(classes: &[&str], css_path: Option<&str>) -> Result<TailwindResolution> {
+pub fn resolve_tailwind_classes(
+    classes: &[&str],
+    css_path: Option<&str>,
+) -> Result<TailwindResolution> {
     let theme = if let Some(path) = css_path {
         let content = fs::read_to_string(path)?;
         parse_theme_block(&content)
@@ -181,10 +184,10 @@ fn parse_theme_line(line: &str, ctx: &mut ThemeContext) {
 
 /// Strip important modifier: leading `!` (Tailwind v4) or trailing `!` (v3)
 fn strip_important(class: &str) -> (&str, bool) {
-    if class.starts_with('!') {
-        (&class[1..], true)
-    } else if class.ends_with('!') {
-        (&class[..class.len() - 1], true)
+    if let Some(stripped) = class.strip_prefix('!') {
+        (stripped, true)
+    } else if let Some(stripped) = class.strip_suffix('!') {
+        (stripped, true)
     } else {
         (class, false)
     }
@@ -202,9 +205,8 @@ fn strip_variants_and_negative(class: &str) -> (Option<String>, &str, bool) {
     };
 
     // Check for negative prefix: leading '-' followed by alphabetic char
-    let negative = core.starts_with('-')
-        && core.len() > 1
-        && core.as_bytes()[1].is_ascii_alphabetic();
+    let negative =
+        core.starts_with('-') && core.len() > 1 && core.as_bytes()[1].is_ascii_alphabetic();
     let core = if negative { &core[1..] } else { core };
 
     (variants, core, negative)
@@ -732,15 +734,19 @@ const SPACING_MAP: &[(&str, &[&str])] = &[
     ("inset", &["inset"]),
     ("inset-x", &["left", "right"]),
     ("inset-y", &["top", "bottom"]),
-    ("space-x", &["margin-left"]),  // simplified — applies to children
-    ("space-y", &["margin-top"]),   // simplified — applies to children
+    ("space-x", &["margin-left"]), // simplified — applies to children
+    ("space-y", &["margin-top"]),  // simplified — applies to children
 ];
 
 fn resolve_spacing(core: &str, negative: bool, _theme: &ThemeContext) -> Option<ResolvedClass> {
     for &(prefix, properties) in SPACING_MAP {
         if let Some(suffix) = strip_prefix_dash(core, prefix) {
             if let Some(value) = spacing_value(suffix) {
-                let value = if negative { format!("-{}", value) } else { value };
+                let value = if negative {
+                    format!("-{}", value)
+                } else {
+                    value
+                };
                 let declarations = properties
                     .iter()
                     .map(|p| CssDeclaration {
@@ -807,14 +813,14 @@ const COLOR_MAP: &[(&str, &str)] = &[
     ("border-b", "border-bottom-color"),
     ("border-l", "border-left-color"),
     ("outline", "outline-color"),
-    ("ring", "box-shadow"),  // ring color — simplified
+    ("ring", "box-shadow"), // ring color — simplified
     ("accent", "accent-color"),
     ("caret", "caret-color"),
     ("fill", "fill"),
     ("stroke", "stroke"),
     ("decoration", "text-decoration-color"),
-    ("placeholder", "color"),  // ::placeholder — simplified
-    ("divide", "border-color"),  // > * + * — simplified
+    ("placeholder", "color"),   // ::placeholder — simplified
+    ("divide", "border-color"), // > * + * — simplified
     ("from", "--tw-gradient-from"),
     ("via", "--tw-gradient-via"),
     ("to", "--tw-gradient-to"),
@@ -884,9 +890,22 @@ fn resolve_color_value(name: &str, theme: &ThemeContext) -> Option<String> {
             // stealing from later resolvers (e.g. border-2, border-solid, border-t)
             let first_char = name.chars().next().unwrap_or('0');
             if first_char.is_ascii_digit()
-                || matches!(name, "solid" | "dashed" | "dotted" | "double" | "none"
-                    | "collapse" | "separate"
-                    | "t" | "r" | "b" | "l" | "x" | "y")
+                || matches!(
+                    name,
+                    "solid"
+                        | "dashed"
+                        | "dotted"
+                        | "double"
+                        | "none"
+                        | "collapse"
+                        | "separate"
+                        | "t"
+                        | "r"
+                        | "b"
+                        | "l"
+                        | "x"
+                        | "y"
+                )
             {
                 None
             } else {
@@ -912,7 +931,11 @@ fn resolve_sizing(core: &str, negative: bool) -> Option<ResolvedClass> {
     for &(prefix, properties) in SIZING_MAP {
         if let Some(suffix) = strip_prefix_dash(core, prefix) {
             if let Some(value) = sizing_value(suffix, prefix) {
-                let value = if negative { format!("-{}", value) } else { value };
+                let value = if negative {
+                    format!("-{}", value)
+                } else {
+                    value
+                };
                 let declarations = properties
                     .iter()
                     .map(|p| CssDeclaration {
@@ -1329,10 +1352,22 @@ fn resolve_border_radius(core: &str) -> Option<ResolvedClass> {
 fn resolve_rounded(suffix: &str) -> Option<ResolvedClass> {
     // Corner-specific: rounded-{corner}-{size}
     let corners = [
-        ("t", &["border-top-left-radius", "border-top-right-radius"][..]),
-        ("r", &["border-top-right-radius", "border-bottom-right-radius"]),
-        ("b", &["border-bottom-right-radius", "border-bottom-left-radius"]),
-        ("l", &["border-top-left-radius", "border-bottom-left-radius"]),
+        (
+            "t",
+            &["border-top-left-radius", "border-top-right-radius"][..],
+        ),
+        (
+            "r",
+            &["border-top-right-radius", "border-bottom-right-radius"],
+        ),
+        (
+            "b",
+            &["border-bottom-right-radius", "border-bottom-left-radius"],
+        ),
+        (
+            "l",
+            &["border-top-left-radius", "border-bottom-left-radius"],
+        ),
         ("tl", &["border-top-left-radius"][..]),
         ("tr", &["border-top-right-radius"][..]),
         ("br", &["border-bottom-right-radius"][..]),
@@ -1871,10 +1906,22 @@ fn resolve_filters(core: &str) -> Option<ResolvedClass> {
             return Some(ResolvedClass {
                 class_name: core.to_string(),
                 declarations: vec![
-                    CssDeclaration { property: "overflow".to_string(), value: "visible".to_string() },
-                    CssDeclaration { property: "display".to_string(), value: "block".to_string() },
-                    CssDeclaration { property: "-webkit-box-orient".to_string(), value: "horizontal".to_string() },
-                    CssDeclaration { property: "-webkit-line-clamp".to_string(), value: "unset".to_string() },
+                    CssDeclaration {
+                        property: "overflow".to_string(),
+                        value: "visible".to_string(),
+                    },
+                    CssDeclaration {
+                        property: "display".to_string(),
+                        value: "block".to_string(),
+                    },
+                    CssDeclaration {
+                        property: "-webkit-box-orient".to_string(),
+                        value: "horizontal".to_string(),
+                    },
+                    CssDeclaration {
+                        property: "-webkit-line-clamp".to_string(),
+                        value: "unset".to_string(),
+                    },
                 ],
                 variant: None,
                 resolved: true,
@@ -1887,10 +1934,22 @@ fn resolve_filters(core: &str) -> Option<ResolvedClass> {
             return Some(ResolvedClass {
                 class_name: core.to_string(),
                 declarations: vec![
-                    CssDeclaration { property: "overflow".to_string(), value: "hidden".to_string() },
-                    CssDeclaration { property: "display".to_string(), value: "-webkit-box".to_string() },
-                    CssDeclaration { property: "-webkit-box-orient".to_string(), value: "vertical".to_string() },
-                    CssDeclaration { property: "-webkit-line-clamp".to_string(), value: n.to_string() },
+                    CssDeclaration {
+                        property: "overflow".to_string(),
+                        value: "hidden".to_string(),
+                    },
+                    CssDeclaration {
+                        property: "display".to_string(),
+                        value: "-webkit-box".to_string(),
+                    },
+                    CssDeclaration {
+                        property: "-webkit-box-orient".to_string(),
+                        value: "vertical".to_string(),
+                    },
+                    CssDeclaration {
+                        property: "-webkit-line-clamp".to_string(),
+                        value: n.to_string(),
+                    },
                 ],
                 variant: None,
                 resolved: true,
@@ -1946,7 +2005,11 @@ fn resolve_translate(core: &str, negative: bool) -> Option<ResolvedClass> {
     for (prefix, property) in &axes {
         if let Some(suffix) = strip_prefix_dash(core, prefix) {
             if let Some(value) = spacing_value(suffix) {
-                let value = if negative { format!("-{}", value) } else { value };
+                let value = if negative {
+                    format!("-{}", value)
+                } else {
+                    value
+                };
                 return Some(ResolvedClass {
                     class_name: core.to_string(),
                     declarations: vec![CssDeclaration {
@@ -2221,10 +2284,7 @@ mod tests {
         let rc = resolve_one("border-blue-200");
         assert!(rc.resolved);
         assert_eq!(rc.category, "color");
-        assert_eq!(
-            prop_value(&rc, "border-color"),
-            "var(--color-blue-200)"
-        );
+        assert_eq!(prop_value(&rc, "border-color"), "var(--color-blue-200)");
     }
 
     #[test]
@@ -2398,10 +2458,7 @@ mod tests {
     fn test_arbitrary_grid_cols() {
         let rc = resolve_one("grid-cols-[1fr_2fr]");
         assert!(rc.resolved);
-        assert_eq!(
-            prop_value(&rc, "grid-template-columns"),
-            "1fr 2fr"
-        );
+        assert_eq!(prop_value(&rc, "grid-template-columns"), "1fr 2fr");
     }
 
     // ===== Variants =====

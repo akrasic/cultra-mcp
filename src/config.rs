@@ -20,7 +20,14 @@ impl std::fmt::Debug for APIConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("APIConfig")
             .field("base_url", &self.base_url)
-            .field("key", &if self.key.is_empty() { "<empty>" } else { "<redacted>" })
+            .field(
+                "key",
+                &if self.key.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
             .finish()
     }
 }
@@ -35,9 +42,9 @@ impl Config {
         // Try ~/.config/cultra/mcp.json (skip exists() check to avoid TOCTOU)
         if let Some(home) = dirs::home_dir() {
             let default_path = home.join(".config/cultra/mcp.json");
-            match Self::load_from_file(&default_path) {
-                Ok(config) => return Ok(config),
-                Err(_) => {} // File doesn't exist or is invalid — fall through to env vars
+            // File doesn't exist or is invalid — fall through to env vars
+            if let Ok(config) = Self::load_from_file(&default_path) {
+                return Ok(config);
             }
         }
 
@@ -74,7 +81,7 @@ pub fn detect_project_id(workspace_root: &std::path::Path) -> Option<String> {
         // Match: **Project:** project-id
         if let Some(rest) = line.strip_prefix("**Project:**") {
             let project_id = rest
-                .split('|')  // Handle "**Project:** xxx | **Updated:** ..."
+                .split('|') // Handle "**Project:** xxx | **Updated:** ..."
                 .next()?
                 .trim()
                 .to_string();

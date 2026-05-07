@@ -15,7 +15,12 @@ pub struct Server {
 impl Server {
     pub fn new(api: APIClient, lsp: lsp::LSPManager) -> Self {
         let workspace_root = lsp.workspace_root().to_path_buf();
-        Self { api, lsp, default_project_id: None, workspace_root }
+        Self {
+            api,
+            lsp,
+            default_project_id: None,
+            workspace_root,
+        }
     }
 
     pub fn with_default_project(mut self, project_id: Option<String>) -> Self {
@@ -29,7 +34,11 @@ impl Server {
             Ok(r) => r,
             Err(e) => {
                 // JSON-RPC spec: parse errors must return code -32700
-                return Ok(Some(self.error_response(None, -32700, &format!("Parse error: {}", e))));
+                return Ok(Some(self.error_response(
+                    None,
+                    -32700,
+                    &format!("Parse error: {}", e),
+                )));
             }
         };
 
@@ -117,11 +126,7 @@ impl Server {
         let name = match params.get("name").and_then(|v| v.as_str()) {
             Some(n) => n,
             None => {
-                return self.error_response_obj(
-                    req.id.clone(),
-                    -32602,
-                    "Missing 'name' parameter",
-                )
+                return self.error_response_obj(req.id.clone(), -32602, "Missing 'name' parameter")
             }
         };
 
@@ -157,7 +162,7 @@ impl Server {
                     result: Some(content),
                     error: None,
                 }
-            },
+            }
             Err(e) => {
                 tracing::error!("Tool execution error: {}", e);
                 self.error_response_obj(req.id.clone(), -32000, &e.to_string())
@@ -169,7 +174,8 @@ impl Server {
     pub fn error_response(&self, id: Option<Value>, code: i32, message: &str) -> String {
         let response = self.error_response_obj(id, code, message);
         serde_json::to_string(&response).unwrap_or_else(|_| {
-            let escaped_message = serde_json::to_string(message).unwrap_or_else(|_| "\"internal error\"".to_string());
+            let escaped_message =
+                serde_json::to_string(message).unwrap_or_else(|_| "\"internal error\"".to_string());
             format!(
                 r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":{},"message":{}}}}}"#,
                 code, escaped_message

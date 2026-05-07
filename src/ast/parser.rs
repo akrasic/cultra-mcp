@@ -1,7 +1,7 @@
-use super::types::{FileContext, Symbol, ASTStats};
-use super::util::{detect_language, calculate_ast_stats};
 use super::languages;
-use crate::mcp::types::{Language as LangEnum, SymbolType};
+use super::types::{ASTStats, FileContext, Symbol};
+use super::util::{calculate_ast_stats, detect_language};
+use crate::mcp::types::Language as LangEnum;
 use anyhow::{Context, Result};
 use std::fs;
 use tree_sitter::Parser as TSParser;
@@ -63,7 +63,7 @@ impl Parser {
 
         Ok(FileContext {
             file_path: file_path.to_string(),
-            language: LangEnum::from_str(language),
+            language: language.parse::<LangEnum>().unwrap(),
             symbols,
             imports,
             ast_stats,
@@ -89,8 +89,7 @@ impl Parser {
 
         // Parse the script content as TypeScript
         let mut ts_parser = TSParser::new();
-        let ts_language: tree_sitter::Language =
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let ts_language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
         ts_parser
             .set_language(&ts_language)
             .with_context(|| "Failed to set TypeScript language for Svelte")?;
@@ -195,9 +194,8 @@ impl Parser {
             "python" => {
                 languages::python::extract_python_imports(root_node, content).unwrap_or_default()
             }
-            "terraform" => {
-                languages::terraform::extract_terraform_imports(root_node, content).unwrap_or_default()
-            }
+            "terraform" => languages::terraform::extract_terraform_imports(root_node, content)
+                .unwrap_or_default(),
             _ => Vec::new(),
         }
     }
@@ -269,7 +267,12 @@ fn extract_svelte_template_symbols(content: &str) -> Vec<Symbol> {
         if let Some(rest) = trimmed.strip_prefix("{@const ") {
             if let Some(eq_pos) = rest.find('=') {
                 let name = rest[..eq_pos].trim().to_string();
-                if !name.is_empty() && name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') {
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphabetic() || c == '_')
+                {
                     symbols.push(Symbol {
                         symbol_type: SymbolType::Variable,
                         name,
@@ -294,9 +297,7 @@ fn extract_svelte_template_symbols(content: &str) -> Vec<Symbol> {
         let mut search_from = 0;
         while search_from < line_str.len() {
             // Match onclick=, on:click=, onchange=, etc.
-            let handler_start = line_str[search_from..]
-                .find("on")
-                .map(|p| p + search_from);
+            let handler_start = line_str[search_from..].find("on").map(|p| p + search_from);
             let handler_start = match handler_start {
                 Some(pos) => pos,
                 None => break,
@@ -305,7 +306,10 @@ fn extract_svelte_template_symbols(content: &str) -> Vec<Symbol> {
             let after_on = &line_str[handler_start + 2..];
             // Must be followed by a letter (onclick) or colon (on:click)
             let is_event = after_on.starts_with(':')
-                || after_on.chars().next().map_or(false, |c| c.is_ascii_lowercase());
+                || after_on
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase());
             if !is_event {
                 search_from = handler_start + 2;
                 continue;
@@ -322,11 +326,12 @@ fn extract_svelte_template_symbols(content: &str) -> Vec<Symbol> {
                     let body_trimmed = body.trim();
                     // Determine handler name: if it's a simple reference like {handleClick},
                     // use that. If it's an arrow () => ..., name it as event handler.
-                    let handler_name = if !body_trimmed.contains("=>") && !body_trimmed.contains('(') {
-                        body_trimmed.to_string()
-                    } else {
-                        format!("{}:handler", event_name)
-                    };
+                    let handler_name =
+                        if !body_trimmed.contains("=>") && !body_trimmed.contains('(') {
+                            body_trimmed.to_string()
+                        } else {
+                            format!("{}:handler", event_name)
+                        };
 
                     // Only emit if it's an arrow function (simple refs are already in script symbols)
                     if body_trimmed.contains("=>") {
@@ -356,7 +361,8 @@ fn extract_svelte_template_symbols(content: &str) -> Vec<Symbol> {
         if let Some(lt_pos) = trimmed.find('<') {
             let after_lt = &trimmed[lt_pos + 1..];
             if after_lt.starts_with(|c: char| c.is_ascii_uppercase()) {
-                let comp_end = after_lt.find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+                let comp_end = after_lt
+                    .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
                     .unwrap_or(after_lt.len());
                 let comp_name = &after_lt[..comp_end];
                 // Skip HTML-like tags (SVG, DOCTYPE, etc.)
@@ -443,6 +449,7 @@ fn regex_find_script_open(content: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::types::SymbolType;
 
     #[test]
     fn test_get_tree_sitter_language() {
@@ -486,7 +493,8 @@ fn main() {
         let temp_dir = std::env::temp_dir();
         let test_file = temp_dir.join("test_parser_rust.rs");
         let mut file = std::fs::File::create(&test_file).expect("Failed to create temp file");
-        file.write_all(source.as_bytes()).expect("Failed to write temp file");
+        file.write_all(source.as_bytes())
+            .expect("Failed to write temp file");
 
         // Parse the file
         let parser = Parser::new();
@@ -496,18 +504,34 @@ fn main() {
         let file_context = result.unwrap();
 
         assert_eq!(file_context.language, LangEnum::Rust);
-        assert!(file_context.symbols.len() >= 3, "Should extract at least 3 symbols (struct, trait, impl)");
+        assert!(
+            file_context.symbols.len() >= 3,
+            "Should extract at least 3 symbols (struct, trait, impl)"
+        );
 
-        let has_struct = file_context.symbols.iter().any(|s| s.name == "Calculator" && s.symbol_type == SymbolType::Struct);
-        let has_trait = file_context.symbols.iter().any(|s| s.name == "Compute" && s.symbol_type == SymbolType::Interface);
-        let has_main = file_context.symbols.iter().any(|s| s.name == "main" && s.symbol_type == SymbolType::Function);
+        let has_struct = file_context
+            .symbols
+            .iter()
+            .any(|s| s.name == "Calculator" && s.symbol_type == SymbolType::Struct);
+        let has_trait = file_context
+            .symbols
+            .iter()
+            .any(|s| s.name == "Compute" && s.symbol_type == SymbolType::Interface);
+        let has_main = file_context
+            .symbols
+            .iter()
+            .any(|s| s.name == "main" && s.symbol_type == SymbolType::Function);
 
         assert!(has_struct, "Should find Calculator struct");
         assert!(has_trait, "Should find Compute trait");
         assert!(has_main, "Should find main function");
 
         let has_std_fmt = file_context.imports.iter().any(|i| i.contains("std::fmt"));
-        assert!(has_std_fmt, "Should find `use std::fmt` import, got: {:?}", file_context.imports);
+        assert!(
+            has_std_fmt,
+            "Should find `use std::fmt` import, got: {:?}",
+            file_context.imports
+        );
 
         let _ = std::fs::remove_file(test_file);
     }
@@ -555,7 +579,7 @@ export function createServer(config: Config): Server {
             "Should extract at least 3 symbols (interface, class, function)"
         );
         assert!(
-            file_context.imports.len() >= 1,
+            !file_context.imports.is_empty(),
             "Should extract at least 1 import"
         );
 
@@ -600,8 +624,14 @@ export function createServer(config: Config): Server {
 
         let (script, offset) = extract_svelte_script(content);
         assert!(!script.is_empty(), "Should extract script content");
-        assert!(script.contains("import { onMount }"), "Should contain import");
-        assert!(script.contains("function increment"), "Should contain function");
+        assert!(
+            script.contains("import { onMount }"),
+            "Should contain import"
+        );
+        assert!(
+            script.contains("function increment"),
+            "Should contain function"
+        );
         assert!(!script.contains("<button"), "Should not contain template");
         assert!(!script.contains("<style>"), "Should not contain style");
         // Offset = number of newlines before end of <script> tag = 0 (tag is on line 0)
@@ -648,25 +678,43 @@ export function createServer(config: Config): Server {
         let temp_dir = std::env::temp_dir();
         let test_file = temp_dir.join("test_parser_svelte.svelte");
         let mut file = std::fs::File::create(&test_file).expect("Failed to create temp file");
-        file.write_all(source.as_bytes()).expect("Failed to write temp file");
+        file.write_all(source.as_bytes())
+            .expect("Failed to write temp file");
 
         let parser = Parser::new();
         let result = parser.parse_file(test_file.to_str().unwrap());
 
-        assert!(result.is_ok(), "Failed to parse Svelte file: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to parse Svelte file: {:?}",
+            result.err()
+        );
         let ctx = result.unwrap();
 
         assert_eq!(ctx.language, LangEnum::Svelte);
-        assert!(!ctx.symbols.is_empty(), "Should extract symbols from script block");
-        assert!(!ctx.imports.is_empty(), "Should extract imports from script block");
+        assert!(
+            !ctx.symbols.is_empty(),
+            "Should extract symbols from script block"
+        );
+        assert!(
+            !ctx.imports.is_empty(),
+            "Should extract imports from script block"
+        );
 
         // Check that line numbers are offset (not starting at 1)
         let func = ctx.symbols.iter().find(|s| s.name == "handleClick");
         assert!(func.is_some(), "Should find handleClick function");
         let func = func.unwrap();
-        assert!(func.line > 1, "Line number should be offset from script tag, got {}", func.line);
+        assert!(
+            func.line > 1,
+            "Line number should be offset from script tag, got {}",
+            func.line
+        );
 
-        let has_interface = ctx.symbols.iter().any(|s| s.name == "Props" && s.symbol_type == SymbolType::Interface);
+        let has_interface = ctx
+            .symbols
+            .iter()
+            .any(|s| s.name == "Props" && s.symbol_type == SymbolType::Interface);
         assert!(has_interface, "Should find Props interface");
 
         let _ = std::fs::remove_file(test_file);

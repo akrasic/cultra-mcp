@@ -97,7 +97,10 @@ fn test_lsp_document_symbols_go() {
 
     match result {
         Ok(response) => {
-            println!("Response: {}", serde_json::to_string_pretty(&response).unwrap());
+            println!(
+                "Response: {}",
+                serde_json::to_string_pretty(&response).unwrap()
+            );
 
             let obj = response.as_object().unwrap();
 
@@ -140,7 +143,10 @@ fn test_lsp_document_symbols_rust() {
         }
     };
 
-    println!("Testing lsp_document_symbols with Rust file: {:?}", test_file);
+    println!(
+        "Testing lsp_document_symbols with Rust file: {:?}",
+        test_file
+    );
 
     let lsp = LSPManager::new(get_test_workspace().join("mcp-server-rust"));
     let mut args = Map::new();
@@ -150,14 +156,22 @@ fn test_lsp_document_symbols_rust() {
     );
     args.insert(
         "workspace_root".to_string(),
-        Value::String(get_test_workspace().join("mcp-server-rust").to_string_lossy().to_string()),
+        Value::String(
+            get_test_workspace()
+                .join("mcp-server-rust")
+                .to_string_lossy()
+                .to_string(),
+        ),
     );
 
     let result = cultra_mcp::lsp::tools::lsp_document_symbols(args, &lsp);
 
     match result {
         Ok(response) => {
-            println!("Response: {}", serde_json::to_string_pretty(&response).unwrap());
+            println!(
+                "Response: {}",
+                serde_json::to_string_pretty(&response).unwrap()
+            );
 
             let obj = response.as_object().unwrap();
             let count = obj.get("count").unwrap().as_u64().unwrap();
@@ -205,7 +219,10 @@ fn test_lsp_hover_go() {
 
     match result {
         Ok(response) => {
-            println!("Hover response: {}", serde_json::to_string_pretty(&response).unwrap());
+            println!(
+                "Hover response: {}",
+                serde_json::to_string_pretty(&response).unwrap()
+            );
 
             let obj = response.as_object().unwrap();
 
@@ -252,12 +269,18 @@ fn test_lsp_goto_definition_go() {
         Value::String(get_test_workspace().to_string_lossy().to_string()),
     );
 
-    args.insert("action".to_string(), Value::String("definition".to_string()));
+    args.insert(
+        "action".to_string(),
+        Value::String("definition".to_string()),
+    );
     let result = cultra_mcp::lsp::tools::lsp_query(args, &lsp);
 
     match result {
         Ok(response) => {
-            println!("Goto definition response: {}", serde_json::to_string_pretty(&response).unwrap());
+            println!(
+                "Goto definition response: {}",
+                serde_json::to_string_pretty(&response).unwrap()
+            );
 
             let obj = response.as_object().unwrap();
             assert!(obj.contains_key("found"));
@@ -303,12 +326,18 @@ fn test_lsp_find_references_go() {
         Value::String(get_test_workspace().to_string_lossy().to_string()),
     );
 
-    args.insert("action".to_string(), Value::String("references".to_string()));
+    args.insert(
+        "action".to_string(),
+        Value::String("references".to_string()),
+    );
     let result = cultra_mcp::lsp::tools::lsp_query(args, &lsp);
 
     match result {
         Ok(response) => {
-            println!("Find references response: {}", serde_json::to_string_pretty(&response).unwrap());
+            println!(
+                "Find references response: {}",
+                serde_json::to_string_pretty(&response).unwrap()
+            );
 
             let obj = response.as_object().unwrap();
             assert!(obj.contains_key("references"));
@@ -347,7 +376,10 @@ fn test_lsp_workspace_symbols_go() {
 
     match result {
         Ok(response) => {
-            println!("Workspace symbols response: {}", serde_json::to_string_pretty(&response).unwrap());
+            println!(
+                "Workspace symbols response: {}",
+                serde_json::to_string_pretty(&response).unwrap()
+            );
 
             let obj = response.as_object().unwrap();
             assert!(obj.contains_key("symbols"));

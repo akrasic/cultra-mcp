@@ -1,6 +1,6 @@
 [package]
 name = "cultra-mcp"
-version = "1.0.0"
+version = "2.0.1"
 edition = "2021"
 authors = ["Cultra Contributors"]
 description = "Universal MCP server for Cultra - cross-tool AI coding intelligence"

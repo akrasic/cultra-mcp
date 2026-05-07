@@ -19,15 +19,6 @@ pub fn detect_language(file_path: &str) -> Option<&'static str> {
     }
 }
 
-/// Format location as "line" or "start-end"
-pub fn format_location(start_line: u32, end_line: u32) -> String {
-    if start_line == end_line {
-        format!("{}", start_line)
-    } else {
-        format!("{}-{}", start_line, end_line)
-    }
-}
-
 /// Calculate AST statistics by traversing tree
 pub fn calculate_ast_stats(node: &tree_sitter::Node) -> (usize, usize) {
     let mut total_nodes = 0;
@@ -64,11 +55,5 @@ mod tests {
         assert_eq!(detect_language("main.tf"), Some("terraform"));
         assert_eq!(detect_language("vars.tfvars"), Some("terraform"));
         assert_eq!(detect_language("unknown.txt"), None);
-    }
-
-    #[test]
-    fn test_format_location() {
-        assert_eq!(format_location(10, 10), "10");
-        assert_eq!(format_location(10, 20), "10-20");
     }
 }

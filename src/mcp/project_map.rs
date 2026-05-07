@@ -16,12 +16,22 @@ use tracing::warn;
 use crate::mcp::server::Server;
 
 const PROJECT_MAP_DEFAULT_IGNORES: &[&str] = &[
-    "node_modules", "target", "dist", "build",
-    ".venv", "venv",
-    ".fastembed_cache", ".next", ".svelte-kit", ".turbo",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    ".fastembed_cache",
+    ".next",
+    ".svelte-kit",
+    ".turbo",
     ".git",
-    "__pycache__", ".pytest_cache", ".mypy_cache",
-    "coverage", ".coverage",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "coverage",
+    ".coverage",
 ];
 
 /// scan_project_map_tool is the MCP dispatch target for `get_project_map`.
@@ -125,7 +135,12 @@ pub(crate) fn scan_project_map(workspace_root: &std::path::Path) -> Result<Value
         // Normal or submodule: read manifest. Submodules keep full manifest info
         // because they're semantically part of the parent's history.
         match classify_entry_by_manifest(&name, &path) {
-            EntryClassification::Manifest { kind, manifest, frameworks, workspace } => {
+            EntryClassification::Manifest {
+                kind,
+                manifest,
+                frameworks,
+                workspace,
+            } => {
                 code_entry_count += 1;
                 let mut obj = serde_json::Map::new();
                 obj.insert("dir".to_string(), json!(name));
@@ -456,7 +471,14 @@ fn parse_ignore_file(path: &std::path::Path) -> Vec<String> {
 /// to tell agents "yes, you can call get_project_map here to learn more"
 /// without actually reading anything across the repo boundary.
 fn has_any_known_manifest(dir: &std::path::Path) -> bool {
-    for name in &["Cargo.toml", "go.mod", "package.json", "pyproject.toml", "composer.json", "requirements.txt"] {
+    for name in &[
+        "Cargo.toml",
+        "go.mod",
+        "package.json",
+        "pyproject.toml",
+        "composer.json",
+        "requirements.txt",
+    ] {
         if dir.join(name).exists() {
             return true;
         }
@@ -499,12 +521,17 @@ mod tests {
         std::fs::create_dir_all(root.join("svc")).unwrap();
         std::fs::write(root.join("svc").join("go.mod"), "module foo\n\ngo 1.22\n").unwrap();
         std::fs::create_dir_all(root.join("engine")).unwrap();
-        std::fs::write(root.join("engine").join("Cargo.toml"), "[package]\nname=\"e\"\nversion=\"0.1\"\n").unwrap();
+        std::fs::write(
+            root.join("engine").join("Cargo.toml"),
+            "[package]\nname=\"e\"\nversion=\"0.1\"\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join("web")).unwrap();
         std::fs::write(
             root.join("web").join("package.json"),
             r#"{"name":"web","dependencies":{"react":"18.0.0","next":"14.0.0"}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         root
     }
 
@@ -519,7 +546,8 @@ mod tests {
         std::fs::write(
             root.join("vendor-tool").join("Cargo.toml"),
             "[package]\nname=\"v\"\n",
-        ).unwrap();
+        )
+        .unwrap();
         root
     }
 
@@ -532,7 +560,8 @@ mod tests {
         std::fs::write(
             root.join("submod").join(".git"),
             "gitdir: ../.git/modules/submod\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(root.join("submod").join("go.mod"), "module submod\n").unwrap();
         root
     }
@@ -544,7 +573,8 @@ mod tests {
         std::fs::write(
             root.join("app").join("package.json"),
             r#"{"name":"app","dependencies":{"svelte":"4.0.0"}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         root
     }
 
@@ -554,10 +584,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("docs")).unwrap();
         for i in 0..10 {
-            std::fs::write(
-                root.join("docs").join(format!("f{}.md", i)),
-                "# content",
-            ).unwrap();
+            std::fs::write(root.join("docs").join(format!("f{}.md", i)), "# content").unwrap();
         }
         root
     }
@@ -571,7 +598,8 @@ mod tests {
         let result = scan_project_map(&root).unwrap();
         assert_eq!(result["root_is_git_repo"], json!(true));
         assert_eq!(
-            result["structure"], json!("single_project"),
+            result["structure"],
+            json!("single_project"),
             "empty repo must be single_project, not monorepo"
         );
         assert_eq!(result["entries"].as_array().unwrap().len(), 0);
@@ -607,10 +635,16 @@ mod tests {
 
         let result = scan_project_map(&root).unwrap();
         let entries = result["entries"].as_array().unwrap();
-        let nested = entries.iter().find(|e| e["dir"] == json!("vendor-scripts")).unwrap();
+        let nested = entries
+            .iter()
+            .find(|e| e["dir"] == json!("vendor-scripts"))
+            .unwrap();
         assert_eq!(nested["is_own_repo"], json!(true));
-        assert_eq!(nested["has_manifest"], json!(false),
-            "nested repo without recognized manifest must report has_manifest: false");
+        assert_eq!(
+            nested["has_manifest"],
+            json!(false),
+            "nested repo without recognized manifest must report has_manifest: false"
+        );
         // Pruned shape: no manifest details even though has_manifest is false.
         assert!(nested.get("kind").is_none());
         assert!(nested.get("manifest").is_none());
@@ -624,13 +658,25 @@ mod tests {
         let result = scan_project_map(&root).unwrap();
         assert_eq!(result["structure"], json!("workspace_with_nested_repos"));
         let entries = result["entries"].as_array().unwrap();
-        let nested = entries.iter().find(|e| e["dir"] == json!("vendor-tool")).unwrap();
+        let nested = entries
+            .iter()
+            .find(|e| e["dir"] == json!("vendor-tool"))
+            .unwrap();
         assert_eq!(nested["is_own_repo"], json!(true));
         assert_eq!(nested["has_manifest"], json!(true));
         // Pruned entry must not leak manifest details.
-        assert!(nested.get("kind").is_none(), "nested repo entry must not expose kind");
-        assert!(nested.get("frameworks").is_none(), "nested repo entry must not expose frameworks");
-        assert!(nested.get("manifest").is_none(), "nested repo entry must not expose manifest");
+        assert!(
+            nested.get("kind").is_none(),
+            "nested repo entry must not expose kind"
+        );
+        assert!(
+            nested.get("frameworks").is_none(),
+            "nested repo entry must not expose frameworks"
+        );
+        assert!(
+            nested.get("manifest").is_none(),
+            "nested repo entry must not expose manifest"
+        );
     }
 
     #[test]
@@ -639,7 +685,10 @@ mod tests {
         let root = mk_submodule(tmp.path());
         let result = scan_project_map(&root).unwrap();
         let entries = result["entries"].as_array().unwrap();
-        let sub = entries.iter().find(|e| e["dir"] == json!("submod")).unwrap();
+        let sub = entries
+            .iter()
+            .find(|e| e["dir"] == json!("submod"))
+            .unwrap();
         assert_eq!(sub["is_own_repo"], json!(false));
         assert_eq!(sub["submodule"], json!(true));
         // Submodule keeps full manifest info (semantically part of parent).
@@ -669,8 +718,12 @@ mod tests {
         let entries = result["entries"].as_array().unwrap();
         let web = entries.iter().find(|e| e["dir"] == json!("web")).unwrap();
         assert_eq!(web["kind"], json!("node"));
-        let fw: Vec<&str> = web["frameworks"].as_array().unwrap()
-            .iter().map(|v| v.as_str().unwrap()).collect();
+        let fw: Vec<&str> = web["frameworks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
         // Most-specific first: next added before react.
         assert_eq!(fw[0], "next", "frameworks[0] must be most-specific (next)");
         assert!(fw.contains(&"react"), "Next implies React");
@@ -699,7 +752,10 @@ mod tests {
 
         let result = scan_project_map(&root).unwrap();
         let ignored = result["ignored"].as_array().unwrap();
-        let hit = ignored.iter().find(|e| e["dir"] == json!("tmp-stuff")).unwrap();
+        let hit = ignored
+            .iter()
+            .find(|e| e["dir"] == json!("tmp-stuff"))
+            .unwrap();
         assert_eq!(hit["reason"], json!("gitignore"));
         // real-code still appears in entries
         let entries = result["entries"].as_array().unwrap();
@@ -712,7 +768,10 @@ mod tests {
         let root = mk_monorepo(tmp.path());
         let _ = scan_project_map(&root).unwrap();
         let artifact = root.join(".cultra").join("project-map.json");
-        assert!(artifact.exists(), "cache artifact should be written to .cultra/project-map.json");
+        assert!(
+            artifact.exists(),
+            "cache artifact should be written to .cultra/project-map.json"
+        );
         let content = std::fs::read_to_string(&artifact).unwrap();
         let parsed: Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["structure"], json!("monorepo"));
@@ -724,7 +783,11 @@ mod tests {
         let root = tmp.path().join("sp");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("app")).unwrap();
-        std::fs::write(root.join("app").join("Cargo.toml"), "[package]\nname=\"a\"\n").unwrap();
+        std::fs::write(
+            root.join("app").join("Cargo.toml"),
+            "[package]\nname=\"a\"\n",
+        )
+        .unwrap();
         let result = scan_project_map(&root).unwrap();
         assert_eq!(result["structure"], json!("single_project"));
     }
@@ -738,10 +801,14 @@ mod tests {
         std::fs::write(
             root.join("ws-pkg").join("Cargo.toml"),
             "[workspace]\nmembers = [\"a\"]\n",
-        ).unwrap();
+        )
+        .unwrap();
         let result = scan_project_map(&root).unwrap();
         let entries = result["entries"].as_array().unwrap();
-        let pkg = entries.iter().find(|e| e["dir"] == json!("ws-pkg")).unwrap();
+        let pkg = entries
+            .iter()
+            .find(|e| e["dir"] == json!("ws-pkg"))
+            .unwrap();
         assert_eq!(pkg["workspace"], json!(true));
     }
 
@@ -753,10 +820,16 @@ mod tests {
         let root = mk_monorepo(tmp.path()); // engine/Cargo.toml has no [workspace]
         let result = scan_project_map(&root).unwrap();
         let entries = result["entries"].as_array().unwrap();
-        let engine = entries.iter().find(|e| e["dir"] == json!("engine")).unwrap();
+        let engine = entries
+            .iter()
+            .find(|e| e["dir"] == json!("engine"))
+            .unwrap();
         assert_eq!(engine["kind"], json!("rust"));
-        assert!(engine.get("workspace").is_none(),
-            "regular Rust crate must not carry a workspace field; got {:?}", engine);
+        assert!(
+            engine.get("workspace").is_none(),
+            "regular Rust crate must not carry a workspace field; got {:?}",
+            engine
+        );
     }
 
     /// Ad-hoc "what does the real Cultra workspace look like?" dump.
@@ -766,7 +839,10 @@ mod tests {
     #[ignore]
     fn dump_real_workspace_project_map() {
         let here = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let workspace_root = std::path::PathBuf::from(&here).parent().unwrap().to_path_buf();
+        let workspace_root = std::path::PathBuf::from(&here)
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let result = scan_project_map(&workspace_root).expect("scan should succeed");
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
     }
@@ -786,8 +862,11 @@ mod tests {
         let mut args = Map::new();
         args.insert("path".to_string(), json!(outside.to_string_lossy()));
         let err = scan_project_map_tool(args, &server).unwrap_err();
-        assert!(err.to_string().contains("workspace root"),
-            "expected boundary error, got: {}", err);
+        assert!(
+            err.to_string().contains("workspace root"),
+            "expected boundary error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -811,7 +890,14 @@ mod tests {
 
         let result = scan_project_map_tool(Map::new(), &server).unwrap();
         let obj = result.as_object().expect("top-level must be object");
-        for key in &["root", "root_is_git_repo", "structure", "generated_at", "entries", "ignored"] {
+        for key in &[
+            "root",
+            "root_is_git_repo",
+            "structure",
+            "generated_at",
+            "entries",
+            "ignored",
+        ] {
             assert!(obj.contains_key(*key), "missing top-level key: {}", key);
         }
         assert!(result["entries"].is_array());
@@ -853,8 +939,10 @@ mod tests {
         });
         merge_project_map_into(&mut response, &root);
 
-        assert_eq!(response["project_map"], original,
-            "merge must not overwrite a project_map field already present in the response");
+        assert_eq!(
+            response["project_map"], original,
+            "merge must not overwrite a project_map field already present in the response"
+        );
     }
 
     #[test]
@@ -868,8 +956,10 @@ mod tests {
 
         assert_eq!(response["found"], json!(true));
         assert_eq!(response["session"]["session_id"], json!("abc"));
-        assert!(response.get("project_map").is_none(),
-            "scan failure must not insert a project_map field");
+        assert!(
+            response.get("project_map").is_none(),
+            "scan failure must not insert a project_map field"
+        );
     }
 
     #[test]
